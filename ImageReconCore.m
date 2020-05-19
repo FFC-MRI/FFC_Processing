@@ -355,7 +355,8 @@ classdef ImageReconCore
             noise(n,:) = obj.originalcomplexkspace(1,:,1,1,1,n); %used in multicoil recon
             end
 
-            obj = correct_orientation(obj);          
+            obj = correct_orientation(obj);     
+obj.complexkspace = mean(obj.complexkspace,6);
             obj.compleximage=fft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
 %             tempdims = size(obj.compleximage);
 %             temp = reshape(obj.compleximage,tempdims(1),tempdims(2),[]);
@@ -369,9 +370,10 @@ classdef ImageReconCore
 %             
 %             temp = reshape(temp,tempdims);
 %              obj.compleximage = temp;
-          obj.magimage = combine_channels(obj.compleximage,noise);
+%           obj.magimage = combine_channels(obj.compleximage,noise);
+
             obj.magimage = abs( obj.compleximage);
-           obj.magimage = mean(obj.magimage,6); %average multichannel data for now
+%            obj.magimage = mean(obj.magimage,6); %average multichannel data for now
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);
             
