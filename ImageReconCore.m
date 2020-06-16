@@ -4,6 +4,7 @@ classdef ImageReconCore
     
     properties (SetAccess = public)
         sequence %the pulse sequence ppl name (eg gechoa, fse etc)
+        displayname %user friendly sequence name eg Spin-Echo
         name %filename
         filelocation %fileID
         fileindex %which file is this in the savelist?
@@ -272,6 +273,19 @@ classdef ImageReconCore
             %% 
         end %function
         
+        function obj = rename_sequence(obj)
+            switch lower(strcat(char(regexp(obj.sequence,'[a-zA-Z]','match'))'))
+                case 'hsenavv'
+                    obj.displayname = 'Field-Cycling Spin-Echo';
+                case 'hsemultislice'
+                    obj.displayname = 'Multislice Spin-Echo';
+                case 'hflash'
+                    obj.displayname = 'Turbo Flash';
+                otherwise
+                    obj.displayname = obj.sequence; %for sequences we don't recognise
+            end
+        end
+            
         function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set
            
             if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
@@ -325,6 +339,7 @@ classdef ImageReconCore
 %                     end
                 end
                 A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+
                [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
                
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);

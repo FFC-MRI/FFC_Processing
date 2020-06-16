@@ -3,13 +3,17 @@ function [obj] = open_mrifile()
 %creates appropriate object containing the file data.
 
 persistent lastFolder
+
+
+try
 if isempty(lastFolder)
-  lastFolder = cd;
+    lastFolder = cd;
 end
 bakCD = cd;
 cd(lastFolder);
-
-
+catch
+    cd('C:\') %default to C if all else fails
+end
 
 
 [nmrfilename,nmrpathname] = uigetfile({'*.MRD;*.mat;','MRI Files';...
@@ -22,7 +26,7 @@ end
 
 cd(bakCD);
 if ischar(nmrpathname)
-  lastFolder = nmrpathname;
+    lastFolder = nmrpathname;
 end
 
 if iscell(nmrfilename)
@@ -38,24 +42,24 @@ else
     if strcmp(filetype,'.mat')
         file = load(nmrfilename);
         if strcmp(class(file.saveList{1}),'ImageReconCore')
-        obj = file.saveList;    
+            obj = file.saveList;
         else
-        objects = cellfun(@class,file.saveList,'UniformOutput',false);
-        whitelist = {'H9_se_nav_Elina','H9_se_multislice','h9_flash','h9_flash_v2','H9_se_nav_v6','H9_ge_lock','H9_se_propeller','H9_se_nav_v7','H9_se_nav_v8','H9_se_nav_v9','H9_se_nav_v10','H9_se_nav_fermi_v1','H9_se_nav_v7','H9_ir_se','H9_ir_se_nav_v4','H9_se_nav_v4'}; %these are imaging sequences, we discard all non-imaging sequences
-        toprocess = find(ismember(objects,whitelist));
-        indx = 0;
-        for n=toprocess
-            
-            indx =indx+1;
-            try
-            [fid,~] = fopen(fullfile(nmrfilename));
-            obj{indx} = ImageReconCore(fid,filetype,n); 
-            catch ME
-        disp(['Error while processing sequence number ' num2str(n) ':'])
-        disp(ME)
-        end
+            objects = cellfun(@class,file.saveList,'UniformOutput',false);
+            whitelist = {'H9_se_nav_Elina','H9_se_multislice','h9_flash','h9_flash_v2','H9_se_nav_v6','H9_ge_lock','H9_se_propeller','H9_se_nav_v7','H9_se_nav_v8','H9_se_nav_v9','H9_se_nav_v10','H9_se_nav_fermi_v1','H9_se_nav_v7','H9_ir_se','H9_ir_se_nav_v4','H9_se_nav_v4'}; %these are imaging sequences, we discard all non-imaging sequences
+            toprocess = find(ismember(objects,whitelist));
+            indx = 0;
+            for n=toprocess
+                
+                indx =indx+1;
+                try
+                    [fid,~] = fopen(fullfile(nmrfilename));
+                    obj{indx} = ImageReconCore(fid,filetype,n);
+                catch ME
+                    disp(['Error while processing sequence number ' num2str(n) ':'])
+                    disp(ME)
+                end
+            end
         end
     end
-end
 end
 
