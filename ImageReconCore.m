@@ -56,8 +56,9 @@ classdef ImageReconCore
         reprocess %should the file be reprocessed?
         checkfit %should the user check the t1 fit?
         n_receivers %number of receivers
+        multichannel_recon %how to deal with multiple channels?
         rot_theta %describes rotation applied using GUI
-        param = struct %other sequence parameters go here
+        param = struct %other sequence parameters go here       
     end
     
     
@@ -324,19 +325,22 @@ classdef ImageReconCore
                 else
                     A = squeeze(A);
                 end
-                 A = removespikes(A);
+%                   A = removespikes(A);
                 A = reshape(A,obj.samples,obj.views,[]);
                 if obj.samples ~= obj.views && obj.partialkspace ==1
-                    A = padarray(double(A),[0,double(obj.samples-obj.views)],0,'post');
+                     A = padarray(double(A),[0,double(obj.samples-obj.views)],0,'post');
+                     if mean(A(:,1,1))==0
+                         A(:,1,:) = A(:,2,:);
+                     end
                     %             AA = centre_kspace(AA);
                     obj.views = obj.samples;
                     %PF recon if we need to
-%                     try
-%                         for n=1:size(A,3)
-%                             [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
-%                         end
-%                     catch
-%                     end
+                    try
+                        for n=1:size(A,3)
+                            [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
+                        end
+                    catch
+                    end
                 end
                 A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
 
@@ -367,11 +371,13 @@ classdef ImageReconCore
            
             obj.complexkspace = windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function); %perform the kspace windowing first
             for n=1:obj.n_receivers
-            noise(n,:) = obj.originalcomplexkspace(1,:,1,1,1,n); %used in multicoil recon
+                for s=1:obj.slices
+            noise(n,s,:) = obj.originalcomplexkspace(1,:,s,1,1,n); %used in multicoil recon
+                end
             end
 
             obj = correct_orientation(obj);     
-obj.complexkspace = mean(obj.complexkspace,6);
+% obj.complexkspace = mean(obj.complexkspace,6);
             obj.compleximage=fft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
 %             tempdims = size(obj.compleximage);
 %             temp = reshape(obj.compleximage,tempdims(1),tempdims(2),[]);
@@ -385,10 +391,10 @@ obj.complexkspace = mean(obj.complexkspace,6);
 %             
 %             temp = reshape(temp,tempdims);
 %              obj.compleximage = temp;
-%           obj.magimage = combine_channels(obj.compleximage,noise);
+            obj.magimage = combine_channels(obj.compleximage,noise,obj.multichannel_recon);
 
-            obj.magimage = abs( obj.compleximage);
-%            obj.magimage = mean(obj.magimage,6); %average multichannel data for now
+%                obj.magimage = abs( obj.compleximage(:,:,:,:,1));
+%             obj.magimage = mean(obj.magimage,6); %average multichannel data for now
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);
             

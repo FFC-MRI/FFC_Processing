@@ -1,4 +1,4 @@
-function [combined_images] = combine_channels(images,noise)
+function [combined_images] = combine_channels(images,noise,opts)
 %multicoil reconstruction
 %   Detailed explanation goes here
 % 
@@ -10,26 +10,32 @@ function [combined_images] = combine_channels(images,noise)
 % Rnscaled = (Rn);
 
 
-eta = noise;
-
+switch opts
+    case 1       
 n_channels = size(images,6);
-psi = [n_channels,n_channels];
-dims = size(images);
-channel_data = (reshape(images,[],n_channels));
-psi = (1/(length(noise)-1))*(eta*eta');
+if n_channels >2
+for s=1:size(images,3)
+    images_temp = images(:,:,s,:,:,:);
+    eta = squeeze(noise(:,s,:));
+    psi = [n_channels,n_channels];
+dims = size(images_temp);
+channel_data = (reshape(images_temp,[],n_channels));
+psi = (1/(length(squeeze(noise(:,s,:)))-1))*(eta*eta');
 L = chol(psi,'lower');
 L_inv =inv(L);
 %  L_inv =1;
 data_scaled = (L_inv*permute(channel_data,[2 1]));
 channel_data = reshape(data_scaled',dims);
-% channel_data(:,:,:,1) = 0;
-% channel_data(:,:,:,2) = 0;
-% channel_data(:,:,:,3) = 0;
-% channel_data(:,:,:,4) = 0;
-% channel_data(:,:,:,5) = 0;
-% channel_data(:,:,:,6) = 0;
-combined_images = sqrt(sum(channel_data.*conj(channel_data),6));
-
+combined_images(:,:,s,:,:) = sqrt(sum(channel_data.*conj(channel_data),6));
+end
+else
+    combined_images = mean(images,6);
+end
+    case 2
+     combined_images = mean(images,6);
+    otherwise
+    combined_images = images(:,:,:,opts-2);
+end
 
 % for n=1:size(images,6)
 % coil_images(:,:,:,n) = coil_images(:,:,:,n).*(noise(1)./noise(n));
