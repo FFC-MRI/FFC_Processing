@@ -1,4 +1,4 @@
-classdef H9_ir_se_nav_v4 < PulseSequence
+classdef H9_se_nav_v5 < PulseSequence
     %H9_ir_se Inversion recovery pulse sequence
     
     properties
@@ -8,10 +8,10 @@ classdef H9_ir_se_nav_v4 < PulseSequence
     end
     
     methods
-        function pulse = H9_ir_se_nav_v4
+        function pulse = H9_se_nav_v5
             pulse@PulseSequence;
             pulse.pulseSequenceName = 'Inversion Recovery Spin Echo';
-            pulse.pprFile = 'C:\Scanner\H9_scanner\PulseSequences\H9_ir_se_nav_v4.PPR';
+            pulse.pprFile = 'C:\Scanner\H9_scanner\PulseSequences\H9_se_nav_v5.PPR';
             pulse.dBdt = 7;
             pulse.useMode = 3;
             pulse.steppedAcquisition = 0;

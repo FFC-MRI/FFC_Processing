@@ -298,12 +298,13 @@ classdef ImageReconCore
                
                 
                 
-                A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
+              
                 
                       
                 
                 A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                
+                 
+                A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
                 if obj.echoes>1
 %                   for r=1:obj.n_receivers
 %                       for f=1:obj.n_fieldpoints

@@ -18,7 +18,15 @@ switch sequence
                        end
                        
             A = tempmatrix;
+            
+            case "H9_ir_se"
+                kspace(:,:,1,:,:,:,:,:) = kspace(:,:,2,:,:,:,:,:);
+                A = kspace;
     otherwise
+        
+   
+            
+                
         A= kspace;
 end
 
