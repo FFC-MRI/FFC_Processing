@@ -385,19 +385,8 @@ classdef ImageReconCore
             obj = correct_orientation(obj);     
 % obj.complexkspace = mean(obj.complexkspace,6);
             obj.compleximage=fft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
-%             tempdims = size(obj.compleximage);
-%             temp = reshape(obj.compleximage,tempdims(1),tempdims(2),[]);
-%  
-%             mat = [0.87,0 0;0 1 0;0 0 1];
-%             tform_t = affine2d(mat);
-%             for n=16:20
-%             temp2(:,:,n)= imwarp(temp(:,:,n),tform_t);
-%             temp(:,:,n) = padarray(temp2(:,:,n),[0,(128-size(temp2,2))/2,0],0,'both');
-%             end
-%             
-%             temp = reshape(temp,tempdims);
-%              obj.compleximage = temp;
-            obj.magimage = circshift(combine_channels(obj.compleximage,noise,obj.multichannel_recon),[10 0]);
+
+            obj.magimage = combine_channels(obj.compleximage,noise,obj.multichannel_recon);
 
 %                obj.magimage = abs( obj.compleximage(:,:,:,:,1));
 %             obj.magimage = mean(obj.magimage,6); %average multichannel data for now
