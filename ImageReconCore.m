@@ -302,8 +302,8 @@ classdef ImageReconCore
                 
                       
                 
-                A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                 
+                A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
+                A = mean(A,7); 
                 A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
                 if obj.echoes>1
 %                   for r=1:obj.n_receivers
@@ -346,6 +346,7 @@ classdef ImageReconCore
                 A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
 
                [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+
                
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 obj.originalcomplexkspace =obj.complexkspace;
@@ -371,11 +372,15 @@ classdef ImageReconCore
             upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;
            
             obj.complexkspace = windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function); %perform the kspace windowing first
+           if obj.n_receivers>1
             for n=1:obj.n_receivers
                 for s=1:obj.slices
             noise(n,s,:) = obj.originalcomplexkspace(1,:,s,1,1,n); %used in multicoil recon
                 end
             end
+           else 
+               noise = obj.originalcomplexkspace(1,:,1,1,1,1);
+           end
 
             obj = correct_orientation(obj);     
 % obj.complexkspace = mean(obj.complexkspace,6);
@@ -392,7 +397,7 @@ classdef ImageReconCore
 %             
 %             temp = reshape(temp,tempdims);
 %              obj.compleximage = temp;
-            obj.magimage = combine_channels(obj.compleximage,noise,obj.multichannel_recon);
+            obj.magimage = circshift(combine_channels(obj.compleximage,noise,obj.multichannel_recon),[10 0]);
 
 %                obj.magimage = abs( obj.compleximage(:,:,:,:,1));
 %             obj.magimage = mean(obj.magimage,6); %average multichannel data for now
