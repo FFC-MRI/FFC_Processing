@@ -6,6 +6,12 @@ function [I1,ph,A1,bkgd,jj] = iterative_images_correction_v7(A,thresh_bkgd,max_i
 %
 %
 
+I1 = [];
+ph = [];
+A1 = [];
+bkgd = [];
+jj = [];
+
 if ndims(A)>2
     sze = size(A);
     bkgd = [];
