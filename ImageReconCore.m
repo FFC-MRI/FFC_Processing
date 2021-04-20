@@ -15,7 +15,7 @@ classdef ImageReconCore
         magimage
         magkspace
         scaledimages
-        phaseimage
+        complexphaseimage
         nfids %number of nmr excitations used to generate the file
         nmrdatatype %data type
         echoes %number of echoes. Defaults to 1 for sequences if unused.
