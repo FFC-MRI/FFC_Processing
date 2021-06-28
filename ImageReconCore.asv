@@ -80,20 +80,10 @@ classdef ImageReconCore
                     obj.fileindex = index;
                     obj.samples = cell2mat(file.pprParamList(strcmp('NO_SAMPLES', file.pprParamList(:,1)),3));
                     obj.views = cell2mat(file.pprParamList(strcmp('NO_VIEWS', file.pprParamList(:,1)),3));
-                    if isempty(cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3)))
-                    obj.views2 = 1;
-                    else
-                    obj.views2 = cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3));
-                    end
-                    
+                    try
+                    obj.views2 = size(file.data,3);
                     obj.slices = cell2mat(file.pprParamList(strcmp('NO_SLICES', file.pprParamList(:,1)),3));
-                   
-                    if isempty(cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3)))
-                    obj.echoes = 1;
-                    else
-                    obj.echoes = cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3));
-                    end
-                    
+                    obj.echoes = size(file.data,5);
                     obj.experiments = size(file.data,6)*size(file.data,7);
                     obj.averages = size(file.data,8);
                     obj.n_receivers = size(file.data,9);

@@ -6,7 +6,7 @@ dims = size(imagestack);
 nbrow = size(imagestack,1);
 nbcol = size(imagestack,2);
 [u,v] = meshgrid(1:nbcol,1:nbrow);
-imagestack = reshape(imagestack,nbrow,nbcol,[]);
+ imagestack = reshape(imagestack,nbrow,nbcol,[]);
 registered_images = zeros(size(imagestack));
 % 
 for n=1:size(imagestack,3)

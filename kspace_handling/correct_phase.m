@@ -6,6 +6,8 @@ dims = size(kspace); %we can reshape back to this dimensionality later
 
     workingkspace = reshape(kspace(:,:,:,:,:,n_receivers),dims(1),dims(2),[]); %only do the phase correction for one coil and duplicate the results to others.
     workingdim = size(workingkspace);
+    
+    
     if backgroundtest ==1
         hh = figure;
         imagesc(abs(fft2c(kspace(:,:,1,1,1)))); axis off square; colormap('gray');
