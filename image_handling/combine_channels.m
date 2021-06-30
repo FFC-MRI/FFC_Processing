@@ -24,10 +24,14 @@ for s=1:size(images,3)
 dims = size(images_temp);
 channel_data = (reshape(images_temp,[],n_channels));
 psi = (1/(length(squeeze(noise(:,s,:)))-1))*(eta*eta');
+try
   L = chol(psi,'lower');
   L_inv =inv(L);
-%   L_inv =1;
-data_scaled = (L_inv*permute(channel_data,[2 1]));
+catch
+    L_inv =1;
+end
+%    L_inv =1;
+data_scaled = (fliplr(L_inv)*permute(channel_data,[2 1]));
 channel_data = reshape(data_scaled',dims);
  combined_images(:,:,s,:,:) = sqrt(sum(channel_data.*conj(channel_data),6));
  %combined_images = rssq(images,6); %basic S
