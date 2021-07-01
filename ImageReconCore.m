@@ -386,7 +386,7 @@ classdef ImageReconCore
            if obj.n_receivers>1
             for n=1:obj.n_receivers
                 for s=1:obj.slices
-            noise(n,s,:) = obj.originalcomplexkspace(:,1,s,1,1,n); %used in multicoil recon
+            noise(n,s,:) = obj.originalcomplexkspace(1,:,s,1,1,n); %used in multicoil recon
                 end
             end
            else 
