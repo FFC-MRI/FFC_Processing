@@ -94,6 +94,8 @@ classdef ImageReconCore
                     obj.echoes = cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3));
                     end
                     
+                    
+                    
                     obj.experiments = size(file.data,6)*size(file.data,7);
                     obj.averages = size(file.data,8);
                     obj.n_receivers = size(file.data,9);
@@ -101,10 +103,15 @@ classdef ImageReconCore
                     
                     truedim1 = size(file.data,1); %try to deal with aborted or corrupted scans by looking at what we have vs what we expected
                     truedim2 = size(file.data,2);
-                    if truedim1 ~=  obj.samples
+                    
+%                     if truedim1 > obj.samples
+%                         file.data = file.data(1:obj.samples,:,:,:,:,:,:,:); %deal with that strange 4x 0 padding issue the new evo produces.
+%                     end
+%                     
+                    if truedim1 <  obj.samples
                         file.data = padarray(file.data,abs(obj.samples-truedim1),0,'post');
                     end
-                    if truedim2 ~=  obj.views
+                    if truedim2 <  obj.views
                         file.data = padarray(file.data,[0,abs(obj.views-truedim2)],0,'post');
                     end
 

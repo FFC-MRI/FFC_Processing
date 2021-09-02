@@ -45,7 +45,7 @@ else
             obj = file.saveList;
         else
             objects = cellfun(@class,file.saveList,'UniformOutput',false);
-            whitelist = {'H9_ir_multislice_se','H9_se_nav_Elina','H9_se_multislice','h9_flash','h9_flash_v2','H9_se_nav_v6','H9_ge_lock','H9_se_propeller','H9_se_nav_v7','H9_se_nav_v8','H9_se_nav_v9','H9_se_nav_v10','H9_se_nav_fermi_v1','H9_se_nav_v7','H9_ir_se','H9_ir_se_nav_v4','H9_se_nav_v4','H9_se_nav_longT1','H9_se_nav_v2','H9_ir_se_nav_v2'}; %these are imaging sequences, we discard all non-imaging sequences
+            whitelist = {'H9_se_multislice_cardiac','H9_se_nav_v9_cardiac','H9_ir_multislice_se','H9_se_nav_Elina','H9_se_multislice','h9_flash','h9_flash_v2','H9_se_nav_v6','H9_ge_lock','H9_se_propeller','H9_se_nav_v7','H9_se_nav_v8','H9_se_nav_v9','H9_se_nav_v10','H9_se_nav_fermi_v1','H9_se_nav_v7','H9_ir_se','H9_ir_se_nav_v4','H9_se_nav_v4','H9_se_nav_longT1','H9_se_nav_v2','H9_ir_se_nav_v2'}; %these are imaging sequences, we discard all non-imaging sequences
             toprocess = find(ismember(objects,whitelist));
             indx = 0;
             for n=toprocess
