@@ -20,9 +20,9 @@ switch opts
     case 1
         n_channels = size(images,6);
         if n_channels >1
-            for s=1:size(images,3)
+            for s=1:size(images_temp,3)
                 
-                eta = squeeze(noise(:,s,:));
+                eta = squeeze(noise(:,1,:));
                 psi = [n_channels,n_channels];
                 dims = size(images_temp);
                 channel_data = reshape(images_temp(:,:,s,:),[],n_channels);
@@ -52,7 +52,7 @@ switch opts
                 %                  kernel = ones(27)*0.00000001;
                 
                 
-                sensitivities = squeeze(adaptive_est_sens(reshape(channel_data,[tempdim(1),tempdim(2) 1 n_channels])));
+%                 sensitivities = squeeze(adaptive_est_sens(reshape(channel_data,[tempdim(1),tempdim(2) 1 n_channels])));
                 
                 
                 %
@@ -63,13 +63,13 @@ switch opts
                 % % mask = abs(img_combined) > thresh;
                 % % sensitivities = sensitivities.*mask;
                 %
-                img_combined_opt = sum(channel_data.*conj(sensitivities),3)./sum(sensitivities.*conj(sensitivities),3);
+%                 img_combined_opt = sum(channel_data.*conj(sensitivities),3)./sum(sensitivities.*conj(sensitivities),3);
                 %            [img_combined_opt,smap] = ir_mri_coil_combine(channel_data);
                 % %
                 % %
                 % %
                 % %
-                combined_images(:,:,s) = img_combined_opt;
+%                 combined_images(:,:,s) = img_combined_opt;
                 %                   combined_images(:,:,s) = rssq(channel_data,3); %basic S
             end
             

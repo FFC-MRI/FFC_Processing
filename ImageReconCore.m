@@ -466,7 +466,7 @@ classdef ImageReconCore
             %                                 signaltemp(t,k,n) = mean(temp(t1mask(:,:,k)==1));
             %                             end
             %                         end
-            mF = 0.05;
+            mF = 0.22;
             maskFactor = mF;
             dims = size(obj.magimage);
             nbrow = size(obj.magimage,1);
@@ -489,8 +489,8 @@ classdef ImageReconCore
                 T1Maps(:,:,1,n)=t1map(:,:,:,1);
                 end
             else
-            parfor n=1:n_fields
-                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,:,:,n)),times(n,:),0,t1mask);
+            for n=1:n_fields
+                 t1map = T1map(squeeze(obj.compleximage(:,:,:,:,n)),times(1,:));
                 T1Maps(:,:,1,n)=t1map(:,:,:,1);
             end
             end
