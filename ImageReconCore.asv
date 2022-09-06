@@ -375,8 +375,7 @@ classdef ImageReconCore
             obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));           
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
-            obj.phaseimage =[]; 
-            obj.phaseimage = unwrap_phase(obj.compleximage);
+obj.phaseimage =[];           
            
 %             obj.phaseimage = angle(obj.compleximage);
             

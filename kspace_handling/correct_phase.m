@@ -16,7 +16,7 @@ dims = size(kspace); %we can reshape back to this dimensionality later
     else
         background = [];
     end
-    [I1,ph] = iterative_images_correction_v7(workingkspace(:,:,:,:,:,1),0.20,10,0.00015,background);
+    [I1,ph] = iterative_images_correction_v7(workingkspace(:,:,:,:,:,1),10.015,20,1e-6,background);
     
     phase_correction = reshape(repmat(ph,dims(1),1,1),size(kspace(:,:,:,:,:,1)));
     
@@ -24,5 +24,5 @@ dims = size(kspace); %we can reshape back to this dimensionality later
         correctedkspace(:,:,:,:,:,n) = kspace(:,:,:,:,:,n).*exp(-1i*phase_correction);
     end
 %     
-% correctedkspace = kspace; %bypass for debugging
+ correctedkspace = kspace; %bypass for debugging
 
