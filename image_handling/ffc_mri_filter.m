@@ -1,6 +1,6 @@
 function [filtered_images] = ffc_mri_filter(images,filter_type,kernel)
-%P
-%   Detailed explanation goes here
+% This function decides which noise filter to use based on the input
+% 'filter_type' from the GUI drop down.
 
 
 % % modification:  normalising the images field-by-field (LB 1/03/20, needs
