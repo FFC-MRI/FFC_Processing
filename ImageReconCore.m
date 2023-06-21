@@ -331,7 +331,7 @@ classdef ImageReconCore
                     A = squeeze(A);
                
                 end
-                               %    A = removespikes(A);
+                A = removespikes(A);
                 A = reshape(A,obj.samples,obj.views,[]);
               
                 if obj.samples ~= obj.views && obj.partialkspace ==1
@@ -368,15 +368,15 @@ classdef ImageReconCore
             %phase encoding vertical 
             
             upscale_factor_read = double(obj.fft_size-obj.samples)/2;
-            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
-            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
+            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;           
+            obj.complexkspace = windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function); %perform the kspace windowing first
             obj = correct_orientation(obj);     
             obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
             obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));           
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
             obj.phaseimage =[]; 
-            obj.phaseimage = unwrap_phase(obj.compleximage);
+            %obj.phaseimage = unwrap_phase(obj.compleximage);
            
 %             obj.phaseimage = angle(obj.compleximage);
             
@@ -393,7 +393,46 @@ classdef ImageReconCore
             clear obj.R1Maps
             obj.T1Maps = zeros(dim,dim,n_fields);
             obj.R1Maps = zeros(dim,dim,n_fields);
-           
+            %             %             mask = roipoly;
+            %             switch obj.twopointT1
+            %                 case 1
+            %                     sz = size(obj.compleximage);
+            %                     %                     temp = reshape(obj.compleximage,[dim*dim,[],size(fields)]);
+            %                     for n=1:size(fields)
+            %                         temp = obj.compleximage(:,:,:,:,:,n);
+            %                         signal(:,n) = (abs(temp(:)));
+            %                     end
+            %                     for j = 1:size(signal,1)
+            %                         t1maptemp(j,:) =  TwoPointMultifieldMethod(signal(j,:),fields,200,0.92,times,1,15,2);
+            %                     end
+            %
+            %                     obj.T1maps = reshape(t1maptemp,sz);
+            %
+            %                 otherwise
+            %                     clear obj.T1maps
+            %                     image1 = abs(obj.compleximage(:,:,1,1,1));
+            %                     dummymask = imbinarize(image1);
+            %
+            %                     [idx, centroids]=kmeans(double(image1(:)),5,'distance','sqEuclidean','Replicates',3);
+            %                     segmented_images = cell(1,5);
+            %                     for k = 1:5
+            %                         color = zeros(size(image1));
+            %                         color(idx==k) = image1(idx==k);
+            %                         segmented_images{k} = color;
+            %                     end
+            %                     for n=1:5
+            %                         t1mask(:,:,n) = imbinarize(segmented_images{n});
+            %
+            %                     end
+            %                     for n=1:n_fields
+            %                         tempt1mask = zeros(dim,dim);
+            %                         for k=1:5
+            %                             for t=1:size(times,2)
+            %                                 temp = abs(obj.compleximage(:,:,:,t,n));
+            %
+            %                                 signaltemp(t,k,n) = mean(temp(t1mask(:,:,k)==1));
+            %                             end
+            %                         end
             mF = 0.12;
             maskFactor = mF;
             dims = size(obj.magimage);
@@ -401,7 +440,9 @@ classdef ImageReconCore
             nbcol = size(obj.magimage,2);
             t1mask = zeros(nbrow, nbcol, 1);
             
-
+            
+            
+            
             maskTmp = t1mask(:,:);
             maskTmp = medfilt2(maskTmp); % remove salt and pepper noise
             maskThreshold = maskFactor*max(max(abs(obj.magimage(:,:,1,1,1,1))));
@@ -484,8 +525,7 @@ classdef ImageReconCore
             times = obj.timepoints;
             n_fields = obj.n_fieldpoints;
             R1dispersion = zeros(1,n_fields);
-              signal = (((squeeze(obj.magimage(:,:,:,:,:)))));
-              signal(isnan(signal)) = 0;
+              signal = abs(((squeeze(obj.compleximage(:,:,:,:,:)))));
             signal = signal.*repmat(obj.mask,[1 1 size(signal,3)]);
                  signal = sum(sum(signal,1),2);
                  signal = squeeze(signal);
@@ -493,7 +533,7 @@ classdef ImageReconCore
           
             for n=1:n_fields
                 invtimes = times(n,:);
-                signal = (((squeeze(obj.magimage(:,:,:,:,n)))));
+                signal = abs(((squeeze(obj.compleximage(:,:,:,:,n)))));
                 
                 signal = signal.*repmat(obj.mask,[1 1 size(signal,3)]);
                 signal = sum(sum(signal,1),2);
@@ -502,11 +542,11 @@ classdef ImageReconCore
                 y = signal;
                 
                 [~,index] = min(y);
-%                 if index~=1
-%                     y(1:index-1)=-1.*y(1:index-1);
-%                     y = [y; -y(index)];
-%                     x = [x x(index)];
-%                 end
+                if index~=1
+                    y(1:index-1)=-1.*y(1:index-1);
+                    y = [y; -y(index)];
+                    x = [x x(index)];
+                end
                 %
                 signal = y(1:end);
                 invtimes = x(1:end)./1000;
@@ -518,8 +558,7 @@ classdef ImageReconCore
                 ft = fittype( '((M0-Minf)*exp(-x*R1)+Minf)', 'independent', 'x', 'dependent', 'y' );
                 opts = fitoptions( 'Method', 'NonlinearLeastSquares','Robust','on');
                 opts.Display = 'Off';
-                opts.Algorithm = 'Levenberg-Marquardt';
-                opts.Lower = [-Inf,-Inf,-Inf];
+                opts.Lower = [-Inf,-Inf,0];
                 opts.Upper = [Inf,Inf,Inf];
                 
                 % else
@@ -542,12 +581,7 @@ classdef ImageReconCore
                 %                 Weights = yData;
                 %                 opts.Weights = Weights;
                 opts.Startpoint = [ys(1),ys(end),1/T1est];
-                try
-                [fitob,gof] = fit(xs(1:4),ys(1:4),ft,opts);
-              
-                    
-               errortemp = confint(fitob);
-               error(n) = diff(errortemp(:,3)/2);
+                [fitob,gof] = fit(xs(:),ys(:),ft,opts);
                 
                 
 %                 gofmaptemp(n) = gof.rsquare;
@@ -556,10 +590,7 @@ classdef ImageReconCore
                 
                 
                 R1dispersion(n)= fitob.R1;
-                catch
-                    error(n) = 0;
-                    R1dispersion(n) = 0;
-                end
+                
 %                 gofmaptemp(n) = gof.rsquare;
 %                 error = confint(fitob,0.63);
 %                 errors(n) = diff(error(:,2));
@@ -579,7 +610,6 @@ classdef ImageReconCore
                 
             end
             T1dispersion = 1./R1dispersion.*1000; %in ms
-            error = 1./error.*1000;
             fieldHz = fields.*gammaH*1e-9;
             fields = fields./1e3;
 %               figure, scatter(fieldHz, R1out);
@@ -593,8 +623,7 @@ classdef ImageReconCore
             else
                 disp(['Fields (T): ' num2str(fields')])
                 disp(['T1 (ms): ' num2str(T1dispersion)])
-                disp(['Error:' num2str(error)]);
-                figure,scatter(fields(1:n_fields),T1dispersion,'o');
+                figure,scatter(fields,T1dispersion,'o');
                 set(gca,'xscale','log','yscale','log');
                 xlabel('Evolution Field (T)')
                 ylabel('T_1 (ms)');

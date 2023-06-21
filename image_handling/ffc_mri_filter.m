@@ -9,28 +9,35 @@ function [filtered_images] = ffc_mri_filter(images,filter_type,kernel)
 %     images(:,:,:,:,b) = images(:,:,:,:,b)./repmat(images(:,:,:,1,1),1,1,1,size(images,4));
 % end
 
+previousLocation = pwd;
+cd C:\Users\s02sn2\Desktop\FFCProcessing\FFC-Processing\image_handling\noise_filters
+Files = dir('*.m');
+num_files = length(Files);
+filterArray = {};
+
+for i=1:num_files
+    [pathstr, name, ext] = fileparts(Files(i).name);
+    if strcmp(name,'NoiseFilterTemplate') == false
+        filterArray{end+1} = feval(name);
+    end
+end
+cd(previousLocation);
+
+
 dim = size(images);
 tempimages = abs(reshape(images,dim(1),dim(2),[])); %reshape for processing ease
 
-switch filter_type
-    case 'Generalised Total Variation'
-        parfor n=1:size(tempimages,3)
-            filtered_images(:,:,n) = imtgvsmooth(tempimages(:,:,n),kernel,kernel,200);
-        end
-        
-    case 'Total Variation'
-        parfor n=1:size(tempimages,3)
-            filtered_images(:,:,n) = TVL1denoise(tempimages(:,:,n),kernel,100);
-        end
-    case 'Deep Learning'
-        net = denoisingNetwork('DnCNN');
-        parfor n=1:size(tempimages,3)
-            tempimages(:,:,n) =  tempimages(:,:,n)./max(max( tempimages(:,:,n)));
-              filtered_images(:,:,n) = denoiseImage(tempimages(:,:,n), net);
-        end
-    otherwise
-        filtered_images = tempimages;
+filtered_images = tempimages;
+
+
+for i=1:length(filterArray)
+
+    if strcmp(filter_type,filterArray{i}.processName)== true
+        filtered_images = filterArray{i}.Filter(tempimages,kernel);
+    end
 end
+
+
 filtered_images = reshape(filtered_images,dim);
 end
 
