@@ -10,7 +10,9 @@ function [filtered_images] = ffc_mri_filter(images,filter_type,kernel)
 % end
 
 previousLocation = pwd;
-cd C:\Users\s02sn2\Desktop\FFCProcessing\FFC-Processing\image_handling\noise_filters
+[localDirectory,~,~] = fileparts(mfilename('fullpath'));
+cd(localDirectory);
+cd ..\image_handling\noise_filters;
 Files = dir('*.m');
 num_files = length(Files);
 filterArray = {};
