@@ -6,7 +6,7 @@
 clear
 root = cd;
 
-%% data loading procedures
+%%
 
 % asks to select the folder containing the data. Each folder is to be
 % copied into the analysis folder
@@ -23,15 +23,10 @@ processedData = '.\test'; % folder where the processed data is saved
 cd(rawDataFolder)
 folders = dir;
 sample = {};
-
-
 for fi = 3:numel(folders)
     f = folders(fi);
     cd(root)
-    
-%% Sanity checks and selection of correct sequence
-    
-    %     if exist(f.name,'dir')
+%     if exist(f.name,'dir')
 %         continue
 %     end
     
@@ -54,26 +49,9 @@ for fi = 3:numel(folders)
     if isempty(indffc)
         continue % skip if no FFC sequence found
     end
-
-    
     skipflag = 1; % initialise a skip flag
     for indComplete = indffc(end:-1:1) % find the first complete dataset
         kspace = saveList{indComplete}.data; % to be compared with manual despiking below.
-        sze = size(kspace);
-        if length(sze)==8 % check that there is only one channel (specific to prostate images)
-%             continue
-            kspace = kspace(:,:,:,:,:,:,:,1);
-            sze = size(kspace);
-        end
-        if length(sze)>=7 % chec ksize consistency, to avoid processing images that were aborted
-            if isequal(sze(6:7),[5,4])||isequal(sze(6:7),[6,4])
-                skipflag = 0;
-                break
-            end
-        end
-    
-%% Despiking method
-        
         % despiking
 %         [kspace,~] = autodespike(kspace,60,6);
         switch f.name % manual deskpiking (VM)
@@ -97,14 +75,23 @@ for fi = 3:numel(folders)
             otherwise
 %                  continue % skip processing if the folders dont have spikes
         end
-        
-        
+        sze = size(kspace);
+        if length(sze)==8 % check that there is only one channel (specific to prostate images)
+%             continue
+            kspace = kspace(:,:,:,:,:,:,:,1);
+            sze = size(kspace);
+        end
+        if length(sze)>=7 % chec ksize consistency, to avoid processing images that were aborted
+            if isequal(sze(6:7),[5,4])||isequal(sze(6:7),[6,4])
+                skipflag = 0;
+                break
+            end
+        end
     end
     if skipflag
         continue
     end
 
-%% Correction of motion due to navigator pulse frquency shift
     %
     nlines = sze(2);
     nB0 = sze(7);
@@ -125,8 +112,7 @@ for fi = 3:numel(folders)
             end
         end
     end
-    
-%% phase-encoding artefact correction. 
+    % phase-encoding artefact correction. 
     cd(root)
     if ~exist(f.name,'dir')
         mkdir(root, f.name)
@@ -141,15 +127,11 @@ for fi = 3:numel(folders)
     [imcor,ph,~,bkgd,jj] = iterative_images_correction_v7(kspace(:,:,1,1,1,:,:),0.15,20,0.15,bkgd);  
     % saving the results
     save initial_image.mat imcor bkgd ph kspace
-    
-%% selection of the mask
     if ~isfile('mask.mat')
         mask = sum(~bkgd,3)>(size(bkgd,3)/8);
         save mask.mat mask
     end
     
-    
-%% denoising algorithm
     %----------------------------------------
     % modification VM 02/05/23
     imcor = squeeze(imcor)/max(imcor(:));
@@ -169,7 +151,7 @@ for fi = 3:numel(folders)
     save denoised_image.mat imcordenoised
     %---------------------------------------
     
-%% get the T1 maps
+    % get the T1 maps
     B = [];
     T = [];
     for i = 1:length(saveList{indComplete}.waveformProfile.waveList)
@@ -189,8 +171,6 @@ for fi = 3:numel(folders)
     B = B*1000; % convert into mT
     T = T*1000; % convert into ms
     outfit = run_fit(abs(imcordenoised),T,B,200,mask,0,0);
-    
-%% saving the results    
 %     outfit.R1highres = imresize(outfit.R1,2,"bilinear"); % save a high-resolution version
     save fitresult.mat outfit
     
@@ -200,7 +180,6 @@ for fi = 3:numel(folders)
 end
 cd(root)
 
-%% display the result
 bkgd = squeeze(bkgd(:,:,1));
 % figure;imagesc(abs(imcordenoised(:,:,1,4).*~bkgd))
 % axis off;colormap(gray)
