@@ -73,27 +73,16 @@ for fi = 3:numel(folders)
         end
     
 %% Despiking method
+    %Find the spikes in gui, display the kspace and find the x,y coordinates
+    %nTevo = xx;
+    %nBevo = xx;
+%     imshow(abs(kspace(:,:,1,1,1,nTevo,nBevo)),[0,80])
+%     impixelinfo
         
-        % despiking
-%         [kspace,~] = autodespike(kspace,60,6);
         switch f.name % manual deskpiking (VM)
             case 'TBID_8931 040722'
                 kspace(37:67,56,1,1,1,2,1) = 0;
-            case 'TBID_9012 240822'
-                kspace(6:32,23,1,1,1,5,1) = 0;
-                kspace(38:90,57,1,1,1,1,3,3) = 0;
-            case 'TBID_9122 160123'
-                 kspace(7:60,2,1,1,1,5,2) = 0;
-                 kspace(2:12,39,1,1,1,2,3) = 0;
-                 kspace(33:80,25,1,1,1,4,2) = 0;
-            case 'TBID_9112 090123'    
-                 kspace(53:90,58,1,1,1,3,2) = 0;
-            case 'TBID_8817 130422'
-                 kspace(:,27,1,1,1,5,3) = 0;
-            case 'TBID_9113 090123'
-                 kspace(4:45,45,1,1,1,1,2) = 0;    
-            case 'TBID_9094 011222'
-                 kspace(69:86,55,1,1,1,5,3) = 0;  
+           
             otherwise
 %                  continue % skip processing if the folders dont have spikes
         end
