@@ -1,0 +1,29 @@
+%% Denoise the image
+image = abs(image);
+imagen = image./max(image(:)); %normalise images
+
+N_times = size(image,3);
+N_fields = size(image,4);
+figure;imagesc(imagen(:,:,1,1)); %plot image to select the noise area
+
+     for i = 1:N_fields
+         for  j = 1:N_times
+             img = imagen(:,:,j,i);
+             noise = std2(img(1:10,1:100))+ 0.2*std2(img(1:10,1:100)); %(y,x)
+             denoised_image = BM3D(img,noise);
+             denoised_image_5D(:,:,1,j,i) = denoised_img;
+        end
+     end
+     
+denoised_image = denoised_image_5D;
+
+%%  %% plot images
+figure
+imagesc(abs(image(:,:,1,1)));colormap(gray);%camroll(90);
+title('Raw')
+
+figure
+imagesc(abs(img(:,:,1,1,1)));colormap(gray);%camroll(90);
+title('Denoised')
+
+
