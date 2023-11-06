@@ -361,6 +361,55 @@ classdef ImageReconCore
                 obj.originalcomplexkspace = obj.complexkspace;
             end
         end
+        
+        function obj = pipelinePreprocessing(obj,autoDespike) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set           
+            if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
+                temp1 = load(obj.filelocation);
+                matfile = temp1.saveList{obj.fileindex};
+                obj.views = size(obj.rawdata,2);
+                A = double(obj.rawdata);
+                A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
+                A = mean(A,7);
+                A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
+                
+                if obj.echoes>1
+                    A(:,:,2,:,:,:) = []; %throw out the navigator data
+                else
+                    A = squeeze(A);
+               
+                end
+                if autoDespike == true
+                  A = removespikes(A);  
+                end
+                A = reshape(A,obj.samples,obj.views,[]);
+              
+                if obj.samples ~= obj.views && obj.partialkspace ==1
+                    A = padarray(double(A),[0,double(obj.samples-obj.views)],0,'post');
+                    obj.views = obj.samples;
+                    if mean(A(:,1,1))==0
+                        A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
+                    end
+                    %             AA = centre_kspace(AA);
+                    
+                    %PF recon if we need to
+                    try
+                        for n=1:size(A,3)
+                            [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
+                        end
+                    catch
+                    end
+                    
+                end
+                A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+                
+                obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                obj.originalcomplexkspace =obj.complexkspace; %so we can undo windowing etc keep an untouched version of kspace prior to FFT
+            else
+                obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
+                obj.originalcomplexkspace = obj.complexkspace;
+            end
+        end
             
             
         function obj = buildimages(obj)

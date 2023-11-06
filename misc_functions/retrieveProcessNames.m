@@ -25,7 +25,6 @@ for i=1:num_files
     end
 end
 cd(previousLocation);
-
 output = nameArray;
 
 end
