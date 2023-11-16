@@ -1,4 +1,4 @@
-function [output] = retrieveProcessNames()
+function [output] = retrieveProcessNames(processType)
 %RETRIEVEPROCESSNAMES This function retrieves all the names for all the
 %classes in a folder. 
 
@@ -7,7 +7,11 @@ function [output] = retrieveProcessNames()
 previousLocation = pwd;
 [localDirectory,~,~] = fileparts(mfilename('fullpath'));
 cd(localDirectory);
-cd ..\image_handling\noise_filters;
+if strcmp(processType,'Noise') == true 
+    cd ..\image_handling\noise_filters;
+elseif strcmp(processType,'R1') == true 
+    cd ..\analysis_methods\T1Sequences;
+end
 Files = dir('*.m');
 num_files = length(Files);
 
@@ -20,7 +24,7 @@ nameArray{1} = 'None';
 %name values are put into a list to be returned.
 for i=1:num_files
     [pathstr, name, ext] = fileparts(Files(i).name);
-    if strcmp(name,'NoiseFilterTemplate') == false
+    if strcmp(name,'NoiseFilterTemplate') == false && strcmp(name,'R1Template') == false
         nameArray{end+1} = feval(name).processName;
     end
 end
