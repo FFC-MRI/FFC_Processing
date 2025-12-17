@@ -77,27 +77,7 @@ classdef FIDclass
             fclose(fid);
             [name,file] = fileparts(obj.param.PPL{:}); %decomposes pulse sequence path and file name into parts
             
-            
-%             for n=1:50
-%                 fields(n) = str2num(obj.param.b_evol{1+n});
-%                 times(n) = str2num(obj.param.t_evol{1+n});
-%             end
-%             n_fields = length(unique(fields));
-%             n_times = obj.nmrexperiments/n_fields;
-%             times = times(1:n_fields*n_times);
-%             obj.times = reshape(times,[n_times n_fields]);
-%             obj.fields = unique(fields(fields~=0));
-%             dim1 = obj.nmrsamples;
-%             dim2 = obj.nmrviews;
-%             
-%             AA = reshape(obj.nmrdata,[dim1 dim2 2 1 n_fields]);
-%             AAA = squeeze(AA(:,:,2,:,:));
-%             for i = 1:n_fields
-%                 for j= 1:n_times
-%                     obj.image(:,:,i,j) = abs(ifftshift(ifft2(AAA(:,:,j,i))));
-%                 end
-%             end
-            
+
             
             obj.sequence = file;
             

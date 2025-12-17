@@ -16,6 +16,10 @@ classdef ImageReconCore
         magkspace
         scaledimages
         phaseimage
+        psirrealimage    % <-- use this for fitting (signed)
+        psirimagimage                 % residuals (diagnostic)
+        psirphi_ref                  % saved for QC
+        psirweights 
         nfids %number of nmr excitations used to generate the file
         nmrdatatype %data type
         echoes %number of echoes. Defaults to 1 for sequences if unused.
@@ -58,11 +62,14 @@ classdef ImageReconCore
         n_receivers %number of receivers
         multichannel_recon %how to deal with multiple channels?
         rot_theta %describes rotation applied using GUI
-        hor_theta %mirror horizontally
-        ver_theta %mirror vertically
+        flipH %mirror horizontally
+        flipV %mirror vertically
         param = struct %other sequence parameters go here       
         SENSE %undersampled
         registration_tform %transformation used for image registration
+        TwoDimensional
+        recon2d
+        geomT
         
     end
     
@@ -104,7 +111,7 @@ classdef ImageReconCore
                     obj.experiments = size(file.data,6)*size(file.data,7);
                     obj.averages = size(file.data,8);
                     obj.n_receivers = size(file.data,9);
-                  
+                  obj.recon2d = obj.samples;
                     
                     truedim1 = size(file.data,1); %try to deal with aborted or corrupted scans by looking at what we have vs what we expected
                     truedim2 = size(file.data,2);
@@ -123,6 +130,7 @@ classdef ImageReconCore
                     obj.rawdata = reshape(file.data,obj.samples,obj.views,[]); %reshaping to the correct dimensions will happen later, for now stick with [2D,everything else] for preprocessing
                     obj.n_timepoints = size(file.data,6);
                     obj.n_fieldpoints = size(file.data,7);
+                    
                     obj.timepoints = file.waveformProfile.generator.Tevo.*1000;
                     obj.fieldpoints = file.waveformProfile.generator.Bevo.*1000;
                     obj.fov = cell2mat(file.pprParamList(strcmp('FOV', file.pprParamList(:,1)),2));
@@ -165,6 +173,7 @@ classdef ImageReconCore
                     obj.denoise_filter = 'none';
                     obj.denoise_params = []; %filter kernel
                     obj.param = file.pprParamList;
+                    obj.TwoDimensional =1;
                     [~,obj.sequence] = bst_fileparts(cell2mat(file.pprParamList(strcmp('PPL', file.pprParamList(:,1)),2)));
                     switch obj.sequence
                         case 'H9_ir_se_nav_v2'
@@ -298,6 +307,75 @@ classdef ImageReconCore
                         case 'H9_ge_looklocker_nav'
                             obj.sequence = 'H9_ge_looklocker';
                     end
+
+                case '.dat'
+                obj.rawdata = fid.data;
+                 obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
+                obj.samples = fid.par.md1d;
+                obj.views = fid.par.md2d;
+                obj.slices = fid.par.md3d;
+                obj.experiments =fid.par.md4d;
+                obj.n_receivers = fid.par.ncoils;
+                obj.echoes = 1;
+                obj.TE = fid.par.te*1000;
+                obj.FlipAngle = fid.par.fa;
+                obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
+                obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
+                obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
+                obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
+                obj.resolution_throughplane = obj.thk;
+                obj.sequence = fid.par.serieName;
+                obj.partialkspace =0;
+                if fid.par.cameleon.USER_ZERO_FILLING_2D ~=0
+                    obj.partialkspace =0;
+                
+                end
+               obj.geomT = eye(3);
+ 
+                obj.recon2d = fid.par.cameleon.USER_MATRIX_DIMENSION_2D;
+              
+                obj.averages =1;
+                obj.twopointT1 = 0;
+                    obj.window_function = 'none';
+                    obj.window_size = 1;
+                    obj.fft_size = obj.samples;
+                    obj.denoise_filter = 'none';
+                    obj.denoise_params = []; %filter kernel
+                    obj.param = fid.par.cameleon;
+                   
+                    if fid.par.cameleon.MULTI_PLANAR_EXCITATION ==1
+                        obj.TwoDimensional = 1;
+                    else
+                        obj.TwoDimensional = 0; %ie 3d
+                    end
+                if strcmp(obj.param.TRANSFORM_PLUGIN,'Sequential4DCine')
+                obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
+                obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET';
+                obj.n_fieldpoints =1;
+                obj.fieldpoints = 200;
+
+                elseif strcmp(obj.param.SEQUENCE_NAME,'FFC_GE')
+                    obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
+                    if obj.param.FCI_T1_LOG_DIST ==1
+                        for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                       obj.timepoints(n,:) = logspace(log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER),log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER),obj.param.FCI_NUMBER_OF_TEVO);    
+                        end
+                    else
+                    for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                        obj.timepoints(n,:) = linspace(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER,obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER,obj.param.FCI_NUMBER_OF_TEVO);
+                    end
+                    end
+                    obj.timepoints = obj.timepoints.*1000;
+                    obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
+                    obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
+                    
+                
+                else
+                     obj.n_timepoints=1;
+                     obj.n_fieldpoints =1;
+                     obj.timepoints = 1;
+                     obj.fieldpoints = 200;
+                end
             end
             %% 
         end %function
@@ -317,12 +395,16 @@ classdef ImageReconCore
             
         function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set           
             if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
+                try
                 temp1 = load(obj.filelocation);
                 matfile = temp1.saveList{obj.fileindex};
+                catch
+                end
                 obj.views = size(obj.rawdata,2);
-                A = double(obj.rawdata);
+                A = single(obj.rawdata);
                 A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
                 A = mean(A,7);
+                if 1 ==1
                 A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
                 
                 if obj.echoes>1
@@ -331,12 +413,22 @@ classdef ImageReconCore
                     A = squeeze(A);
                
                 end
-                               %    A = removespikes(A);
+
+                if obj.recon2d == 0
+                end
+
+                                   A = removespikes(A);
                 A = reshape(A,obj.samples,obj.views,[]);
               
                 if obj.samples ~= obj.views && obj.partialkspace ==1
-                    A = padarray(double(A),[0,double(obj.samples-obj.views)],0,'post');
+                    try 
+                    A = padarray(single(A),[0,single(obj.recon2d-obj.views)],0,'post');    
+                    obj.views = obj.recon2d;
+                    catch
+                         A = padarray(single(A),[0,single(obj.samples-obj.views)],0,'post');
                     obj.views = obj.samples;
+                    end
+                   
                     if mean(A(:,1,1))==0
                         A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
                     end
@@ -351,34 +443,105 @@ classdef ImageReconCore
                     end
                     
                 end
+                
                 A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
-                
+               % fprintf("kspace delta: %.3g\n", norm(correctedkspace(:)-A(:)) / norm(A(:)));
+                else
+                  correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 obj.originalcomplexkspace =obj.complexkspace; %so we can undo windowing etc keep an untouched version of kspace prior to FFT
+                obj.complexkspace = noise_whiten(obj.complexkspace,obj);
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
                 obj.originalcomplexkspace = obj.complexkspace;
-            end
+                obj.complexkspace = noise_whiten(obj.complexkspace,obj);
+                end
+                
         end
             
             
         function obj = buildimages(obj)
             
+            if obj.TwoDimensional==1
             %phase encoding vertical 
-            
             upscale_factor_read = double(obj.fft_size-obj.samples)/2;
             upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
             obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-            obj = correct_orientation(obj);     
+
+
+
+
+
+      % Preallocate the complexkspace matrix
+% tempComplexKspace = obj.complexkspace;
+% 
+% refNoise = tempComplexKspace(:,:,:,:,end);   % broadcast-only reference
+% 
+% for n = 1:obj.n_receivers
+%     local = tempComplexKspace(:,:,:,:,n);   % sliced read once
+% 
+%     for f = 1:obj.n_fieldpoints(1)
+%         for t = 1:obj.n_timepoints
+%             for s = 1:obj.slices
+%                 % build editornoise from the broadcast refNoise (not from local n)
+%                 editornoise = zeros(size(local,1), size(local,2), 2);
+%                 % editornoise(:,:,1) = local(:,:,s,t,f);            % if you need chan 8 etc., fetch from ref arrays
+%                 editornoise(:,:,2) = refNoise(:,:,s,t,f);            % channel 15 reference
+% 
+%                 sliceData = local(:,:,s,t,f);
+%                 local(:,:,s,t,f) = editer(sliceData, editornoise);
+%             end
+%         end
+%     end
+% % 
+%     tempComplexKspace(:,:,:,:,n) = local;   % sliced write once
+%  end
+% 
+%     % Assign modified data back to the corresponding timepoint
+%     complexkspace(:, :, :, :, :, :) = tempComplexKspace;
+% 
+
+% Assign the updated complexkspace back to obj after the loop
+%obj.complexkspace = complexkspace;
+            % obj.complexkspace(:,:,:,2) =0;
+            % obj.complexkspace(:,:,:,:,:,16) =0;
+            obj = correct_orientation(obj);   
+
+         
+          
+            
+
             obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
-            obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));           
+            obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));            
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
             obj.phaseimage =[]; 
-            obj.phaseimage = unwrap_phase(obj.compleximage);
+            obj.phaseimage = rssq((angle(obj.compleximage)),5);
            
-%             obj.phaseimage = angle(obj.compleximage);
+
+            else
+            upscale_factor_read = double(obj.fft_size-obj.samples)/2;
+            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
+            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
+            
+            
+          
+            obj = correct_orientation(obj);  
+            for r=1:size(obj.complexkspace,6)
+            for f=1:size(obj.complexkspace,5)
+            for t=1:size(obj.complexkspace,4)
+            obj.compleximage(:,:,:,t,f,r)=fftshift(ifftn(ifftshift(padarray(obj.complexkspace(:,:,:,t,f,r) ,[round(upscale_factor_phase) round(upscale_factor_read)],0))));
+            end
+            end
+            end
+            obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));           
+            obj.magkspace = abs(fftshift(ifftn(obj.magimage)));
+            obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
+            obj.phaseimage =[]; 
+            obj.phaseimage = angle(obj.compleximage);
+            end
             
         end %here the conversion from k-space to image space is performed, including FFT and multi-coil reconstruction
         
@@ -391,10 +554,10 @@ classdef ImageReconCore
             n_fields = obj.n_fieldpoints;
             clear obj.T1Maps
             clear obj.R1Maps
-            obj.T1Maps = zeros(dim,dim,n_fields);
-            obj.R1Maps = zeros(dim,dim,n_fields);
+            obj.T1Maps = zeros(dim,dim,obj.slices,n_fields(1));
+            obj.R1Maps = zeros(dim,dim,obj.slices,n_fields(1));
            
-            mF = 0.12;
+            mF = 0.01;
             maskFactor = mF;
             dims = size(obj.magimage);
             nbrow = size(obj.magimage,1);
@@ -409,21 +572,87 @@ classdef ImageReconCore
             t1mask = maskTmp;
             clear maskTmp
             imagestobeprocessed = obj.magimage;
+
+% % Define data and model
+%  % Inversion times (ms)
+% % Preallocate results map
+% % Preallocate results map
+% maps = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2), 1, n_fields(1));
+% 
+% % Precompute values used in all iterations
+% min_noise_threshold = 20 * min(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1)); % Noise threshold
+% initial_sigma = std(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1));           % Initial sigma estimate
+% tic
+% % Parallel processing
+% parfor n = 1:n_fields(1)
+%     local_map = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2)); % Temporary map for this field
+% 
+%     for x = 1:size(imagestobeprocessed, 1)
+%         for y = 1:size(imagestobeprocessed, 2)
+%             t = times(n, :)';
+%             S_obs = squeeze(imagestobeprocessed(x, y, :, :, n)); % Observed signal intensities
+% 
+%             % Skip pixels with low intensity
+%             if max(S_obs) < min_noise_threshold
+%                 continue;
+%             end
+% 
+%             % Select the signal model based on n
+%             if n == 1
+%                 % Recovery from -M0
+%                 model = @(params, t) abs(params(1) * (1 - 2 * exp(-t / params(2))));
+%             else
+%                 % Decay from M0 to 0
+%                 model = @(params, t) params(1) * exp(-t / params(2));
+%             end
+% 
+%             % Log-likelihood function including sigma
+%             objective = @(params) -sum(log( ...
+%                 (S_obs / params(3)^2) .* ...
+%                 exp(-(S_obs.^2 + model(params, t).^2) / (2 * params(3)^2)) .* ...
+%                 besseli(0, (S_obs .* model(params, t)) / params(3)^2) ...
+%             ));
+% 
+%             % Initial guesses [M0, T1, sigma]
+%             initial_guess = [max(S_obs), 100, initial_sigma];
+% 
+%             % Optimization
+%             options = optimset('Display', 'off', 'TolFun', 1e-6);
+%             params_opt = fminsearch(objective, initial_guess, options);
+% 
+%             % Store T1 value in local map
+%             local_map(x, y) = params_opt(2);
+%         end
+%     end
+% 
+%     % Assign the local map for this field to the global maps variable
+%     maps(:, :, 1, n) = local_map;
+% end
+% 
+% obj.T1Maps = maps;
+% toc
+
+
+
             if obj.checkfit
+                for s=1:obj.slices
                 for n=1:n_fields
-                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,:,:,n)),times(n,:),1,t1mask);
-                T1Maps(:,:,1,n)=t1map(:,:,:,1);
+                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),1,t1mask);
+                T1Maps(:,:,s,n)=t1map(:,:,1,1);
+                end
                 end
             else
-            for n=1:n_fields
-                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,:,:,n)),times(n,:),0,t1mask);
-                T1Maps(:,:,1,n)=t1map(:,:,:,1);
-            end
+           for s=1:obj.slices
+                for n=1:n_fields
+                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),0,t1mask);
+                T1Maps(:,:,s,n)=t1map(:,:,1,1);
+                end
+                end
             end
             
             
-            obj.T1Maps = T1Maps;
-            obj.R1Maps = 1000./T1Maps;
+             obj.T1Maps = T1Maps;
+            obj.R1Maps = 1000./obj.T1Maps;
             
             %                         %                    x = times(1,:);
             %                         for k=1:5
@@ -479,35 +708,39 @@ classdef ImageReconCore
             
         end %image based T1 analysis methods are contained here
         
-        function obj = T1dispersion(obj)
+        function obj = T1dispersion(obj,slice)
             fields = obj.fieldpoints; %list of evolution times in seconds
             times = obj.timepoints;
             n_fields = obj.n_fieldpoints;
-            R1dispersion = zeros(1,n_fields);
+            R1dispersion = zeros(1,n_fields(1));
               signal = (((squeeze(obj.magimage(:,:,:,:,:)))));
               signal(isnan(signal)) = 0;
             signal = signal.*repmat(obj.mask,[1 1 size(signal,3)]);
-                 signal = sum(sum(signal,1),2);
-                 signal = squeeze(signal);
+                signal = squeeze(sum(signal .* obj.mask, [1 2 3]) ./ sum(obj.mask(:)));
 %              [fitobject,gof,R1out] = fit_relaxation(signal,times./1000,fields,0.200);
           
-            for n=1:n_fields
+            for n=1:n_fields(1)
                 invtimes = times(n,:);
-                signal = (((squeeze(obj.magimage(:,:,:,:,n)))));
+                signal = (((squeeze(obj.magimage(:,:,slice,:,n)))));
                 
-                signal = signal.*repmat(obj.mask,[1 1 size(signal,3)]);
-                signal = sum(sum(signal,1),2);
-                signal = squeeze(signal);
+for t=1:obj.n_timepoints
+signalt = signal(:,:,t).*obj.mask;
+signaltt(t) = sum(sum(signalt));
+end
+signal = signaltt';                
+              
                 x = invtimes;
                 y = signal;
                 
                 [~,index] = min(y);
-%                 if index~=1
-%                     y(1:index-1)=-1.*y(1:index-1);
-%                     y = [y; -y(index)];
-%                     x = [x x(index)];
-%                 end
-                %
+                 if index~=1 && index ~= size(invtimes,2) 
+
+                    y(1:index-1)=-1.*y(1:index-1);
+                    y = [y; -y(index)];
+                    x = [x x(index)];
+
+                 end
+
                 signal = y(1:end);
                 invtimes = x(1:end)./1000;
                 
@@ -543,7 +776,7 @@ classdef ImageReconCore
                 %                 opts.Weights = Weights;
                 opts.Startpoint = [ys(1),ys(end),1/T1est];
                 try
-                [fitob,gof] = fit(xs(1:4),ys(1:4),ft,opts);
+                [fitob,gof] = fit(xs,ys,ft,opts);
               
                     
                errortemp = confint(fitob);
@@ -591,16 +824,42 @@ classdef ImageReconCore
                 xlabel('Evolution Field (MHz)')
                 ylabel('R_1 (s^-^1)');
             else
-                disp(['Fields (T): ' num2str(fields')])
+                disp(['Fields (T): ' num2str(fields)])
                 disp(['T1 (ms): ' num2str(T1dispersion)])
                 disp(['Error:' num2str(error)]);
-                figure,scatter(fields(1:n_fields),T1dispersion,'o');
+                figure,plot(fields(1:n_fields(1)),T1dispersion,'o');
                 set(gca,'xscale','log','yscale','log');
                 xlabel('Evolution Field (T)')
                 ylabel('T_1 (ms)');
                 obj.dispersioncurve = R1dispersion;
             end
         end %ROI based T1 methods are contained here
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
     end
     
     

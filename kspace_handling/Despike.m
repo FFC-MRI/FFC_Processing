@@ -1,4 +1,4 @@
-function [kspace] = removespikes(kspace)
+function [kspace] = Despike(kspace)
 %Try and remove dubious kspace lines
 %   Detailed explanation goes here
 
@@ -8,11 +8,14 @@ function [kspace] = removespikes(kspace)
 dims = size(kspace);
 kspace = reshape(kspace,dims(1),dims(2),[]);
 for p=1:size(kspace,3)
-kspace(:,:,p) = despike_kspace_sym(kspace(:,:,p),5,20);
- end
+kspace = despike_kspace_sym(kspace(:,:,p),5);
+end
 
+
+
+end
 
 kspace = reshape(kspace,dims);
 
-end
+
 

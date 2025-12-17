@@ -22,6 +22,10 @@ switch sequence
             case "H9_ir_se"
                 kspace(:,:,1,:,:,:,:,:) = kspace(:,:,2,:,:,:,:,:);
                 A = kspace;
+
+    
+
+
     otherwise
         
    
