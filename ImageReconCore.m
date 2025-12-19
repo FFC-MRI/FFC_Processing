@@ -310,7 +310,7 @@ classdef ImageReconCore
 
                 case '.dat'
                 obj.rawdata = fid.data;
-                 obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
+                obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
                 obj.samples = fid.par.md1d;
                 obj.views = fid.par.md2d;
                 obj.slices = fid.par.md3d;
@@ -417,7 +417,7 @@ classdef ImageReconCore
                 if obj.recon2d == 0
                 end
 
-                                   A = removespikes(A);
+                                %   A = removespikes(A);
                 A = reshape(A,obj.samples,obj.views,[]);
               
                 if obj.samples ~= obj.views && obj.partialkspace ==1
@@ -445,18 +445,22 @@ classdef ImageReconCore
                 end
                 
                 A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+              %  [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+              correctedkspace = A;
                % fprintf("kspace delta: %.3g\n", norm(correctedkspace(:)-A(:)) / norm(A(:)));
                 else
                   correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                obj.originalcomplexkspace =obj.complexkspace; %so we can undo windowing etc keep an untouched version of kspace prior to FFT
+                 %so we can undo windowing etc keep an untouched version of kspace prior to FFT
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
+                obj = correct_orientation(obj); 
+                obj.originalcomplexkspace =obj.complexkspace;
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
-                obj.originalcomplexkspace = obj.complexkspace;
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
+                obj = correct_orientation(obj);   
+              obj.originalcomplexkspace = obj.complexkspace;
                 end
                 
         end
@@ -467,9 +471,10 @@ classdef ImageReconCore
             if obj.TwoDimensional==1
             %phase encoding vertical 
             upscale_factor_read = double(obj.fft_size-obj.samples)/2;
-            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
+            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;   
+            
             obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-
+           % obj.complexkspace = correct_ringdown_perKz(obj.complexkspace);
 
 
 
@@ -506,14 +511,11 @@ classdef ImageReconCore
 % Assign the updated complexkspace back to obj after the loop
 %obj.complexkspace = complexkspace;
             % obj.complexkspace(:,:,:,2) =0;
-            % obj.complexkspace(:,:,:,:,:,16) =0;
-            obj = correct_orientation(obj);   
 
-         
-          
-            
 
             obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
+ 
+
             obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));            
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
@@ -525,10 +527,7 @@ classdef ImageReconCore
             upscale_factor_read = double(obj.fft_size-obj.samples)/2;
             upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
             obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-            
-            
-          
-            obj = correct_orientation(obj);  
+            %obj = correct_orientation(obj);  
             for r=1:size(obj.complexkspace,6)
             for f=1:size(obj.complexkspace,5)
             for t=1:size(obj.complexkspace,4)

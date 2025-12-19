@@ -46,7 +46,7 @@ function correctedkspace = correct_phase(kspace, backgroundtest, n_receivers)
 
     % Estimate phase per page (iterative_images_correction_v7 supports stacks)
     % Output ph will be [1 Ny Npages]
-    [~, ph] = iterative_images_correction_v9(kRefPages, 1, 50, 1e-3, background);
+    [~, ph] = iterative_images_correction_v9(kRefPages, 0.0015, 20, 1e-5, background);
 
     % Ensure ph is [1 Ny Npages]
     if ismatrix(ph)
@@ -65,7 +65,7 @@ function correctedkspace = correct_phase(kspace, backgroundtest, n_receivers)
     kAll = kAll .* exp(-1i * phasePages);        % implicit expansion over Nc
 
     correctedkspace = reshape(kAll, dims);
-     % correctedkspace = kspace;
+    
 end
 
 
