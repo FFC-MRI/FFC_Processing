@@ -350,7 +350,7 @@ classdef ImageReconCore
                     end
                 if strcmp(obj.param.TRANSFORM_PLUGIN,'Sequential4DCine')
                 obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
-                obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET';
+                obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET;
                 obj.n_fieldpoints =1;
                 obj.fieldpoints = 200;
 
@@ -474,10 +474,6 @@ classdef ImageReconCore
             upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;   
             
             obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-           % obj.complexkspace = correct_ringdown_perKz(obj.complexkspace);
-
-
-
 
       % Preallocate the complexkspace matrix
 % tempComplexKspace = obj.complexkspace;
@@ -514,8 +510,6 @@ classdef ImageReconCore
 
 
             obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
- 
-
             obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));            
             obj.magkspace = abs(fft2c(obj.magimage));
             obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
@@ -526,8 +520,7 @@ classdef ImageReconCore
             else
             upscale_factor_read = double(obj.fft_size-obj.samples)/2;
             upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
-            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-            %obj = correct_orientation(obj);  
+            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first  
             for r=1:size(obj.complexkspace,6)
             for f=1:size(obj.complexkspace,5)
             for t=1:size(obj.complexkspace,4)
@@ -571,67 +564,6 @@ classdef ImageReconCore
             t1mask = maskTmp;
             clear maskTmp
             imagestobeprocessed = obj.magimage;
-
-% % Define data and model
-%  % Inversion times (ms)
-% % Preallocate results map
-% % Preallocate results map
-% maps = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2), 1, n_fields(1));
-% 
-% % Precompute values used in all iterations
-% min_noise_threshold = 20 * min(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1)); % Noise threshold
-% initial_sigma = std(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1));           % Initial sigma estimate
-% tic
-% % Parallel processing
-% parfor n = 1:n_fields(1)
-%     local_map = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2)); % Temporary map for this field
-% 
-%     for x = 1:size(imagestobeprocessed, 1)
-%         for y = 1:size(imagestobeprocessed, 2)
-%             t = times(n, :)';
-%             S_obs = squeeze(imagestobeprocessed(x, y, :, :, n)); % Observed signal intensities
-% 
-%             % Skip pixels with low intensity
-%             if max(S_obs) < min_noise_threshold
-%                 continue;
-%             end
-% 
-%             % Select the signal model based on n
-%             if n == 1
-%                 % Recovery from -M0
-%                 model = @(params, t) abs(params(1) * (1 - 2 * exp(-t / params(2))));
-%             else
-%                 % Decay from M0 to 0
-%                 model = @(params, t) params(1) * exp(-t / params(2));
-%             end
-% 
-%             % Log-likelihood function including sigma
-%             objective = @(params) -sum(log( ...
-%                 (S_obs / params(3)^2) .* ...
-%                 exp(-(S_obs.^2 + model(params, t).^2) / (2 * params(3)^2)) .* ...
-%                 besseli(0, (S_obs .* model(params, t)) / params(3)^2) ...
-%             ));
-% 
-%             % Initial guesses [M0, T1, sigma]
-%             initial_guess = [max(S_obs), 100, initial_sigma];
-% 
-%             % Optimization
-%             options = optimset('Display', 'off', 'TolFun', 1e-6);
-%             params_opt = fminsearch(objective, initial_guess, options);
-% 
-%             % Store T1 value in local map
-%             local_map(x, y) = params_opt(2);
-%         end
-%     end
-% 
-%     % Assign the local map for this field to the global maps variable
-%     maps(:, :, 1, n) = local_map;
-% end
-% 
-% obj.T1Maps = maps;
-% toc
-
-
 
             if obj.checkfit
                 for s=1:obj.slices
