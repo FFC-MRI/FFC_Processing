@@ -1,7 +1,7 @@
 classdef ImageReconCore
     %UNTITLED Summary of this class goes here
     %   Detailed explanation goes here
-    
+
     properties (SetAccess = public)
         sequence %the pulse sequence ppl name (eg gechoa, fse etc)
         displayname %user friendly sequence name eg Spin-Echo
@@ -19,7 +19,7 @@ classdef ImageReconCore
         psirrealimage    % <-- use this for fitting (signed)
         psirimagimage                 % residuals (diagnostic)
         psirphi_ref                  % saved for QC
-        psirweights 
+        psirweights
         nfids %number of nmr excitations used to generate the file
         nmrdatatype %data type
         echoes %number of echoes. Defaults to 1 for sequences if unused.
@@ -64,21 +64,21 @@ classdef ImageReconCore
         rot_theta %describes rotation applied using GUI
         flipH %mirror horizontally
         flipV %mirror vertically
-        param = struct %other sequence parameters go here       
+        param = struct %other sequence parameters go here
         SENSE %undersampled
         registration_tform %transformation used for image registration
         TwoDimensional
         recon2d
         geomT
-        
+
     end
-    
-    
+
+
     methods
         function obj = ImageReconCore(fid,filetype,varargin) %Constructor function. Takes file ID (fid) and fills properties with the appropriate data from the file.
             % patch for full path argument (LB 25/06/12, 3 lines)
             switch filetype
-                %% 
+                %%
                 case '.mat'
                     filename = fopen(fid);
                     obj.filelocation = filename;
@@ -93,33 +93,33 @@ classdef ImageReconCore
                     obj.samples = cell2mat(file.pprParamList(strcmp('NO_SAMPLES', file.pprParamList(:,1)),3));
                     obj.views = cell2mat(file.pprParamList(strcmp('NO_VIEWS', file.pprParamList(:,1)),3));
                     if isempty(cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3)))
-                    obj.views2 = 1;
+                        obj.views2 = 1;
                     else
-                    obj.views2 = cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3));
+                        obj.views2 = cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3));
                     end
-                    
+
                     obj.slices = cell2mat(file.pprParamList(strcmp('NO_SLICES', file.pprParamList(:,1)),3));
-                   
+
                     if isempty(cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3)))
-                    obj.echoes = 1;
+                        obj.echoes = 1;
                     else
-                    obj.echoes = cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3));
+                        obj.echoes = cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3));
                     end
-                    
-                    
-                    
+
+
+
                     obj.experiments = size(file.data,6)*size(file.data,7);
                     obj.averages = size(file.data,8);
                     obj.n_receivers = size(file.data,9);
-                  obj.recon2d = obj.samples;
-                    
+                    obj.recon2d = obj.samples;
+
                     truedim1 = size(file.data,1); %try to deal with aborted or corrupted scans by looking at what we have vs what we expected
                     truedim2 = size(file.data,2);
-                    
-%                     if truedim1 > obj.samples
-%                         file.data = file.data(1:obj.samples,:,:,:,:,:,:,:); %deal with that strange 4x 0 padding issue the new evo produces.
-%                     end
-%                     
+
+                    %                     if truedim1 > obj.samples
+                    %                         file.data = file.data(1:obj.samples,:,:,:,:,:,:,:); %deal with that strange 4x 0 padding issue the new evo produces.
+                    %                     end
+                    %
                     if truedim1 <  obj.samples
                         file.data = padarray(file.data,abs(obj.samples-truedim1),0,'post');
                     end
@@ -130,7 +130,7 @@ classdef ImageReconCore
                     obj.rawdata = reshape(file.data,obj.samples,obj.views,[]); %reshaping to the correct dimensions will happen later, for now stick with [2D,everything else] for preprocessing
                     obj.n_timepoints = size(file.data,6);
                     obj.n_fieldpoints = size(file.data,7);
-                    
+
                     obj.timepoints = file.waveformProfile.generator.Tevo.*1000;
                     obj.fieldpoints = file.waveformProfile.generator.Bevo.*1000;
                     obj.fov = cell2mat(file.pprParamList(strcmp('FOV', file.pprParamList(:,1)),2));
@@ -142,9 +142,9 @@ classdef ImageReconCore
                     temp1 = temp1{1,1}{1,1};
                     obj.bandwidth = 10000/temp1;
                     phaseoverundersample = cell2mat(file.pprParamList(strcmp('oversample2', file.pprParamList(:,2)),3));
-                     obj.SENSE = 0;
+                    obj.SENSE = 0;
                     try
-                    obj.SENSE = cell2mat(file.pprParamList(strcmp('sense_onoff', file.pprParamList(:,2)),3));
+                        obj.SENSE = cell2mat(file.pprParamList(strcmp('sense_onoff', file.pprParamList(:,2)),3));
                     catch
                     end
                     if obj.views ~= obj.samples && phaseoverundersample == 0
@@ -185,12 +185,12 @@ classdef ImageReconCore
                         case 'H9_se_multislice'
                         case 'H9_ge_looklocker_nav'
                             obj.sequence = 'H9_ge_looklocker';
-                            
+
                     end
                     fclose(fid);
-                    %% 
+                    %%
                 case '.MRD'
-                    %% 
+                    %%
                     if ischar(fid)
                         fid = fopen(fid);
                     end
@@ -207,7 +207,7 @@ classdef ImageReconCore
                     obj.echoes = single(fread(fid, 1, '*int32'));
                     obj.experiments = single(fread(fid, 1, '*int32'));%%-8;%%%%%%%%%%%%%%%%%%%%%%
                     obj.nfids = single(obj.views*obj.views2*obj.slices*obj.echoes*obj.experiments);
-                    
+
                     % Next, the data.
                     fseek(fid, hex2dec('200'), 'bof');
                     [AR, ~] = fread(fid, [obj.samples,obj.nfids], '*float32', 4);
@@ -218,7 +218,7 @@ classdef ImageReconCore
                     AR = single(AR);
                     AI = single(AI);
                     obj.rawdata = (AR) + (AI)*1i;
-                    
+
                     % Finally, the parameters, and close the file.
                     pb = fread(fid)';
                     ps = char(pb);
@@ -231,13 +231,13 @@ classdef ImageReconCore
                         eval(['params.' matlab.lang.makeValidName(P{1,j}{1}) ' = P{1,j}(2:end);']);
                     end
                     obj.param =  params; %fills param property with the sequence parameters
-                    
+
                     if isfield(obj.param,'two_pt_switch')
                         obj.twopointT1 = str2double(obj.param.two_pt_switch{1});
                     else
                         obj.twopointT1 =0;
                     end
-                    
+
                     switch obj.twopointT1
                         case 1
                             if isfield(obj.param,'b_evol')
@@ -252,7 +252,7 @@ classdef ImageReconCore
                                 if isempty(obj.timepoints)
                                     obj.timepoints = 0;
                                 else
-                                    
+
                                 end
                             else
                                 obj.timepoints = 0;
@@ -288,14 +288,14 @@ classdef ImageReconCore
                     fclose(fid);
                     [~,file] = bst_fileparts(obj.param.PPL{:}); %decomposes pulse sequence path and file name into parts
                     obj.sequence = file;
-                    
+
                     %default recon params
                     obj.window_function = 'None';
                     obj.window_size = 1;
                     obj.fft_size = obj.samples;
                     obj.denoise_filter = 'None';
                     obj.denoise_params = []; %filter kernel
-                    
+
                     switch obj.sequence
                         case 'H9_ir_se_nav_v2'
                             obj.sequence = 'H9_ir_se';
@@ -309,77 +309,76 @@ classdef ImageReconCore
                     end
 
                 case '.dat'
-                obj.rawdata = fid.data;
-                obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
-                obj.samples = fid.par.md1d;
-                obj.views = fid.par.md2d;
-                obj.slices = fid.par.md3d;
-                obj.experiments =fid.par.md4d;
-                obj.n_receivers = fid.par.ncoils;
-                obj.echoes = 1;
-                obj.TE = fid.par.te*1000;
-                obj.FlipAngle = fid.par.fa;
-                obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
-                obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
-                obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
-                obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
-                obj.resolution_throughplane = obj.thk;
-                obj.sequence = fid.par.serieName;
-                obj.partialkspace =0;
-                if fid.par.cameleon.USER_ZERO_FILLING_2D ~=0
+                    obj.rawdata = fid.data;
+                    obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
+                    obj.samples = fid.par.md1d;
+                    obj.views = fid.par.md2d;
+                    obj.slices = fid.par.md3d;
+                    obj.experiments =fid.par.md4d;
+                    obj.n_receivers = fid.par.ncoils;
+                    obj.echoes = 1;
+                    obj.TE = fid.par.te*1000;
+                    obj.FlipAngle = fid.par.fa;
+                    obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
+                    obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
+                    obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
+                    obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
+                    obj.resolution_throughplane = obj.thk;
+                    obj.sequence = fid.par.serieName;
                     obj.partialkspace =0;
-                
-                end
-               obj.geomT = eye(3);
- 
-                obj.recon2d = fid.par.cameleon.USER_MATRIX_DIMENSION_2D;
-              
-                obj.averages =1;
-                obj.twopointT1 = 0;
+                    if fid.par.cameleon.USER_ZERO_FILLING_2D ~=0
+                        obj.partialkspace =1;
+                    end
+                    obj.geomT = eye(3);
+
+                    obj.recon2d = fid.par.cameleon.USER_MATRIX_DIMENSION_2D;
+
+                    obj.averages =1;
+                    obj.twopointT1 = 0;
                     obj.window_function = 'none';
                     obj.window_size = 1;
                     obj.fft_size = obj.samples;
                     obj.denoise_filter = 'none';
                     obj.denoise_params = []; %filter kernel
                     obj.param = fid.par.cameleon;
-                   
+
                     if fid.par.cameleon.MULTI_PLANAR_EXCITATION ==1
                         obj.TwoDimensional = 1;
                     else
                         obj.TwoDimensional = 0; %ie 3d
                     end
-                if strcmp(obj.param.TRANSFORM_PLUGIN,'Sequential4DCine')
-                obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
-                obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET';
-                obj.n_fieldpoints =1;
-                obj.fieldpoints = 200;
+                    if strcmp(obj.param.TRANSFORM_PLUGIN,'Sequential4DCine')
+                        obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
+                        obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET;
+                        obj.n_fieldpoints =1;
+                        obj.fieldpoints = 200;
 
-                elseif strcmp(obj.param.SEQUENCE_NAME,'FFC_GE')
-                    obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
-                    if obj.param.FCI_T1_LOG_DIST ==1
-                        for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
-                       obj.timepoints(n,:) = logspace(log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER),log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER),obj.param.FCI_NUMBER_OF_TEVO);    
+                    elseif isfield(obj.param,'FCI_LIST_OF_BEVO')
+                        obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
+                        if obj.param.FCI_T1_LOG_DIST ==1
+                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                                obj.timepoints(n,:) = logspace(log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER),log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER),obj.param.FCI_NUMBER_OF_TEVO);
+                            end
+                        else
+                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                                obj.timepoints(n,:) = linspace(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER,obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER,obj.param.FCI_NUMBER_OF_TEVO);
+                            end
                         end
+                        obj.timepoints = obj.timepoints.*1000;
+                        obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
+                        obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
+
+
                     else
-                    for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
-                        obj.timepoints(n,:) = linspace(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER,obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER,obj.param.FCI_NUMBER_OF_TEVO);
+                        obj.n_timepoints=1;
+                        obj.n_fieldpoints =1;
+                        obj.timepoints = 1;
+                        obj.fieldpoints = 200;
                     end
-                    end
-                    obj.timepoints = obj.timepoints.*1000;
-                    obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
-                    obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
-                    
-                
-                else
-                     obj.n_timepoints=1;
-                     obj.n_fieldpoints =1;
-                     obj.timepoints = 1;
-                     obj.fieldpoints = 200;
-                end
             end
-            %% 
+            %%
         end %function
-        
+
         function obj = rename_sequence(obj)
             switch lower(strcat(char(regexp(obj.sequence,'[a-zA-Z]','match'))'))
                 case 'hsenavv'
@@ -392,12 +391,12 @@ classdef ImageReconCore
                     obj.displayname = obj.sequence; %for sequences we don't recognise
             end
         end
-            
-        function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set           
+
+        function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set
             if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
                 try
-                temp1 = load(obj.filelocation);
-                matfile = temp1.saveList{obj.fileindex};
+                    temp1 = load(obj.filelocation);
+                    matfile = temp1.saveList{obj.fileindex};
                 catch
                 end
                 obj.views = size(obj.rawdata,2);
@@ -405,153 +404,205 @@ classdef ImageReconCore
                 A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
                 A = mean(A,7);
                 if 1 ==1
-                A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
-                
-                if obj.echoes>1
-                    A(:,:,2,:,:,:) = []; %throw out the navigator data
-                else
-                    A = squeeze(A);
-               
-                end
+                    A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
 
-                if obj.recon2d == 0
-                end
+                    if obj.echoes>1
+                        A(:,:,2,:,:,:) = []; %throw out the navigator data
+                    else
+                        A = squeeze(A);
 
-                                %   A = removespikes(A);
-                A = reshape(A,obj.samples,obj.views,[]);
-              
-                if obj.samples ~= obj.views && obj.partialkspace ==1
-                    try 
-                    A = padarray(single(A),[0,single(obj.recon2d-obj.views)],0,'post');    
-                    obj.views = obj.recon2d;
-                    catch
-                         A = padarray(single(A),[0,single(obj.samples-obj.views)],0,'post');
-                    obj.views = obj.samples;
                     end
-                   
-                    if mean(A(:,1,1))==0
-                        A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
+
+                    if obj.recon2d == 0
                     end
-                    %             AA = centre_kspace(AA);
-                    
-                    %PF recon if we need to
-                    try
-                        for n=1:size(A,3)
-                            [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
-                        end
-                    catch
-                    end
-                    
-                end
+
+                    %   A = removespikes(A);
+                    A = reshape(A,obj.samples,obj.views,[]);
+
+                    % if obj.samples ~= obj.views && obj.partialkspace ==1
+                    %     try
+                    %         A = padarray(single(A),[0,single(obj.recon2d-obj.views)],0,'post');
+                    %         obj.views = obj.recon2d;
+                    %     catch
+                    %         A = padarray(single(A),[0,single(obj.samples-obj.views)],0,'post');
+                    %         obj.views = obj.samples;
+                    %     end
+                    % 
+                    %     if mean(A(:,1,1))==0
+                    %         A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
+                    %     end
+                    %     %             AA = centre_kspace(AA);
+                    % 
+                    %     %PF recon if we need to
+                    %     % try
+                    %     %     for n=1:size(A,3)
+                    %     %         [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
+                    %     %     end
+                    %     % catch
+                    %     end
+
+% --- Symmetric undersampling about k0 (NOT partial Fourier) ---
+% Phase-encode dimension is dim 2
+
+fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);        % nominal
+acqViews  = double(obj.param.ACQUISITION_MATRIX_DIMENSION_2D); % collected
+
+% If you trust obj.views more than the header, you can cross-check:
+% acqViews = double(obj.views);
+
+% Optional sanity check against USER_PARTIAL_PHASE (doesn't drive padding)
+if isfield(obj.param,'USER_PARTIAL_PHASE')
+    pct = double(obj.param.USER_PARTIAL_PHASE);
+    % expectedAcq = round(fullViews * pct/100);
+    % (don't enforce; some consoles round differently)
+end
+
+curViews = size(A,2);
+
+% If the array doesn't match the header, prefer the actual array size.
+% (This avoids padding the wrong amount if obj.views/header got stale.)
+if curViews ~= acqViews
+    acqViews = curViews;
+end
+
+targetViews = fullViews;
+
+if acqViews < targetViews
+    miss = targetViews - acqViews;
+
+    pre  = floor(miss/2);
+    post = miss - pre;   % handles odd miss cleanly
+
+    A = single(A); % ensure consistent type
+    if pre > 0
+        A = padarray(A, [0 pre],  0, 'pre');
+    end
+    if post > 0
+        A = padarray(A, [0 post], 0, 'post');
+    end
+
+    obj.views = targetViews;
+
+elseif acqViews > targetViews
+    % Rare case: acquired more than nominal; crop symmetrically about k0
+    extra = acqViews - targetViews;
+    pre  = floor(extra/2);
+    post = extra - pre;
+
+    A = A(:, (1+pre):(end-post), :, :, :, :);  % keeps all higher dims
+    obj.views = targetViews;
+
+else
+    % already the right size
+    obj.views = acqViews;
+end
+
+
                 
-                A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-              %  [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
-              correctedkspace = A;
-               % fprintf("kspace delta: %.3g\n", norm(correctedkspace(:)-A(:)) / norm(A(:)));
+
+
+
+
+
+                    
+
+                    A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                    %  [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+                    correctedkspace = A;
+                    % fprintf("kspace delta: %.3g\n", norm(correctedkspace(:)-A(:)) / norm(A(:)));
                 else
-                  correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                    correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                 %so we can undo windowing etc keep an untouched version of kspace prior to FFT
-                obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-                obj = correct_orientation(obj); 
+                %so we can undo windowing etc keep an untouched version of kspace prior to FFT
+                %obj.complexkspace = noise_whiten(obj.complexkspace,obj);
+                obj = correct_orientation(obj);
                 obj.originalcomplexkspace =obj.complexkspace;
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-                obj = correct_orientation(obj);   
-              obj.originalcomplexkspace = obj.complexkspace;
-                end
-                
+                obj = correct_orientation(obj);
+                obj.originalcomplexkspace = obj.complexkspace;
+            end
+
         end
-            
-            
+
+
         function obj = buildimages(obj)
-            
+
             if obj.TwoDimensional==1
-            %phase encoding vertical 
-            upscale_factor_read = double(obj.fft_size-obj.samples)/2;
-            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;   
-            
-            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-            obj.complexkspace = correct_ringdown_perKz(obj.complexkspace);
+                %phase encoding vertical
+                upscale_factor_read = double(obj.fft_size-obj.samples)/2;
+                upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;
+                obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
+            %   obj.complexkspace = fix_kspace_conj_symmetry((obj.complexkspace),1,2);
+                
+                
+                %obj.complexkspace = zero_kspace_outliers_by_median(obj.complexkspace,1,10,1);
+                % Preallocate the complexkspace matrix
+                % tempComplexKspace = obj.complexkspace;
+                %
+                % refNoise = tempComplexKspace(:,:,:,:,end);   % broadcast-only reference
+                %
+                % for n = 1:obj.n_receivers
+                %     local = tempComplexKspace(:,:,:,:,n);   % sliced read once
+                %
+                %     for f = 1:obj.n_fieldpoints(1)
+                %         for t = 1:obj.n_timepoints
+                %             for s = 1:obj.slices
+                %                 % build editornoise from the broadcast refNoise (not from local n)
+                %                 editornoise = zeros(size(local,1), size(local,2), 2);
+                %                 % editornoise(:,:,1) = local(:,:,s,t,f);            % if you need chan 8 etc., fetch from ref arrays
+                %                 editornoise(:,:,2) = refNoise(:,:,s,t,f);            % channel 15 reference
+                %
+                %                 sliceData = local(:,:,s,t,f);
+                %                 local(:,:,s,t,f) = editer(sliceData, editornoise);
+                %             end
+                %         end
+                %     end
+                % %
+                %     tempComplexKspace(:,:,:,:,n) = local;   % sliced write once
+                %  end
+                %
+                %     % Assign modified data back to the corresponding timepoint
+                %     complexkspace(:, :, :, :, :, :) = tempComplexKspace;
+                %
+
+                % Assign the updated complexkspace back to obj after the loop
+                %obj.complexkspace = complexkspace;
+                % obj.complexkspace(:,:,:,2) =0;
 
 
+                obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
+                obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));
+                obj.magkspace = rssq(obj.complexkspace,6);
+                obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);
+                obj.phaseimage =[];
+                obj.phaseimage = rssq((angle(obj.compleximage)),5);
 
-
-      % Preallocate the complexkspace matrix
-% tempComplexKspace = obj.complexkspace;
-% 
-% refNoise = tempComplexKspace(:,:,:,:,end);   % broadcast-only reference
-% 
-% for n = 1:obj.n_receivers
-%     local = tempComplexKspace(:,:,:,:,n);   % sliced read once
-% 
-%     for f = 1:obj.n_fieldpoints(1)
-%         for t = 1:obj.n_timepoints
-%             for s = 1:obj.slices
-%                 % build editornoise from the broadcast refNoise (not from local n)
-%                 editornoise = zeros(size(local,1), size(local,2), 2);
-%                 % editornoise(:,:,1) = local(:,:,s,t,f);            % if you need chan 8 etc., fetch from ref arrays
-%                 editornoise(:,:,2) = refNoise(:,:,s,t,f);            % channel 15 reference
-% 
-%                 sliceData = local(:,:,s,t,f);
-%                 local(:,:,s,t,f) = editer(sliceData, editornoise);
-%             end
-%         end
-%     end
-% % 
-%     tempComplexKspace(:,:,:,:,n) = local;   % sliced write once
-%  end
-% 
-%     % Assign modified data back to the corresponding timepoint
-%     complexkspace(:, :, :, :, :, :) = tempComplexKspace;
-% 
-
-% Assign the updated complexkspace back to obj after the loop
-%obj.complexkspace = complexkspace;
-            % obj.complexkspace(:,:,:,2) =0;
-
-
-            obj.compleximage=ifft2c(padarray(obj.complexkspace ,[round(upscale_factor_phase) round(upscale_factor_read)],0));
- 
-
-            obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));            
-            obj.magkspace = abs(fft2c(obj.magimage));
-            obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
-            obj.phaseimage =[]; 
-            obj.phaseimage = rssq((angle(obj.compleximage)),5);
-           
 
             else
-            upscale_factor_read = double(obj.fft_size-obj.samples)/2;
-            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;    
-            obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
-
-
-
-
-           %  obj.complexkspace = remove_mean_linear_kx_phase(obj.complexkspace);
-            obj.complexkspace(100:end,:,:,:,:,:,:,:) = conj(obj.complexkspace(100:end,:,:,:,:,:,:,:))
-          
-            %obj = correct_orientation(obj);  
-            for r=1:size(obj.complexkspace,6)
-            for f=1:size(obj.complexkspace,5)
-            for t=1:size(obj.complexkspace,4)
-            obj.compleximage(:,:,:,t,f,r)=fftshift(ifftn(ifftshift(padarray(obj.complexkspace(:,:,:,t,f,r) ,[round(upscale_factor_phase) round(upscale_factor_read)],0))));
+                upscale_factor_read = double(obj.fft_size-obj.samples)/2;
+                upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples))-obj.views)/2;
+                opts = struct('mode','scalar','use_outer_fraction',0.35);
+                obj.complexkspace = cancel_artifact_with_reference_coil( obj.complexkspace);
+                obj.complexkspace = (windowkspace(obj.originalcomplexkspace,obj.window_size,obj.window_function)); %perform the kspace windowing first
+                for r=1:size(obj.complexkspace,6)
+                    for f=1:size(obj.complexkspace,5)
+                        for t=1:size(obj.complexkspace,4)
+                            obj.compleximage(:,:,:,t,f,r)=fftshift(ifftn(ifftshift(padarray(obj.complexkspace(:,:,:,t,f,r) ,[round(upscale_factor_phase) round(upscale_factor_read)],0))));
+                        end
+                    end
+                end
+                obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));
+                obj.magkspace = rssq(obj.complexkspace,6);
+                obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);
+                obj.phaseimage =[];
+                obj.phaseimage = angle(obj.compleximage);
             end
-            end
-            end
-            obj.magimage = abs(combine_channels(obj.compleximage,obj.multichannel_recon,obj));           
-            obj.magkspace = abs(fftshift(ifftn(obj.magimage)));
-            obj.magimage = ffc_mri_filter(obj.magimage,obj.denoise_filter,obj.denoise_params);   
-            obj.phaseimage =[]; 
-            obj.phaseimage = angle(obj.compleximage);
-            end
-            
+
         end %here the conversion from k-space to image space is performed, including FFT and multi-coil reconstruction
-        
-        
+
         function obj = MapRelaxation(obj)
             %              r1t1mapping;
             dim = size(obj.magimage,1);
@@ -562,14 +613,14 @@ classdef ImageReconCore
             clear obj.R1Maps
             obj.T1Maps = zeros(dim,dim,obj.slices,n_fields(1));
             obj.R1Maps = zeros(dim,dim,obj.slices,n_fields(1));
-           
+
             mF = 0.01;
             maskFactor = mF;
             dims = size(obj.magimage);
             nbrow = size(obj.magimage,1);
             nbcol = size(obj.magimage,2);
             t1mask = zeros(nbrow, nbcol, 1);
-            
+
 
             maskTmp = t1mask(:,:);
             maskTmp = medfilt2(maskTmp); % remove salt and pepper noise
@@ -578,180 +629,67 @@ classdef ImageReconCore
             t1mask = maskTmp;
             clear maskTmp
             imagestobeprocessed = obj.magimage;
-
-% % Define data and model
-%  % Inversion times (ms)
-% % Preallocate results map
-% % Preallocate results map
-% maps = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2), 1, n_fields(1));
-% 
-% % Precompute values used in all iterations
-% min_noise_threshold = 20 * min(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1)); % Noise threshold
-% initial_sigma = std(imagestobeprocessed(1:60, 1, 1, 1, 1, 1, 1));           % Initial sigma estimate
-% tic
-% % Parallel processing
-% parfor n = 1:n_fields(1)
-%     local_map = zeros(size(imagestobeprocessed, 1), size(imagestobeprocessed, 2)); % Temporary map for this field
-% 
-%     for x = 1:size(imagestobeprocessed, 1)
-%         for y = 1:size(imagestobeprocessed, 2)
-%             t = times(n, :)';
-%             S_obs = squeeze(imagestobeprocessed(x, y, :, :, n)); % Observed signal intensities
-% 
-%             % Skip pixels with low intensity
-%             if max(S_obs) < min_noise_threshold
-%                 continue;
-%             end
-% 
-%             % Select the signal model based on n
-%             if n == 1
-%                 % Recovery from -M0
-%                 model = @(params, t) abs(params(1) * (1 - 2 * exp(-t / params(2))));
-%             else
-%                 % Decay from M0 to 0
-%                 model = @(params, t) params(1) * exp(-t / params(2));
-%             end
-% 
-%             % Log-likelihood function including sigma
-%             objective = @(params) -sum(log( ...
-%                 (S_obs / params(3)^2) .* ...
-%                 exp(-(S_obs.^2 + model(params, t).^2) / (2 * params(3)^2)) .* ...
-%                 besseli(0, (S_obs .* model(params, t)) / params(3)^2) ...
-%             ));
-% 
-%             % Initial guesses [M0, T1, sigma]
-%             initial_guess = [max(S_obs), 100, initial_sigma];
-% 
-%             % Optimization
-%             options = optimset('Display', 'off', 'TolFun', 1e-6);
-%             params_opt = fminsearch(objective, initial_guess, options);
-% 
-%             % Store T1 value in local map
-%             local_map(x, y) = params_opt(2);
-%         end
-%     end
-% 
-%     % Assign the local map for this field to the global maps variable
-%     maps(:, :, 1, n) = local_map;
-% end
-% 
-% obj.T1Maps = maps;
-% toc
-
-
-
+            obj.T1Maps = T1;
+            obj.R1Maps = R1;
             if obj.checkfit
                 for s=1:obj.slices
-                for n=1:n_fields
-                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),1,t1mask);
-                T1Maps(:,:,s,n)=t1map(:,:,1,1);
-                end
+                    for n=1:n_fields
+                        t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),1,t1mask);
+                        T1Maps(:,:,s,n)=t1map(:,:,1,1);
+                    end
                 end
             else
-           for s=1:obj.slices
-                for n=1:n_fields
-                t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),0,t1mask);
-                T1Maps(:,:,s,n)=t1map(:,:,1,1);
-                end
+                for s=1:obj.slices
+                    for n=1:n_fields
+                        t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),0,t1mask);
+                        T1Maps(:,:,s,n)=t1map(:,:,1,1);
+                    end
                 end
             end
-            
-            
-             obj.T1Maps = T1Maps;
+
+
+            obj.T1Maps = T1Maps;
             obj.R1Maps = 1000./obj.T1Maps;
-            
-            %                         %                    x = times(1,:);
-            %                         for k=1:5
-            %                             y = signaltemp(:,k,n);
-            %                             x = times(n,:);
-            %                             [~,index] = min(y);
-            %                             if index~=1
-            %                                 y(1:index-1)=-1.*y(1:index-1);
-            %                                 y = [y; -y(index)];
-            %                                 x = [x x(index)];
-            %                                 %                                 obj.T1maps(:,:,1,n) = T1map(squeeze(obj.compleximage(:,:,:,:,n)),times(1,:));
-            %                             end
-            %
-            %                             signal = y;
-            %                             invtimes = x./1000;
-            %
-            %                             [xData, yData] = prepareCurveData(double(invtimes(:)), double(signal(:)));
-            %
-            %                             % Set up fittype and options.
-            %                             % if n==1
-            %                             ft = fittype( '((M0-Minf)*exp(-x*R1)+Minf)', 'independent', 'x', 'dependent', 'y' );
-            %                             opts = fitoptions( 'Method', 'NonlinearLeastSquares','Robust','on');
-            %                             opts.Display = 'Off';
-            %                             opts.Lower = [-Inf,-Inf,0];
-            %                             opts.Upper = [Inf,Inf,Inf];
-            %
-            %                             [xs,ord] = sort(xData);
-            %                             ys = yData(ord);  % obtain the signed magnitude
-            %
-            %                             T1est = 0.1;
-            %                             opts.Startpoint = [ys(1),ys(end),1/T1est];
-            %                             [fitob,gof] = fit(xs(:),ys(:),ft,opts);
-            %
-            %
-            %                             gofmaptemp(n) = gof.rsquare;
-            %                             error = confint(fitob,0.63);
-            %                             errors(n) = diff(error(:,2));
-            %                             R1dispersion(k,n)= fitob.R1;
-            %
-            %                         end
-            %
-            %                     end
-            %                     for n=1:n_fields
-            %                         for k=1:5
-            %                             tempt1mask(t1mask(:,:,k)==1) =  1000./R1dispersion(k,n);%t1 instead of r1
-            %                         end
-            %                         obj.T1maps(:,:,n)=tempt1mask;
-            %
-            %                     end
-            %                     obj.T1maps = obj.T1maps.*dummymask;
-            %
-            %             end
-            
+
         end %image based T1 analysis methods are contained here
-        
+
         function obj = T1dispersion(obj,slice)
             fields = obj.fieldpoints; %list of evolution times in seconds
             times = obj.timepoints;
             n_fields = obj.n_fieldpoints;
             R1dispersion = zeros(1,n_fields(1));
-              signal = (((squeeze(obj.magimage(:,:,:,:,:)))));
-              signal(isnan(signal)) = 0;
+            signal = (((squeeze(obj.magimage(:,:,:,:,:)))));
+            signal(isnan(signal)) = 0;
             signal = signal.*repmat(obj.mask,[1 1 size(signal,3)]);
-                signal = squeeze(sum(signal .* obj.mask, [1 2 3]) ./ sum(obj.mask(:)));
-%              [fitobject,gof,R1out] = fit_relaxation(signal,times./1000,fields,0.200);
-          
+            signal = squeeze(sum(signal .* obj.mask, [1 2 3]) ./ sum(obj.mask(:)));
+
             for n=1:n_fields(1)
                 invtimes = times(n,:);
                 signal = (((squeeze(obj.magimage(:,:,slice,:,n)))));
-                
-for t=1:obj.n_timepoints
-signalt = signal(:,:,t).*obj.mask;
-signaltt(t) = sum(sum(signalt));
-end
-signal = signaltt';                
-              
+
+                for t=1:obj.n_timepoints
+                    signalt = signal(:,:,t).*obj.mask;
+                    signaltt(t) = sum(sum(signalt));
+                end
+                signal = signaltt';
+
                 x = invtimes;
                 y = signal;
-                
+
                 [~,index] = min(y);
-                 if index~=1 && index ~= size(invtimes,2) 
+                if index~=1 && index ~= size(invtimes,2)
 
                     y(1:index-1)=-1.*y(1:index-1);
                     y = [y; -y(index)];
                     x = [x x(index)];
 
-                 end
+                end
 
                 signal = y(1:end);
                 invtimes = x(1:end)./1000;
-                
+
                 [xData, yData] = prepareCurveData(double(invtimes(:)), double(signal(:)));
-                
+
                 % Set up fittype and options.
                 % if n==1
                 ft = fittype( '((M0-Minf)*exp(-x*R1)+Minf)', 'independent', 'x', 'dependent', 'y' );
@@ -760,7 +698,7 @@ signal = signaltt';
                 opts.Algorithm = 'Levenberg-Marquardt';
                 opts.Lower = [-Inf,-Inf,-Inf];
                 opts.Upper = [Inf,Inf,Inf];
-                
+
                 % else
                 % ft = fittype( 'a*exp(-x/b)', 'independent', 'x', 'dependent', 'y' );
                 % opts = fitoptions( 'Method', 'NonlinearLeastSquares' );
@@ -770,7 +708,7 @@ signal = signaltt';
                 % opts.Upper = [Inf 1000];
                 % end
                 %
-                
+
                 [xs,ord] = sort(xData);
                 ys = yData(ord);  % obtain the signed magnitude
                 if n>1
@@ -782,29 +720,25 @@ signal = signaltt';
                 %                 opts.Weights = Weights;
                 opts.Startpoint = [ys(1),ys(end),1/T1est];
                 try
-                [fitob,gof] = fit(xs,ys,ft,opts);
-              
-                    
-               errortemp = confint(fitob);
-               error(n) = diff(errortemp(:,3)/2);
-                
-                
-%                 gofmaptemp(n) = gof.rsquare;
-%                 error = confint(fitob,0.63);
-%                 errors(n) = diff(error(:,2));
-                
-                
-                R1dispersion(n)= fitob.R1;
+                    [fitob,gof] = fit(xs,ys,ft,opts);
+
+
+                    errortemp = confint(fitob);
+                    error(n) = diff(errortemp(:,3)/2);
+
+
+
+                    R1dispersion(n)= fitob.R1;
                 catch
                     error(n) = 0;
                     R1dispersion(n) = 0;
                 end
-%                 gofmaptemp(n) = gof.rsquare;
-%                 error = confint(fitob,0.63);
-%                 errors(n) = diff(error(:,2));
+                %                 gofmaptemp(n) = gof.rsquare;
+                %                 error = confint(fitob,0.63);
+                %                 errors(n) = diff(error(:,2));
                 if obj.checkfit ==1
                     h=figure;
-                    
+
                     plot(fitob,xs(:),ys(:));
                     ylabel('Signal (AU)')
                     xlabel('Evolution Time (s)');
@@ -813,15 +747,15 @@ signal = signaltt';
                         close(h);
                     catch
                     end
-                    
+
                 end
-                
+
             end
             T1dispersion = 1./R1dispersion.*1000; %in ms
             error = 1./error.*1000;
             fieldHz = fields.*gammaH*1e-9;
             fields = fields./1e3;
-%               figure, scatter(fieldHz, R1out);
+            %               figure, scatter(fieldHz, R1out);
             if obj.R1T1 ==1
                 disp(['Fields (MHz): ' num2str(fieldHz')])
                 disp(['R1 (s^-1): ' num2str(R1dispersion)])
@@ -842,33 +776,9 @@ signal = signaltt';
         end %ROI based T1 methods are contained here
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
     end
-    
-    
+
+
 end
 
 
