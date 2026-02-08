@@ -17,7 +17,7 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
     % ---- tunables (good defaults for 128x128 in vivo) ----
     acs = 24;          % 24 or 32
     covSigma = 3;      % covariance smoothing sigma (pixels)
-    maskFrac = 0.05;   % mask threshold = maskFrac * p95(RSS)
+    maskFrac = 0.02;   % mask threshold = maskFrac * p95(RSS)
     if isfield(obj,'espirit_acs') && ~isempty(obj.espirit_acs), acs = obj.espirit_acs; end
     if isfield(obj,'walsh_cov_sigma') && ~isempty(obj.walsh_cov_sigma), covSigma = obj.walsh_cov_sigma; end
     if isfield(obj,'coil_sens_mask_frac') && ~isempty(obj.coil_sens_mask_frac), maskFrac = obj.coil_sens_mask_frac; end

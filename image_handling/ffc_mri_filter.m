@@ -1,36 +1,44 @@
-function [filtered_images] = ffc_mri_filter(images,filter_type,kernel)
-%P
-%   Detailed explanation goes here
-
-
-% % modification:  normalising the images field-by-field (LB 1/03/20, needs
-% % optimising)
-% for b = 1:size(images,5)
-%     images(:,:,:,:,b) = images(:,:,:,:,b)./repmat(images(:,:,:,1,1),1,1,1,size(images,4));
-% end
+function [filtered_images] = ffc_mri_filter(images, filter_type, kernel)
+%FFC_MRI_FILTER  Drop-in denoising pipeline for magnitude stacks (low-field friendly)
+%
+% images: [X Y ...] (any additional dims flattened)
+% filter_type:
+%   'LLR+Wavelet'        (recommended default)
+%   'LLR'               (faster)
+%   'Wavelet'           (fast baseline)
+%   'LLR+Wavelet+TGV'    (strongest, slowest)
+%   others: passthrough magnitude
+%
+% kernel: kept for compatibility; unused here except your other cases.
 
 dim = size(images);
-tempimages = abs(reshape(images,dim(1),dim(2),[])); %reshape for processing ease
+temp = abs(reshape(images, dim(1), dim(2), []));   % [X Y N]
 
 switch filter_type
-    case 'Generalised Total Variation'
-        parfor n=1:size(tempimages,3)
-            filtered_images(:,:,n) = imtgvsmooth(tempimages(:,:,n),kernel,kernel,200);
-        end
-        
+    case 'LLR+Wavelet'
+        temp = llr_denoise_stack(temp, struct('patch',8,'step',3,'niter',2,'tau',2.2,'sigma',[]));
+        temp = wavelet_per_frame(temp, 3); % level 3 for 128x128
+
+    case 'LLR'
+        temp = llr_denoise_stack(temp, struct('patch',8,'step',3,'niter',2,'tau',2.2,'sigma',[]));
+
+    case 'Wavelet'
+        temp = wavelet_per_frame(temp, 3);
+
     case 'Total Variation'
-        parfor n=1:size(tempimages,3)
-            filtered_images(:,:,n) = TVL1denoise(tempimages(:,:,n),kernel,100);
+        temp = llr_denoise_stack(temp, struct('patch',8,'step',3,'niter',2,'tau',1.2,'sigma',[]));
+        temp = wavelet_per_frame(temp, 3);
+        % very light TGV (optional but effective on residual structured junk)
+        optsT = struct('data','L1','normalize',true);
+        tmp2 = zeros(size(temp), 'like', temp);
+        parfor n = 1:size(temp,3)
+            tmp2(:,:,n) = TGV2denoise(temp(:,:,n), 0.04, 0.015, 25, 150, optsT);
         end
-    case 'Deep Learning'
-        net = denoisingNetwork('DnCNN');
-        parfor n=1:size(tempimages,3)
-            tempimages(:,:,n) =  tempimages(:,:,n)./max(max( tempimages(:,:,n)));
-              filtered_images(:,:,n) = denoiseImage(tempimages(:,:,n), net);
-        end
+        temp = tmp2;
+
     otherwise
-        filtered_images = tempimages;
-end
-filtered_images = reshape(filtered_images,dim);
+        % passthrough magnitude
 end
 
+filtered_images = reshape(temp, dim);
+end
