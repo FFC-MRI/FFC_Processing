@@ -511,12 +511,12 @@ end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 %so we can undo windowing etc keep an untouched version of kspace prior to FFT
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-                obj = correct_orientation(obj);
+                
                 obj.originalcomplexkspace =obj.complexkspace;
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-                obj = correct_orientation(obj);
+               
                 obj.originalcomplexkspace = obj.complexkspace;
             end
 
@@ -541,6 +541,9 @@ function obj = buildimages(obj)
 %   obj.bias_sigma, obj.bias_mask_frac, obj.bias_clip_min, obj.bias_clip_max
 %   obj.coil_sens_lambda
 
+obj.complexkspace = obj.originalcomplexkspace;
+
+obj = correct_orientation(obj);
     % ----------- Precompute padding -----------
     upscale_factor_read  = double(obj.fft_size - obj.samples)/2;
     upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples)) - obj.views)/2;
@@ -549,7 +552,7 @@ function obj = buildimages(obj)
     padRead  = max(0, round(upscale_factor_read));
 
     % ----------- Window k-space first -----------
-    obj.complexkspace = windowkspace(obj.originalcomplexkspace, obj.window_size, obj.window_function);
+    obj.complexkspace = windowkspace(obj.complexkspace, obj.window_size, obj.window_function);
 
     % ----------- Pad k-space (phase/read are dims 1/2 in your convention) -----------
     kpad_full = padarray(obj.complexkspace, [padPhase padRead], 0);
@@ -614,7 +617,11 @@ opts = 1:size(kpad,6);   % local coil index space (1..nSel)
         obj.compleximage = ifft2c(kpad);
     else
         % centered ifft over first 3 spatial dims, keeps all other dims intact
-        obj.compleximage = ifftnc_spatial(kpad, 3);
+        for t =1:size(kpad,4)
+            for f=1:size(kpad,5)
+        obj.compleximage(:,:,:,t,f,:) = ifft3c(kpad(:,:,:,t,f,:));
+            end
+        end
     end
 
 
@@ -721,7 +728,7 @@ end
             obj.T1Maps = zeros(dim,dim,obj.slices,n_fields(1));
             obj.R1Maps = zeros(dim,dim,obj.slices,n_fields(1));
 
-            mF = 0.01;
+            mF = 0.05;
             maskFactor = mF;
             dims = size(obj.magimage);
             nbrow = size(obj.magimage,1);
@@ -747,7 +754,7 @@ end
                 end
             else
                 for s=1:obj.slices
-                    for n=1:n_fields
+                    parfor n=1:n_fields
                         t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),0,t1mask);
                         T1Maps(:,:,s,n)=t1map(:,:,1,1);
                     end
