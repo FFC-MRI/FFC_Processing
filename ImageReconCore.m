@@ -351,13 +351,32 @@ classdef ImageReconCore
                     else
                         obj.TwoDimensional = 0; %ie 3d
                     end
-                    if strcmp(obj.param.TRANSFORM_PLUGIN,'Sequential4DCine')
-                        obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
-                        obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET;
-                        obj.n_fieldpoints =1;
-                        obj.fieldpoints = 200;
 
-                    elseif isfield(obj.param,'FCI_LIST_OF_BEVO')
+
+
+                    switch obj.param.TRANSFORM_PLUGIN
+
+                        case 'Sequential4DCine'
+                            obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
+                            obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET;
+                            obj.n_fieldpoints =1;
+                            obj.fieldpoints = 200;
+
+                        otherwise
+                            obj.n_timepoints=1;
+                            obj.n_fieldpoints =1;
+                            obj.timepoints = 1;
+                            obj.fieldpoints = 200;
+                    end
+
+                    if isfield(obj.param,'SE_TYPE')
+                        if strcmp(obj.param.SE_TYPE,'MultiEcho')
+                            obj.n_timepoints = obj.param.ECHO_TRAIN_LENGTH;
+                            obj.timepoints = obj.param.ECHO_TIME;
+                        end
+                    end
+
+                    if isfield(obj.param,'FCI_LIST_OF_BEVO')
                         obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
                         if obj.param.FCI_T1_LOG_DIST ==1
                             for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
@@ -371,14 +390,9 @@ classdef ImageReconCore
                         obj.timepoints = obj.timepoints.*1000;
                         obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
                         obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
-
-
-                    else
-                        obj.n_timepoints=1;
-                        obj.n_fieldpoints =1;
-                        obj.timepoints = 1;
-                        obj.fieldpoints = 200;
                     end
+
+
             end
             %%
         end %function
@@ -431,12 +445,12 @@ classdef ImageReconCore
                     %         A = padarray(single(A),[0,single(obj.samples-obj.views)],0,'post');
                     %         obj.views = obj.samples;
                     %     end
-                    % 
+                    %
                     %     if mean(A(:,1,1))==0
                     %         A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
                     %     end
                     %     %             AA = centre_kspace(AA);
-                    % 
+                    %
                     %     %PF recon if we need to
                     %     % try
                     %     %     for n=1:size(A,3)
@@ -445,61 +459,61 @@ classdef ImageReconCore
                     %     % catch
                     %     end
 
-% --- Symmetric undersampling about k0 (NOT partial Fourier) ---
-% Phase-encode dimension is dim 2
+                    % --- Symmetric undersampling about k0 (NOT partial Fourier) ---
+                    % Phase-encode dimension is dim 2
 
-fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);        % nominal
-acqViews  = double(obj.param.ACQUISITION_MATRIX_DIMENSION_2D); % collected
+                    fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);        % nominal
+                    acqViews  = double(obj.param.ACQUISITION_MATRIX_DIMENSION_2D); % collected
 
-% If you trust obj.views more than the header, you can cross-check:
-% acqViews = double(obj.views);
+                    % If you trust obj.views more than the header, you can cross-check:
+                    % acqViews = double(obj.views);
 
-% Optional sanity check against USER_PARTIAL_PHASE (doesn't drive padding)
-if isfield(obj.param,'USER_PARTIAL_PHASE')
-    pct = double(obj.param.USER_PARTIAL_PHASE);
-    % expectedAcq = round(fullViews * pct/100);
-    % (don't enforce; some consoles round differently)
-end
+                    % Optional sanity check against USER_PARTIAL_PHASE (doesn't drive padding)
+                    if isfield(obj.param,'USER_PARTIAL_PHASE')
+                        pct = double(obj.param.USER_PARTIAL_PHASE);
+                        % expectedAcq = round(fullViews * pct/100);
+                        % (don't enforce; some consoles round differently)
+                    end
 
-curViews = size(A,2);
+                    curViews = size(A,2);
 
-% If the array doesn't match the header, prefer the actual array size.
-% (This avoids padding the wrong amount if obj.views/header got stale.)
-if curViews ~= acqViews
-    acqViews = curViews;
-end
+                    % If the array doesn't match the header, prefer the actual array size.
+                    % (This avoids padding the wrong amount if obj.views/header got stale.)
+                    if curViews ~= acqViews
+                        acqViews = curViews;
+                    end
 
-targetViews = fullViews;
+                    targetViews = fullViews;
 
-if acqViews < targetViews
-    miss = targetViews - acqViews;
+                    if acqViews < targetViews
+                        miss = targetViews - acqViews;
 
-    pre  = floor(miss/2);
-    post = miss - pre;   % handles odd miss cleanly
+                        pre  = floor(miss/2);
+                        post = miss - pre;   % handles odd miss cleanly
 
-    A = single(A); % ensure consistent type
-    if pre > 0
-        A = padarray(A, [0 pre],  0, 'pre');
-    end
-    if post > 0
-        A = padarray(A, [0 post], 0, 'post');
-    end
+                        A = single(A); % ensure consistent type
+                        if pre > 0
+                            A = padarray(A, [0 pre],  0, 'pre');
+                        end
+                        if post > 0
+                            A = padarray(A, [0 post], 0, 'post');
+                        end
 
-    obj.views = targetViews;
+                        obj.views = targetViews;
 
-elseif acqViews > targetViews
-    % Rare case: acquired more than nominal; crop symmetrically about k0
-    extra = acqViews - targetViews;
-    pre  = floor(extra/2);
-    post = extra - pre;
+                    elseif acqViews > targetViews
+                        % Rare case: acquired more than nominal; crop symmetrically about k0
+                        extra = acqViews - targetViews;
+                        pre  = floor(extra/2);
+                        post = extra - pre;
 
-    A = A(:, (1+pre):(end-post), :, :, :, :);  % keeps all higher dims
-    obj.views = targetViews;
+                        A = A(:, (1+pre):(end-post), :, :, :, :);  % keeps all higher dims
+                        obj.views = targetViews;
 
-else
-    % already the right size
-    obj.views = acqViews;
-end
+                    else
+                        % already the right size
+                        obj.views = acqViews;
+                    end
 
                     A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                     %  [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
@@ -511,210 +525,211 @@ end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 %so we can undo windowing etc keep an untouched version of kspace prior to FFT
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-                
+
                 obj.originalcomplexkspace =obj.complexkspace;
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
                 obj.complexkspace = noise_whiten(obj.complexkspace,obj);
-               
+
                 obj.originalcomplexkspace = obj.complexkspace;
             end
 
         end
 
 
-function obj = buildimages(obj)
+        function obj = buildimages(obj)
 
-%BUILDIMAGES  Convert k-space to image space, perform coil combination, optional bias correction, filtering.
-%
-% Expects:
-%   obj.originalcomplexkspace   : complex k-space [X Y (Z) T F C] or [X Y S T F C] depending on mode
-%   obj.TwoDimensional          : 1 for 2D, else 3D
-%   obj.fft_size, obj.samples, obj.views
-%   obj.window_size, obj.window_function
-%   obj.multichannel_recon      : coil selection: scalar 1 (all), logical mask, or index list into ORIGINAL coils
-%   obj.combine                 : 'RSSQ' | 'Adaptive' | 'ACS/Walsh'
-%   obj.biascorrect             : 'Off' | 'ACS'
-% Optional tuning fields (if present):
-%   obj.coil_sens_sigma, obj.coil_sens_mask_frac
-%   obj.espirit_acs, obj.walsh_cov_sigma
-%   obj.bias_sigma, obj.bias_mask_frac, obj.bias_clip_min, obj.bias_clip_max
-%   obj.coil_sens_lambda
+            %BUILDIMAGES  Convert k-space to image space, perform coil combination, optional bias correction, filtering.
+            %
+            % Expects:
+            %   obj.originalcomplexkspace   : complex k-space [X Y (Z) T F C] or [X Y S T F C] depending on mode
+            %   obj.TwoDimensional          : 1 for 2D, else 3D
+            %   obj.fft_size, obj.samples, obj.views
+            %   obj.window_size, obj.window_function
+            %   obj.multichannel_recon      : coil selection: scalar 1 (all), logical mask, or index list into ORIGINAL coils
+            %   obj.combine                 : 'RSSQ' | 'Adaptive' | 'ACS/Walsh'
+            %   obj.biascorrect             : 'Off' | 'ACS'
+            % Optional tuning fields (if present):
+            %   obj.coil_sens_sigma, obj.coil_sens_mask_frac
+            %   obj.espirit_acs, obj.walsh_cov_sigma
+            %   obj.bias_sigma, obj.bias_mask_frac, obj.bias_clip_min, obj.bias_clip_max
+            %   obj.coil_sens_lambda
 
-obj.complexkspace = obj.originalcomplexkspace;
+            obj.complexkspace = obj.originalcomplexkspace;
 
-obj = correct_orientation(obj);
-    % ----------- Precompute padding -----------
-    upscale_factor_read  = double(obj.fft_size - obj.samples)/2;
-    upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples)) - obj.views)/2;
+            obj = correct_orientation(obj);
 
-    padPhase = max(0, round(upscale_factor_phase));
-    padRead  = max(0, round(upscale_factor_read));
+            % ----------- Precompute padding -----------
+            upscale_factor_read  = double(obj.fft_size - obj.samples)/2;
+            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples)) - obj.views)/2;
 
-    % ----------- Window k-space first -----------
-    obj.complexkspace = windowkspace(obj.complexkspace, obj.window_size, obj.window_function);
+            padPhase = max(0, round(upscale_factor_phase));
+            padRead  = max(0, round(upscale_factor_read));
 
-    % ----------- Pad k-space (phase/read are dims 1/2 in your convention) -----------
-    kpad_full = padarray(obj.complexkspace, [padPhase padRead], 0);
+            % ----------- Window k-space first -----------
+            obj.complexkspace = windowkspace(obj.complexkspace, obj.window_size, obj.window_function);
 
-    % ----------- Coil selection (trim once and renumber) -----------
-    % obj.multichannel_recon may be:
-    %   - scalar 1 (meaning "all coils")
-    %   - logical mask over the ORIGINAL coil dimension
-    %   - numeric index list into the ORIGINAL coil dimension (e.g. [2 3 4 5 6 7])
-    opts_orig   = obj.multichannel_recon;      % numeric index list (e.g. [2 3 4 5 6 7])
-nCoils_orig = size(kpad_full, 6);
-probeIsQBC = false;
-try
-    probeIsQBC = isprop(obj,'param') && isfield(obj.param,'PROBES') && strcmp(string(obj.param.PROBES), "Quadrature BirdCage");
-catch
-    probeIsQBC = false;
-end
+            % ----------- Pad k-space (phase/read are dims 1/2 in your convention) -----------
+            kpad_full = padarray(obj.complexkspace, [padPhase padRead], 0);
 
-opts_orig = obj.multichannel_recon;
-
-userDidNotSelect = 1;
-
-if probeIsQBC && userDidNotSelect
-    if nCoils_orig >= 8
-        obj.multichannel_recon = 8;   % use only channel 8
-    else
-        obj.multichannel_recon = 1;   % fallback to channel 1
-    end
-    opts_orig = obj.multichannel_recon; % update local copy
-end
-if isempty(opts_orig)
-    sel_orig = 1:nCoils_orig;
-else
-    if ~isnumeric(opts_orig)
-        error('buildimages:coilSelNotNumeric', ...
-            'multichannel_recon must be a numeric index list. Got %s.', class(opts_orig));
-    end
-
-    sel_orig = unique(round(opts_orig(:).'));   % row vector, unique
-    sel_orig(isnan(sel_orig)) = [];
-
-    if isempty(sel_orig)
-        error('buildimages:coilSelEmptyAfterParse', ...
-            'multichannel_recon became empty after parsing.');
-    end
-
-    if any(sel_orig < 1) || any(sel_orig > nCoils_orig)
-        error('buildimages:coilIndexOutOfRange', ...
-            'Selected coil indices [%s] exceed available coils 1..%d.', num2str(sel_orig), nCoils_orig);
-    end
-end
-
-obj.selected_coils_original = sel_orig;
-
-% Trim padded k-space to the selected coils; from here on coils are renumbered 1..nSel
-kpad = kpad_full(:,:,:,:,:,sel_orig);
-opts = 1:size(kpad,6);   % local coil index space (1..nSel)
-    nSel = numel(opts);
-
-    % ----------- FFT to image space (per coil) -----------
-    if obj.TwoDimensional == 1
-        obj.compleximage = ifft2c(kpad);
-    else
-        % centered ifft over first 3 spatial dims, keeps all other dims intact
-        for t =1:size(kpad,4)
-            for f=1:size(kpad,5)
-        obj.compleximage(:,:,:,t,f,:) = ifft3c(kpad(:,:,:,t,f,:));
+            % ----------- Coil selection (trim once and renumber) -----------
+            % obj.multichannel_recon may be:
+            %   - scalar 1 (meaning "all coils")
+            %   - logical mask over the ORIGINAL coil dimension
+            %   - numeric index list into the ORIGINAL coil dimension (e.g. [2 3 4 5 6 7])
+            opts_orig   = obj.multichannel_recon;      % numeric index list (e.g. [2 3 4 5 6 7])
+            nCoils_orig = size(kpad_full, 6);
+            probeIsQBC = false;
+            try
+                probeIsQBC = isprop(obj,'param') && isfield(obj.param,'PROBES') && strcmp(string(obj.param.PROBES), "Quadrature BirdCage");
+            catch
+                probeIsQBC = false;
             end
-        end
-    end
 
+            opts_orig = obj.multichannel_recon;
 
-    % ----------- Magnitude k-space (for QC / debugging) -----------
-    % Keep in ORIGINAL coil index space for consistency with saved raw k-space
-    obj.magkspace = rssq(obj.complexkspace(:,:,:,:,:,sel_orig), 6);
+            userDidNotSelect = 1;
 
-    % ----------- Receiver combination mode (from GUI dropdown) -----------
-    combineMode = "ACS/Walsh"; % default
-    if isprop(obj,'combination') && ~isempty(obj.combination)
-        combineMode = string(obj.combination);
-    end
-
-    % ----------- Bias correction mode (from GUI dropdown) -----------
-    biasMode = "Off"; % default
-    if isprop(obj,'biascorrect') && ~isempty(obj.biascorrect)
-        biasMode = string(obj.biascorrect);
-    end
-
-    % Initialise outputs
-    obj.complexcombined = [];
-    obj.magimage = [];
-    obj.phaseimage = [];
-
-    % ----------- Combine -----------
-    if nSel <= 1
-        % Single-coil path: selected coil becomes coil 1 after trimming
-        obj.complexcombined = obj.compleximage(:,:,:,:,:,1);
-        obj.magimage = abs(obj.complexcombined);
-
-    else
-        switch combineMode
-            case "RSSQ"
-                % Magnitude-only
-                obj.complexcombined = [];
-                obj.magimage = rssq(obj.compleximage, 6);
-
-            case "Adaptive"
-                % Smoothed self-calibrated adaptive complex combine
-                obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, opts, obj);
-                obj.magimage = abs(obj.complexcombined);
-
-            case "ACS/Walsh"
-                % ACS/Walsh sensitivity maps + Roemer combine
-                maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
-                obj.complexcombined = combine_with_maps(obj.compleximage, maps, opts, obj);
-                obj.magimage = abs(obj.complexcombined);
-
-            otherwise
-                % Safe fallback
-                obj.complexcombined = [];
-                obj.magimage = rssq(obj.compleximage, 6);
-        end
-
-        % ----------- Optional bias-field correction -----------
-        switch biasMode
-            case "Off"
-                % no-op
-
-            case "ACS"
-                [bias, mask3] = bias_field_from_acs(kpad, opts, obj);
-                if exist('apply_bias_field_safe','file') == 2
-                    obj.magimage = apply_bias_field_safe(obj.magimage, bias, mask3, obj);
+            if probeIsQBC && userDidNotSelect
+                if nCoils_orig >= 8
+                    obj.multichannel_recon = 8;   % use only channel 8
                 else
-                   % obj.magimage = apply_bias_field(obj.magimage, bias, mask3, obj);
-[obj.magimage] = map_guided_bias_correct(obj.magimage, maps, obj);
+                    obj.multichannel_recon = 1;   % fallback to channel 1
+                end
+                opts_orig = obj.multichannel_recon; % update local copy
+            end
+            if isempty(opts_orig)
+                sel_orig = 1:nCoils_orig;
+            else
+                if ~isnumeric(opts_orig)
+                    error('buildimages:coilSelNotNumeric', ...
+                        'multichannel_recon must be a numeric index list. Got %s.', class(opts_orig));
                 end
 
-            otherwise
-                % no-op
-        end
-    end
+                sel_orig = unique(round(opts_orig(:).'));   % row vector, unique
+                sel_orig(isnan(sel_orig)) = [];
 
-    % Safety: ensure magimage exists
-    if isempty(obj.magimage)
-        if ~isempty(obj.complexcombined)
-            obj.magimage = abs(obj.complexcombined);
-        else
-            obj.magimage = rssq(obj.compleximage, 6);
-        end
-    end
-  
-    % ----------- Denoise / post-filter -----------
-    obj.magimage = ffc_mri_filter(obj.magimage, obj.denoise_filter, obj.denoise_params);
+                if isempty(sel_orig)
+                    error('buildimages:coilSelEmptyAfterParse', ...
+                        'multichannel_recon became empty after parsing.');
+                end
 
-    % ----------- Phase image (only meaningful for complex combined) -----------
-    if ~isempty(obj.complexcombined)
-        obj.phaseimage = angle(obj.complexcombined);
-    else
-obj.complexcombined = sum(1.*obj.compleximage,6);
-         obj.phaseimage = angle(obj.complexcombined);
-    end
-end
+                if any(sel_orig < 1) || any(sel_orig > nCoils_orig)
+                    error('buildimages:coilIndexOutOfRange', ...
+                        'Selected coil indices [%s] exceed available coils 1..%d.', num2str(sel_orig), nCoils_orig);
+                end
+            end
+
+            obj.selected_coils_original = sel_orig;
+
+            % Trim padded k-space to the selected coils; from here on coils are renumbered 1..nSel
+            kpad = kpad_full(:,:,:,:,:,sel_orig);
+            opts = 1:size(kpad,6);   % local coil index space (1..nSel)
+            nSel = numel(opts);
+
+            % ----------- FFT to image space (per coil) -----------
+            if obj.TwoDimensional == 1
+                obj.compleximage = ifft2c(kpad);
+            else
+                % centered ifft over first 3 spatial dims, keeps all other dims intact
+                for t =1:size(kpad,4)
+                    for f=1:size(kpad,5)
+                        obj.compleximage(:,:,:,t,f,:) = ifft3c(kpad(:,:,:,t,f,:));
+                    end
+                end
+            end
+
+
+            % ----------- Magnitude k-space (for QC / debugging) -----------
+            % Keep in ORIGINAL coil index space for consistency with saved raw k-space
+            obj.magkspace = rssq(obj.complexkspace(:,:,:,:,:,sel_orig), 6);
+
+            % ----------- Receiver combination mode (from GUI dropdown) -----------
+            combineMode = "ACS/Walsh"; % default
+            if isprop(obj,'combination') && ~isempty(obj.combination)
+                combineMode = string(obj.combination);
+            end
+
+            % ----------- Bias correction mode (from GUI dropdown) -----------
+            biasMode = "Off"; % default
+            if isprop(obj,'biascorrect') && ~isempty(obj.biascorrect)
+                biasMode = string(obj.biascorrect);
+            end
+
+            % Initialise outputs
+            obj.complexcombined = [];
+            obj.magimage = [];
+            obj.phaseimage = [];
+
+            % ----------- Combine -----------
+            if nSel <= 1
+                % Single-coil path: selected coil becomes coil 1 after trimming
+                obj.complexcombined = obj.compleximage(:,:,:,:,:,1);
+                obj.magimage = abs(obj.complexcombined);
+
+            else
+                switch combineMode
+                    case "RSSQ"
+                        % Magnitude-only
+                        obj.complexcombined = [];
+                        obj.magimage = rssq(obj.compleximage, 6);
+
+                    case "Adaptive"
+                        % Smoothed self-calibrated adaptive complex combine
+                        obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, opts, obj);
+                        obj.magimage = abs(obj.complexcombined);
+
+                    case "ACS/Walsh"
+                        % ACS/Walsh sensitivity maps + Roemer combine
+                        maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
+                        obj.complexcombined = combine_with_maps(obj.compleximage, maps, opts, obj);
+                        obj.magimage = abs(obj.complexcombined);
+
+                    otherwise
+                        % Safe fallback
+                        obj.complexcombined = [];
+                        obj.magimage = rssq(obj.compleximage, 6);
+                end
+
+                % ----------- Optional bias-field correction -----------
+                switch biasMode
+                    case "Off"
+                        % no-op
+
+                    case "ACS"
+                        [bias, mask3] = bias_field_from_acs(kpad, opts, obj);
+                        if exist('apply_bias_field_safe','file') == 2
+                            obj.magimage = apply_bias_field_safe(obj.magimage, bias, mask3, obj);
+                        else
+                            % obj.magimage = apply_bias_field(obj.magimage, bias, mask3, obj);
+                            [obj.magimage] = map_guided_bias_correct(obj.magimage, maps, obj);
+                        end
+
+                    otherwise
+                        % no-op
+                end
+            end
+
+            % Safety: ensure magimage exists
+            if isempty(obj.magimage)
+                if ~isempty(obj.complexcombined)
+                    obj.magimage = abs(obj.complexcombined);
+                else
+                    obj.magimage = rssq(obj.compleximage, 6);
+                end
+            end
+
+            % ----------- Denoise / post-filter -----------
+            obj.magimage = ffc_mri_filter(obj.magimage, obj.denoise_filter, obj.denoise_params);
+
+            % ----------- Phase image (only meaningful for complex combined) -----------
+            if ~isempty(obj.complexcombined)
+                obj.phaseimage = angle(obj.complexcombined);
+            else
+                obj.complexcombined = sum(1.*obj.compleximage,6);
+                obj.phaseimage = angle(obj.complexcombined);
+            end
+        end
 
 
         function obj = MapRelaxation(obj)
