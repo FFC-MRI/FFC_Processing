@@ -19,7 +19,8 @@ kx = ((0:Nx-1) - Nx/2) / FOV1;   % cycles/m along 1D axis
 ky = ((0:Ny-1) - Ny/2) / FOV2;   % cycles/m along 2D axis
 kz = ((0:Nz-1) - Nz/2) / FOV3;   % cycles/m along 3D axis
 
-[KX, KY, KZ] = ndgrid(kx, ky, kz);  % matches K(i,j,k)
+[KX, KY, KZ] = ndgrid(kx, ky, kz);  % matches K(i,j,k
+
 
 phase = exp(-1i * 2*pi * (KX*off1 + KY*off2 + KZ*off3));
 obj.complexkspace = obj.complexkspace .* phase;

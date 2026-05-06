@@ -1,7 +1,6 @@
 function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
 %NOISE_WHITEN  Coil noise whitening with robust noise covariance estimation.
 %
-% Drop-in compatible with noise_whiten(kspace,obj).
 % Assumes receiver channels are in the LAST dimension: [Nx Ny ... Nc]
 %
 % Optional opts fields:
@@ -49,14 +48,13 @@ function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
     % View as [Nx Ny Npages Nc]
     k4 = reshape(kspace, [Nx, Ny, Npages, Nc]);
 
-    % ---------- Robust noise sample collection ----------
+    %Noise
     eta = collect_noise_samples(k4, opts);   % [Nc x nSamples]
 
     % demean
     eta = eta - mean(eta, 2);
 
-    % optional robust clipping (reduces spikes / residual signal influence)
-    if opts.robust_clip
+    if opts.robust_clip %try and deal with outliers
         eta = mad_clip(eta, opts.clip_k);
     end
 
@@ -83,7 +81,7 @@ function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
     if p == 0
         Xw = L \ X;
     else
-        % fallback: eigen whitening (handles non-PD)
+       
         psiH = (psi + psi')/2;
         [V, D] = eig(psiH);
         d = real(diag(D));
@@ -99,8 +97,6 @@ function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
     info = struct('psi',psi,'L',L,'p',p,'nSamples',nSamples,'method',opts.method);
 end
 
-
-% ================= helper functions =================
 
 function opts = set_defaults(opts)
     def.method      = 'outer';     % 'outer' | 'firstline'
