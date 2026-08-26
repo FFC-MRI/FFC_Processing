@@ -18,9 +18,9 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
     acs = 24;          % 24 or 32
     covSigma = 3;      % covariance smoothing sigma (pixels)
     maskFrac = 0.02;   % mask threshold = maskFrac * p95(RSS)
-    if isfield(obj,'espirit_acs') && ~isempty(obj.espirit_acs), acs = obj.espirit_acs; end
-    if isfield(obj,'walsh_cov_sigma') && ~isempty(obj.walsh_cov_sigma), covSigma = obj.walsh_cov_sigma; end
-    if isfield(obj,'coil_sens_mask_frac') && ~isempty(obj.coil_sens_mask_frac), maskFrac = obj.coil_sens_mask_frac; end
+    acs = get_setting(obj, 'espirit_acs', acs);
+    covSigma = get_setting(obj, 'walsh_cov_sigma', covSigma);
+    maskFrac = get_setting(obj, 'coil_sens_mask_frac', maskFrac);
 
     maps = zeros(X,Y,S,1,1,C,'like',kspace);
 
@@ -85,8 +85,9 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
                     [~,idx] = max(real(D));
                     v = V(:,idx);
 
-                    % Fix arbitrary phase
-                    v = v .* exp(-1i*angle(v(1)));
+                    % Fix arbitrary phase using the most stable receiver.
+                    [~, refIndex] = max(abs(v));
+                    v = v .* exp(-1i*angle(v(refIndex)));
 
                     Smap(x,y,:) = v;
                 end
@@ -97,6 +98,16 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
         nrm = sqrt(sum(abs(Smap).^2, 3));
         Smap = Smap ./ (nrm + eps(class(nrm)));
 
-        maps(:,:,s,1,1,:) = reshape(Smap, [X Y 1 1 C]);
+        maps(:,:,s,1,1,:) = reshape(Smap, [X Y 1 1 1 C]);
+    end
+end
+
+
+function value = get_setting(obj, name, defaultValue)
+    value = defaultValue;
+    if isstruct(obj) && isfield(obj, name) && ~isempty(obj.(name))
+        value = obj.(name);
+    elseif isobject(obj) && isprop(obj, name) && ~isempty(obj.(name))
+        value = obj.(name);
     end
 end
