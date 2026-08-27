@@ -89,7 +89,7 @@ if ~isequal(rootFolder, 0)
     end
 
     % PARALLEL loop
-    parfor k = 1:n
+    for k = 1:n
         thisDatFull   = fullfile(datList(k).folder, datList(k).name);
         thisDatFolder = datList(k).folder;
 

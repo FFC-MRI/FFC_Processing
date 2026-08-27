@@ -37,6 +37,8 @@ classdef ImageReconCore
         fieldpoints %list of evolution fields in mT
         thk %slice thickness
         fov %fov in mm
+        fov_phase %phase-encoding FOV in mm
+        fov_3d %through-plane/slab FOV in mm for 3D acquisitions
         TE %Echo time
         FlipAngle %indegrees
         averages %signal averages
@@ -51,10 +53,12 @@ classdef ImageReconCore
         window_function %windowing function
         window_size     %size of window
         fft_size        %size of 2dfft (symmetrical)
+        fft_size_3d
         denoise_filter  %denoising filter
         denoise_params  %filter kernel
         mask
         dispersioncurve
+        T1FitResults %complete independent/joint dispersion fit diagnostics
         R1T1 %R1 or T1
         fid %file ID
         backgroundselect %should the user define the background?
@@ -72,6 +76,8 @@ classdef ImageReconCore
         recon2d
         geomT
         selected_coils_original
+        noise_whitening %apply receive-noise prewhitening during reconstruction
+        whitening_info %diagnostics returned by noise_whiten
         biascorrect
         combination
         probe %the RF coil used
@@ -324,8 +330,23 @@ classdef ImageReconCore
                     obj.TE = fid.par.te*1000;
                     obj.FlipAngle = fid.par.fa;
                     obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
+                    if isfield(fid.par.cameleon, 'FIELD_OF_VIEW_PHASE') && ...
+                            isfinite(fid.par.cameleon.FIELD_OF_VIEW_PHASE) && ...
+                            fid.par.cameleon.FIELD_OF_VIEW_PHASE > 0
+                        obj.fov_phase = fid.par.cameleon.FIELD_OF_VIEW_PHASE*1000;
+                    else
+                        obj.fov_phase = obj.fov;
+                    end
+                    if isfield(fid.par.cameleon, 'FIELD_OF_VIEW_3D') && ...
+                            isfinite(fid.par.cameleon.FIELD_OF_VIEW_3D) && ...
+                            fid.par.cameleon.FIELD_OF_VIEW_3D > 0
+                        obj.fov_3d = fid.par.cameleon.FIELD_OF_VIEW_3D*1000;
+                    end
                     obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
                     obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
+                    if isempty(obj.fov_3d)
+                        obj.fov_3d = obj.thk*max(double(obj.slices), 1);
+                    end
                     obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
                     obj.resolution_throughplane = obj.thk;
                     obj.sequence = fid.par.serieName;
@@ -342,6 +363,7 @@ classdef ImageReconCore
                     obj.window_function = 'none';
                     obj.window_size = 1;
                     obj.fft_size = obj.samples;
+                    obj.fft_size_3d = obj.slices;
                     obj.denoise_filter = 'none';
                     obj.denoise_params = []; %filter kernel
                     obj.param = fid.par.cameleon;
@@ -350,6 +372,14 @@ classdef ImageReconCore
                         obj.TwoDimensional = 1;
                     else
                         obj.TwoDimensional = 0; %ie 3d
+                        obj.resolution_throughplane = obj.fov_3d/max(double(obj.slices), 1);
+                        if isfield(fid.par.cameleon, 'USER_MATRIX_DIMENSION_3D')
+                            userPartitions = round(double( ...
+                                fid.par.cameleon.USER_MATRIX_DIMENSION_3D));
+                            if isfinite(userPartitions) && userPartitions >= obj.slices
+                                obj.fft_size_3d = userPartitions;
+                            end
+                        end
                     end
 
 
@@ -398,9 +428,24 @@ classdef ImageReconCore
       
      
                   
-
-
             end
+
+            % Backwards-compatible defaults shared by every input format.
+            if isempty(obj.fov_phase)
+                obj.fov_phase = obj.fov;
+            end
+            if isempty(obj.fov_3d)
+                obj.fov_3d = obj.thk*max(double(obj.slices), 1);
+            end
+            hasMultipleReceivers = ~isempty(obj.n_receivers) && ...
+                isscalar(obj.n_receivers) && isfinite(double(obj.n_receivers)) && ...
+                double(obj.n_receivers) > 1;
+            if isempty(obj.noise_whitening)
+                obj.noise_whitening = hasMultipleReceivers;
+            else
+                obj.noise_whitening = logical(obj.noise_whitening) && hasMultipleReceivers;
+            end
+            obj.whitening_info = struct('method', 'notRun', 'nSamples', 0);
             %%
         end %function
 
@@ -532,20 +577,14 @@ classdef ImageReconCore
                     correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
-                %so we can undo windowing etc keep an untouched version of kspace prior to FFT
-            if strcmp(string(obj.probe), "Body Coil 4Rx Coil")
-            obj.originalcomplexkspace = noise_whiten(obj.complexkspace);
-                else
-             obj.originalcomplexkspace = obj.complexkspace;
-            end
+                % Keep an untouched, unwhitened copy. Whitening is a user-selectable
+                % reconstruction operation and must be applied exactly once to
+                % the full receiver array in buildimages(), before selection.
+                obj.originalcomplexkspace = obj.complexkspace;
                
             else
                 obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
-                if strcmp(string(obj.probe), "Body Coil 4Rx Coil")
-            obj.originalcomplexkspace = noise_whiten(obj.complexkspace);
-                else
-             obj.originalcomplexkspace = obj.complexkspace;
-            end
+                obj.originalcomplexkspace = obj.complexkspace;
             end
 
         end
@@ -556,60 +595,37 @@ classdef ImageReconCore
             %BUILDIMAGES  Convert k-space to image space, perform coil combination, optional bias correction, filtering.
             %
             
-            obj.compleximage =[];
+            obj.compleximage = [];
             obj.complexkspace = obj.originalcomplexkspace;
-
             obj = correct_orientation(obj);
-   
-            % ----------- Precompute padding -----------
-            upscale_factor_read  = double(obj.fft_size - obj.samples)/2;
-            upscale_factor_phase = double((obj.fft_size*(obj.views/obj.samples)) - obj.views)/2;
 
-            padPhase = max(0, round(upscale_factor_phase));
-            padRead  = max(0, round(upscale_factor_read));
-            
-            % ----------- Window k-space first -----------
-            obj.complexkspace = windowkspace(obj.complexkspace, obj.window_size, obj.window_function);
-
-            % ----------- Pad k-space (phase/read are dims 1/2 in your convention) -----------
-            kpad_full = padarray(obj.complexkspace, [padPhase padRead], 0);
-
-            % ----------- Coil selection (trim once and renumber) -----------
+            % ----------- Receiver selection and optional prewhitening -----------
             % obj.multichannel_recon may be:
-            %   - scalar 1 (meaning "all coils")
             %   - logical mask over the ORIGINAL coil dimension
-            %   - numeric index list into the ORIGINAL coil dimension (e.g. [2 3 4 5 6 7])
-            opts_orig   = obj.multichannel_recon;      % numeric index list (e.g. [2 3 4 5 6 7])
-            nCoils_orig = size(kpad_full, 6);
-            probeIsQBC = false;
-            try
-                probeIsQBC = isfield(obj.probe) && strcmp(string(obj.probe), "Quadrature BirdCage");
-            catch
-                probeIsQBC = false;
-            end
-
+            %   - numeric MATLAB index list into the ORIGINAL coil dimension
+            %     (the GUI displays scanner receiver IDs 0..N-1, with
+            %     ItemsData 1..N)
             opts_orig = obj.multichannel_recon;
+            nCoils_orig = size(obj.complexkspace, 6);
 
-            userDidNotSelect = 0;
-
-            if probeIsQBC && userDidNotSelect
-                if nCoils_orig >= 8
-                    obj.multichannel_recon = 8;   % use only channel 8
-                else
-                    obj.multichannel_recon = 1;   % fallback to channel 1
-                end
-                opts_orig = obj.multichannel_recon; % update local copy
-            end
             if isempty(opts_orig)
                 sel_orig = 1:nCoils_orig;
+            elseif islogical(opts_orig)
+                if numel(opts_orig) ~= nCoils_orig
+                    error('buildimages:coilMaskWrongLength', ...
+                        'Logical receiver mask has %d entries; %d receivers are available.', ...
+                        numel(opts_orig), nCoils_orig);
+                end
+                sel_orig = find(opts_orig(:).');
             else
                 if ~isnumeric(opts_orig)
                     error('buildimages:coilSelNotNumeric', ...
-                        'multichannel_recon must be a numeric index list. Got %s.', class(opts_orig));
+                        'multichannel_recon must be a numeric index list or logical mask. Got %s.', ...
+                        class(opts_orig));
                 end
 
-                sel_orig = unique(round(opts_orig(:).'));   % row vector, unique
-                sel_orig(isnan(sel_orig)) = [];
+                sel_orig = unique(round(opts_orig(:).'), 'stable');
+                sel_orig(~isfinite(sel_orig)) = [];
 
                 if isempty(sel_orig)
                     error('buildimages:coilSelEmptyAfterParse', ...
@@ -623,28 +639,85 @@ classdef ImageReconCore
             end
 
             obj.selected_coils_original = sel_orig;
+            nSel = numel(sel_orig);
 
-            % Trim padded k-space to the selected coils; from here on coils are renumbered 1..nSel
-            kpad = kpad_full(:,:,:,:,:,sel_orig);
-            opts = 1:size(kpad,6);   % local coil index space (1..nSel)
-            nSel = numel(opts);
+            % Estimate and apply one whitening transform across the complete
+            % acquired receiver array.  Selection is deliberately applied
+            % afterwards: for example, selecting displayed receiver 7 retains
+            % MATLAB channel 8 of the fully prewhitened array.  A retained
+            % channel is therefore a virtual (mixed) prewhitened channel, not
+            % the untouched physical receiver with that number.
+            whiteningEnabled = ~isempty(obj.noise_whitening) && ...
+                isscalar(obj.noise_whitening) && logical(obj.noise_whitening) && ...
+                nCoils_orig > 1;
+            [kspace_selected, obj.whitening_info] = prewhiten_and_select( ...
+                obj.complexkspace, sel_orig, whiteningEnabled);
+            opts = 1:nSel;
+
+            % Magnitude k-space is kept at the acquired matrix size for QC.
+            obj.magkspace = rssq(kspace_selected, 6);
+
+            % ----------- Precompute centred zero filling -----------
+            % Spatial dimension order is read / phase / partition.
+            nRead  = size(kspace_selected, 1);
+            nPhase = size(kspace_selected, 2);
+            nPart  = size(kspace_selected, 3);
+
+            targetRead = round(double(obj.fft_size));
+            if ~isfinite(targetRead) || targetRead < 1
+                error('buildimages:invalidFftSize', ...
+                    'obj.fft_size must be a positive finite integer.');
+            end
+
+            % Apply the same zero-fill factor to read and phase. Deriving this
+            % from the actual array sizes avoids stale header values and works
+            % for rectangular matrices/non-square FOV acquisitions.
+            targetPhase = round(double(nPhase) * targetRead / double(nRead));
+            targetPart = nPart;
+            if obj.TwoDimensional ~= 1 && ~isempty(obj.fft_size_3d)
+                targetPart = round(double(obj.fft_size_3d));
+            end
+
+            if targetRead < nRead
+                error('buildimages:fftSizeTooSmall', ...
+                    'obj.fft_size=%d is smaller than acquired readout size %d.', ...
+                    targetRead, nRead);
+            end
+            if targetPhase < nPhase
+                error('buildimages:phaseFftSizeTooSmall', ...
+                    'Target phase FFT size %d is smaller than acquired phase size %d.', ...
+                    targetPhase, nPhase);
+            end
+            if ~isfinite(targetPart) || targetPart < nPart
+                error('buildimages:partitionFftSizeTooSmall', ...
+                    'obj.fft_size_3d=%g is smaller than acquired partition size %d.', ...
+                    double(targetPart), nPart);
+            end
+
+            padReadTotal  = targetRead  - nRead;
+            padPhaseTotal = targetPhase - nPhase;
+            padPartTotal  = targetPart  - nPart;
+
+            % padarray entries follow the real array order: read, phase, part.
+            % The previous phase/read reversal only went unnoticed for square data.
+            padPre = [floor(padReadTotal/2), ...
+                floor(padPhaseTotal/2), floor(padPartTotal/2)];
+            padPost = [ceil(padReadTotal/2), ...
+                ceil(padPhaseTotal/2), ceil(padPartTotal/2)];
+
+            kspace_selected = windowkspace(kspace_selected, ...
+                obj.window_size, obj.window_function);
+            kpad = padarray(kspace_selected, padPre, 0, 'pre');
+            kpad = padarray(kpad, padPost, 0, 'post');
 
             % ----------- FFT to image space (per coil) -----------
             if obj.TwoDimensional == 1
                 obj.compleximage = ifft2c(kpad);
             else
-                % centered ifft over first 3 spatial dims, keeps all other dims intact
-                for t =1:size(kpad,4)
-                    for f=1:size(kpad,5)
-                        obj.compleximage(:,:,:,t,f,:) = ifft3c(kpad(:,:,:,t,f,:));
-                    end
-                end
+                % Transform only the first three spatial dimensions. The old
+                % ifftn implementation also transformed the receiver dimension.
+                obj.compleximage = ifft3c(kpad);
             end
-
-
-            % ----------- Magnitude k-space (for QC / debugging) -----------
-            % Keep in ORIGINAL coil index space for consistency with saved raw k-space
-            obj.magkspace = rssq(obj.complexkspace(:,:,:,:,:,sel_orig), 6);
 
             % ----------- Receiver combination mode (from GUI dropdown) -----------
             combineMode = "ACS/Walsh"; % default
@@ -678,7 +751,18 @@ classdef ImageReconCore
 
                     case "Adaptive"
                         % Smoothed self-calibrated adaptive complex combine
-                        obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, opts, obj);
+                        ccopts = struct();
+                        ccopts.coils = 1:size(obj.compleximage, 6);
+                        ccopts.sigma = 4;
+                        ccopts.maskFrac = 0.1;
+                        if whiteningEnabled
+                            % Whitening creates virtual channels; no output
+                            % channel remains the privileged "signal coil".
+                            ccopts.referenceMode = 'rss';
+                        else
+                            ccopts.referenceMode = 'signalcoil';
+                        end
+                        obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, ccopts);
                         obj.magimage = abs(obj.complexcombined);
                         obj.compleximage = obj.complexcombined;
                     case "ACS/Walsh"
@@ -700,13 +784,12 @@ classdef ImageReconCore
                         % no-op
 
                     case "ACS"
-                        [bias, mask3] = bias_field_from_acs(kpad, opts, obj);
-                        if exist('apply_bias_field_safe','file') == 2
-                            obj.magimage = apply_bias_field_safe(obj.magimage, bias, mask3, obj);
-                        else
-                            % obj.magimage = apply_bias_field(obj.magimage, bias, mask3, obj);
-                            [obj.magimage] = map_guided_bias_correct(obj.magimage, maps, obj);
+                        % Bias correction previously referenced `maps` even
+                        % when RSSQ or Adaptive combination had not created it.
+                        if ~exist('maps', 'var') || isempty(maps)
+                            maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
                         end
+                        obj.magimage = map_guided_bias_correct(obj.magimage, maps, obj);
 
                     otherwise
                         % no-op
@@ -735,1777 +818,3941 @@ classdef ImageReconCore
         end
 
 
-        function obj = MapRelaxation(obj)
-            %              r1t1mapping;
-            dim = size(obj.magimage,1);
-            fields = obj.fieldpoints; %list of evolution times in seconds
-            times = obj.timepoints;
-            n_fields = obj.n_fieldpoints;
-            clear obj.T1Maps
-            clear obj.R1Maps
-            obj.T1Maps = zeros(dim,dim,obj.slices,n_fields(1));
-            obj.R1Maps = zeros(dim,dim,obj.slices,n_fields(1));
+     function obj = MapRelaxation(obj)
+%MAPRELAXATION Pixelwise FCI T1 mapping, parfor-safe class wrapper.
+%
+% This wrapper intentionally contains NO parfor loop.  The parallel work is
+% done in the standalone function ffc_t1map_phase_signed_run_parallel.m so
+% MATLAB workers do not need to execute ImageReconCore.m or any local helper
+% functions inside the class file.
+%
+% Required files on the MATLAB path:
+%   ffc_t1map_phase_signed_run_parallel.m
+%   ffc_t1map_phase_signed_magnitude_worker_v2.m
+%
+% Model per pixel/field/slice:
+%   y(t) = B - C*exp(-R1*t), B>=0, C>=0, R1>=0
+%
+% If compleximage is available, phase is used only to assign sign while
+% preserving magnitude:
+%   y = sign(real(z*exp(-1i*phi_ref))) .* abs(z)
 
-            mF = 0.05;
-            maskFactor = mF;
-            dims = size(obj.magimage);
-            nbrow = size(obj.magimage,1);
-            nbcol = size(obj.magimage,2);
-            t1mask = zeros(nbrow, nbcol, 1);
+    opts = struct();
+    opts.MaskFactor = 0.02;
+    opts.UseExistingMask = false;
+    opts.PhaseReferenceMode = 'last2';
+    opts.SignAssignmentMode = 'phase_then_prefix_if_bad';
+    opts.MaxPrefixSignCandidates = 4;
+    opts.T1AcceptedRangeMs = [50 3000];
+    opts.RsqBadThreshold = 0.85;
+    opts.R1Min = 0.2;
+    opts.R1Max = 40;
+    opts.R1GridPoints = 80;
+    opts.R1GridLogSpaced = true;
+    opts.MinValidTimepoints = 4;
+    opts.UseParallel = true;
 
-
-            maskTmp = t1mask(:,:);
-            maskTmp = medfilt2(maskTmp); % remove salt and pepper noise
-            maskThreshold = maskFactor*max(max(abs(obj.magimage(:,:,1,1,1,1))));
-            maskTmp(find(abs(obj.magimage(:,:,1,1,1,1))> maskThreshold)) = 1;
-            t1mask = maskTmp;
-            clear maskTmp
-            imagestobeprocessed = obj.magimage;
-            % obj.T1Maps = T1;
-            % obj.R1Maps = R1;
-            if obj.checkfit
-                for s=1:obj.slices
-                    for n=1:n_fields
-                        t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),1,t1mask);
-                        T1Maps(:,:,s,n)=t1map(:,:,1,1);
-                    end
-                end
-            else
-                for s=1:obj.slices
-                    parfor n=1:n_fields
-                        t1map = multipointT1map(squeeze(imagestobeprocessed(:,:,s,:,n)),times(n,:),0,t1mask);
-                        T1Maps(:,:,s,n)=t1map(:,:,1,1);
-                    end
-                end
+    % Optional overrides can be placed in obj.param.T1MapOptions as a struct.
+    try
+        if isstruct(obj.param) && isfield(obj.param, 'T1MapOptions') && isstruct(obj.param.T1MapOptions)
+            userOpts = obj.param.T1MapOptions;
+            fn = fieldnames(userOpts);
+            for k = 1:numel(fn)
+                opts.(fn{k}) = userOpts.(fn{k});
             end
+        end
+    catch
+    end
 
+    if isempty(obj.magimage)
+        error('MapRelaxation:NoMagnitudeImage', 'obj.magimage is empty. Rebuild images before T1 mapping.');
+    end
 
-            obj.T1Maps = T1Maps;
-            obj.R1Maps = 1000./obj.T1Maps;
+    magData = obj.magimage;
 
-        end %image based T1 analysis methods are contained here
+    useComplex = false;
+    complexData = [];
+    try
+        if ~isempty(obj.compleximage) && ndims(obj.compleximage) >= 4 && ...
+                size(obj.compleximage,1) == size(magData,1) && size(obj.compleximage,2) == size(magData,2)
+            complexData = obj.compleximage;
+            useComplex = true;
+        end
+    catch
+        useComplex = false;
+        complexData = [];
+    end
 
- 
-function obj = T1dispersion(obj, slice)
-%T1DISPERSION Complex field-cycling T1 dispersion fit.
-%
-% Fits the complex ROI signal directly using:
-%
-%   z(t) = exp(1i*(phi0 + phi1*t)) * (A*exp(-R1*t) + B)
-%
-% where:
-%
-%   A    <= 0
-%   B    >= 0
-%   R1   >= 0
-%   phi0 = constant phase offset
-%   phi1 = linear phase drift with evolution time, rad/s
-%
-% Field-cycling interpretation:
-%
-%   B = M0(B0e)
-%   A = -M0(200 mT) - M0(B0e)
-%
-% This version:
-%   - uses obj.compleximage
-%   - fits complex data directly
-%   - allows linear phase drift across evolution time
-%   - tries automatic 180-degree polarity flips for poor initial fits
-%   - supports manual polarity flipping in checkfit mode
-%   - uses a fast fitter first and a broader fallback only if needed
-
-    % ==========================================================
-    % User-adjustable settings
-    % ==========================================================
-    R1_UPPER_LIMIT = 50;             % s^-1. 50 corresponds to minimum T1 of 20 ms.
-    MAX_PHASE_SLOPE = 200;           % rad/s. Increase if low-field phase drift is larger.
-
-    USE_FAST_FITTER_FIRST = true;
-    USE_EXPENSIVE_FALLBACK = true;
-    FALLBACK_RSQ_THRESHOLD = 0.60;
-    USE_PARFOR_STARTLIST = true;
-
-    ENABLE_AUTOMATIC_POLARITY_SEARCH = true;
-    AUTO_POLARITY_RSQ_TRIGGER = 0.85;
-    AUTO_POLARITY_IMAG_TRIGGER = 0.45;
-
-    MAX_AUTO_POLARITY_FLIPS = 2;
-    MAX_AUTO_POLARITY_CANDIDATES = 5;
-
-    AUTO_POLARITY_ACCEPT_RMSE_RATIO = 0.75;
-    AUTO_POLARITY_ACCEPT_RSQ_GAIN = 0.15;
-    AUTO_POLARITY_MIN_RSQ_ACCEPT = 0.70;
-
-    ENABLE_MANUAL_POLARITY_CORRECTION = true;
-
-    % Keep this off by default. Automatic polarity search is usually more useful.
-    ENABLE_AUTOMATIC_TRIMMING = false;
-
-    PRINT_FIT_TIMING = false;
-
-    % ==========================================================
-    % Basic setup
-    % ==========================================================
-    fields = double(obj.fieldpoints(:));      % expected mT
-    times  = double(obj.timepoints);          % expected ms
+    times = double(obj.timepoints);
+    fields = double(obj.fieldpoints(:)); %#ok<NASGU>
 
     if isscalar(obj.n_fieldpoints)
-        n_fields = double(obj.n_fieldpoints);
+        nFields = double(obj.n_fieldpoints);
     else
-        n_fields = double(obj.n_fieldpoints(1));
+        nFields = double(obj.n_fieldpoints(1));
     end
 
-    n_fields = min(n_fields, numel(fields));
+    % A 3D reconstruction may be zero-filled through-plane, so the output
+    % stack can contain more planes than the acquired partition count.
+    nSlices = size(magData, 3);
 
-    nParams = 5;                              % [A B R1 phi0 phi1]
-
-    R1dispersion = nan(1, n_fields);
-    R1error      = nan(1, n_fields);
-    T1dispersion = nan(1, n_fields);
-    T1error      = nan(1, n_fields);
-
-    fit_params = nan(n_fields, nParams);      % [A B R1 phi0 phi1]
-    fit_sse    = nan(1, n_fields);
-    fit_rsq    = nan(1, n_fields);
-    fit_rmse   = nan(1, n_fields);
-    fit_dfe    = nan(1, n_fields);
-    fit_qc     = strings(1, n_fields);
-    fit_qc(:)  = "not fitted";
-
-    manual_polarity_flips = cell(1, n_fields);
-    auto_polarity_flips   = cell(1, n_fields);
-    auto_points_removed   = zeros(1, n_fields);
-
-    last_good_p = [];
-
-    gammaH_Hz_per_T = 42.57747892e6;
-
-    fieldsT  = fields ./ 1e3;
-    fieldMHz = fieldsT .* gammaH_Hz_per_T ./ 1e6;
-
-    % ==========================================================
-    % Slice-specific mask
-    % ==========================================================
-    if ndims(obj.mask) == 3
-        mask2d = obj.mask(:,:,slice);
-    else
-        mask2d = obj.mask;
+    userMask = [];
+    try
+        if ~isempty(obj.mask)
+            userMask = logical(obj.mask);
+        end
+    catch
+        userMask = [];
     end
 
-    mask2d = logical(mask2d);
+    out = ffc_t1map_phase_signed_run_parallel( ...
+        magData, complexData, useComplex, times, nFields, nSlices, userMask, opts);
 
+    obj.T1Maps = out.T1;
+    obj.R1Maps = out.R1;
+
+    % Store extra QC outputs in obj.param so you do not have to add new class
+    % properties.  Add real properties later if you want direct dot access.
+    try
+        obj.param.T1Map_Rsq = out.Rsq;
+        obj.param.T1Map_RMSE = out.RMSE;
+        obj.param.T1Map_SSE = out.SSE;
+        obj.param.T1Map_QC = out.QC;
+        obj.param.T1Map_SignMode = out.SignMode;
+        obj.param.T1Map_Mask = out.Mask;
+        obj.param.T1MapOptionsUsed = opts;
+    catch
+    end
+
+    fprintf('Pixelwise T1 mapping complete: %d x %d x %d slices x %d fields. Complex phase-signing: %d\n', ...
+        size(out.T1,1), size(out.T1,2), size(out.T1,3), size(out.T1,4), useComplex);
+end
+
+
+
+function [obj, results] = T1dispersion(obj, slice, userOptions)
+%T1DISPERSION Phase-aware field-cycling inversion-recovery T1 fit.
+%
+%   OBJ = T1DISPERSION(OBJ, SLICE)
+%   [OBJ, RESULTS] = T1DISPERSION(OBJ, SLICE, OPTIONS)
+%
+% This is a drop-in replacement for the previous field-wise fitter.  It is
+% designed for inversion-recovery field-cycling experiments in which the
+% equilibrium magnetisation changes during the evolution field and again
+% during the return to the detection field.
+%
+% If all preparation, ramp and readout timings other than the evolution time
+% are fixed, the longitudinal signal at one evolution field can always be
+% written as
+%
+%       S(t) = S_inf + (S_0 - S_inf) exp(-R1 t)
+%            = B - C exp(-R1 t).                         (1)
+%
+% B and C are nuisance parameters and are NOT tied to the detection-field
+% M0. In the default inversion mode B>=0 and C>B, so the initial state is
+% negative while a near-zero equilibrium remains possible at ultra-low field.
+% Set sequenceMode='unconstrained' only for non-IR acquisitions.
+%
+% Primary fitting routes
+% ---------------------
+% The default auto mode first tests whether a complex ROI signal can be
+% described by a smoothly drifting global phase plus a single IR sign
+% transition.  If so, the drift-corrected signed complex signal is fitted.
+% Otherwise, the magnitude is fitted directly without assigning measured
+% samples arbitrary signs.  For a single T/R coil the expected Rician
+% magnitude is used; for combined multi-coil magnitude data a measured-noise
+% floor approximation is used.  Both routes enforce an inverted initial
+% state, S(0)<0, unless OPTIONS.sequenceMode is explicitly changed.
+%
+% Optional joint multi-field fit
+% ------------------------------
+% Set OPTIONS.fitMode='joint' to refine phase-validated signed field-wise
+% fits using the combined-field signal model of Boedenler et al.:
+%
+%   S_f(t) = M0_D*[r_f*(1-exp(-R1_f*t))
+%                         - alpha_f*exp(-R1_f*t)],          (2)
+%
+% where r_f=B_E,f/B_D, M0_D is shared by every field, and alpha_f and R1_f
+% are field-specific.  In an inversion-recovery sequence alpha_f must be
+% non-negative: S_f(0)=-M0_D*alpha_f.  The linear subproblem therefore uses
+% A_f=M0_D*(alpha_f-alpha_min)>=0 rather than treating the exponential
+% amplitude as an unconstrained nuisance parameter.  This prevents a
+% magnitude curve from being explained by an unphysical negative inversion
+% efficiency.  The shared equilibrium scaling is what makes this a genuinely
+% simultaneous fit; merely summing independent field objectives would return
+% exactly the original field-wise estimates.
+%
+% The independent mode is the default because the joint model additionally
+% requires intensity calibration consistent with M0 proportional to field.
+% This ROI implementation reproduces the paper's combined-field pixel-wise model;
+% it does not implement the paper's k-space Frobenius-TGV reconstruction.
+% Reference: Boedenler M et al., Magn Reson Med. 2021;86:2049-2063,
+% doi:10.1002/mrm.28857.
+%
+% Automatic complex/magnitude fit
+% -------------------------------
+% In the default 'auto' mode, every physically possible IR zero-crossing
+% branch is tested.  For each branch a low-order, smoothly varying phase drift
+% is estimated without independently rotating the time points.  This preserves
+% a genuine pi inversion while allowing ppm-level readout-field drift.
+%
+% Magnitude inversion-recovery model
+% ----------------------------------
+% Magnitude observations are fitted as a function of
+%       nu(t)=abs(B-C*exp(-R1*t)),  B>=0, C>B,
+% rather than converted into signed Gaussian samples.  This explicitly models
+% the non-zero magnitude near the inversion null.  OPTIONS.magnitudeNoiseSigma
+% can provide a measured single-quadrature noise SD; otherwise a background
+% estimate is used and the recovery minimum is only a last-resort estimate.
+%
+% Robustness and uncertainty
+% --------------------------
+% Huber iteratively reweighted least squares reduces the influence of motion
+% or corrupted time points.  A one-dimensional profile-likelihood interval
+% is calculated for R1; this is more informative than a symmetric Jacobian
+% interval when the asymptote is close to zero or R1 approaches a bound.
+%
+% Required OBJ members
+% --------------------
+%   fieldpoints    evolution fields in mT
+%   timepoints     evolution times in ms; vector or [field x time]
+%   mask           2-D mask or [X Y slice] mask
+%   compleximage   preferred, [X Y slice time field]
+%       OR
+%   magimage       fallback, [X Y slice time field]
+%
+% Existing output members are populated when they exist on an object, and
+% are always added when OBJ is a struct.  Detailed diagnostics are returned
+% in RESULTS even when the OBJ class has no matching property.
+%
+% Useful OPTIONS fields (all optional)
+% ------------------------------------
+%   signalMode          'auto' (default), 'complex', or 'magnitude'.
+%                       'auto' fits both representations and uses complex
+%                       results only when their phase/polarity is coherent.
+%   roiAggregation      'phase_aligned_trimmed_mean' (default),
+%                       'phase_aligned_mean', or 'plain_mean'
+%   trimFraction        spatial trimming fraction, default 0.10
+%   robust              false (default); with few time points robust and
+%                       ordinary fits should be compared rather than silently
+%                       discarding influential recovery samples
+%   robustTune          radial Huber tuning constant, default 2.5
+%   robustIterations    default 8
+%   T1BoundsMs          [20 3000] by default
+%   fitMode             'independent' (default) or 'joint'
+%   sequenceMode        'inversion' (default) or 'unconstrained'
+%   minimumInitialMagnetizationFraction  minimum |S(0)| relative to the
+%                       observed signal scale, default 0.05
+%   phaseDriftOrder     polynomial order versus stored acquisition index,
+%                       default 1
+%   maximumPhaseResidualDegrees  maximum RMS residual for accepting complex
+%                       phase, default 40 degrees
+%   magnitudeNoiseSigma NaN (auto), scalar, or one value per field
+%   magnitudeCoilCount NaN (infer), or number of coils represented by a
+%                       magnitude-only image
+%   forcedNegativeIndices / forcedPositiveIndices  cell arrays indexed by
+%                       field, used to impose known sample polarity after
+%                       evolution-time sorting and duplicate-time averaging
+%   detectionField_mT   NaN (default): infer max(fieldpoints). Set the true
+%                       detection/inversion field explicitly when it is not
+%                       the largest evolution field; it enters the physical
+%                       inversion constraint as well as reported alpha.
+%   jointRateSweeps     bounded coordinate sweeps per robust iteration,
+%                       default 5
+%   jointSignIterations joint magnitude-polarity refinements, default 3
+%   jointMinimumAlpha   minimum inversion/ramp efficiency, default 0.10.
+%                       Set to 0 only if a non-inverted initial state is
+%                       physically possible in the acquisition.
+%   jointTimeWeighting  false (default): optional later-time upweighting
+%                       evolution times within each field
+%   jointLateTimeWeight relative latest/earliest weight, default 4
+%   jointTimeWeightExponent curvature of the normalized time ramp,
+%                       default 1 (linear)
+%   jointNoiseWeighting weight fields by robust residual noise, default true
+%   makeDispersionPlot  true (default)
+%   showDashboard       defaults to obj.checkfit == 1
+%   printSummary        true (default)
+%
+% R1error and T1error are approximate one-standard-error values derived from
+% the profile interval.  The full intervals are in results.field(n).R1CI95
+% and results.field(n).T1CI95, and in obj.R1ci95 / obj.T1ci95 when supported.
+
+    if nargin < 2 || isempty(slice)
+        slice = 1;
+    end
+    if nargin < 3 || isempty(userOptions)
+        userOptions = struct();
+    end
+    if ~isstruct(userOptions)
+        error('T1dispersion:InvalidOptions', 'OPTIONS must be a struct.');
+    end
+
+    opts = defaultOptions();
+    opts = mergeOptions(opts, userOptions);
+    if ~isfield(userOptions, 'showDashboard')
+        opts.showDashboard = memberExists(obj, 'checkfit') && ...
+            isscalar(obj.checkfit) && obj.checkfit == 1;
+    end
+    opts = validateOptions(opts);
+
+    if ~memberExists(obj, 'fieldpoints') || isempty(obj.fieldpoints)
+        error('T1dispersion:MissingFields', 'obj.fieldpoints is required.');
+    end
+    if ~memberExists(obj, 'timepoints') || isempty(obj.timepoints)
+        error('T1dispersion:MissingTimes', 'obj.timepoints is required.');
+    end
+    if ~memberExists(obj, 'mask') || isempty(obj.mask)
+        error('T1dispersion:MissingMask', 'obj.mask is required.');
+    end
+
+    fields_mT = double(obj.fieldpoints(:));
+    times_ms = double(obj.timepoints);
+    mask2d = selectMask(obj.mask, slice);
     if ~any(mask2d(:))
-        warning('T1dispersion:EmptyMask', ...
-            'Mask is empty for slice %d. No fits performed.', slice);
-        return
+        error('T1dispersion:EmptyMask', 'The selected mask is empty for slice %d.', slice);
     end
 
-    % ==========================================================
-    % Check complex image dimensions
-    % Expected: [X Y slice time field]
-    % ==========================================================
-    ndc = ndims(obj.compleximage);
-    csz = size(obj.compleximage);
+    % fieldpoints is the authoritative list.  Do not use the currently
+    % displayed EvolutionFieldDropDown value and do not silently reduce the
+    % fit to a four-dimensional, displayed-field image.
+    nFields = numel(fields_mT);
+    sources = resolveSignalSources(obj, opts.signalMode, nFields, mask2d, slice);
+    if isnan(opts.magnitudeCoilCount)
+        opts.magnitudeCoilCount = inferMagnitudeCoilCount(obj, sources);
+    end
+    signalMode = sources.mode;
+    implementationTag = ['ImageReconCore.T1dispersion parent-integrated ', ...
+        'v8 phase-drift-rician-constrained-IR'];
+    inputDiagnostics = struct( ...
+        'fieldCount', nFields, ...
+        'timepointsSize', size(times_ms), ...
+        'magimageSize', memberSize(obj, 'magimage'), ...
+        'compleximageSize', memberSize(obj, 'compleximage'), ...
+        'selectedMode', signalMode, ...
+        'fitMode', opts.fitMode, ...
+        'complexMember', sources.complexMember, ...
+        'magnitudeMember', sources.magnitudeMember, ...
+        'complexRejectedReason', sources.complexRejectedReason);
+    inputDiagnostics.magnitudeCoilCount = opts.magnitudeCoilCount;
 
-    if ndc == 6
-        error(['T1dispersion: obj.compleximage appears to still have a coil ', ...
-               'dimension [X Y slice time field coil]. Perform complex coil ', ...
-               'combination before complex T1 fitting.']);
-    elseif ndc ~= 5
-        error('T1dispersion:UnexpectedComplexImageDims', ...
-            'obj.compleximage has unexpected dimensions: %s', mat2str(csz));
+    if memberExists(obj, 'n_fieldpoints') && ~isempty(obj.n_fieldpoints)
+        declaredCount = double(obj.n_fieldpoints(1));
+        if isfinite(declaredCount) && declaredCount ~= nFields
+            warning('T1dispersion:DeclaredFieldCountMismatch', ...
+                ['obj.n_fieldpoints is %d but obj.fieldpoints contains %d ', ...
+                 'values. Fitting all %d values in obj.fieldpoints.'], ...
+                declaredCount, nFields, nFields);
+        end
     end
 
-    % ==========================================================
-    % lsqcurvefit setup
-    % ==========================================================
-    lsqOpts = optimoptions('lsqcurvefit', ...
-        'Display', 'off', ...
-        'Algorithm', 'trust-region-reflective', ...
-        'FunctionTolerance', 1e-7, ...
-        'StepTolerance', 1e-7, ...
-        'OptimalityTolerance', 1e-7, ...
-        'MaxIterations', 200, ...
-        'MaxFunctionEvaluations', 1000);
+    fieldTemplate = emptyFieldResult();
+    fieldResult = repmat(fieldTemplate, 1, nFields);
 
-    % Parameter order: [A B R1 phi0 phi1]
-    lb = [-Inf, 0, 0,              -pi, -MAX_PHASE_SLOPE];
-    ub = [0,    Inf, R1_UPPER_LIMIT, pi,  MAX_PHASE_SLOPE];
+    % This method contains nested helper functions. MATLAB shares a parent
+    % variable with a nested helper when both use the same name. The helpers
+    % use `n` for the number of time samples, so the field loop must use a
+    % unique name or every fit is written into the same result slot.
+    for fieldLoopIndex = 1:nFields
+        try
+            t_ms = timeVectorForField(times_ms, fieldLoopIndex, nFields);
+            complexSignal = [];
+            magnitudeSignal = [];
+            complexMeta = struct();
+            magnitudeMeta = struct();
 
-    % ==========================================================
-    % Main field loop
-    % ==========================================================
-    for n = 1:n_fields
-
-        if PRINT_FIT_TIMING
-            tField = tic;
-        end
-
-        % ------------------------------------------------------
-        % Extract times for this field
-        % ------------------------------------------------------
-        if size(times,1) >= n
-            invtimes_ms = double(times(n,:)).';
-        else
-            invtimes_ms = double(times(:));
-        end
-
-        invtimes_ms = invtimes_ms(:);
-
-        % ------------------------------------------------------
-        % Extract complex image series [X Y T]
-        % ------------------------------------------------------
-        img_c = reshape( ...
-            obj.compleximage(:,:,slice,:,n), ...
-            size(obj.compleximage,1), ...
-            size(obj.compleximage,2), ...
-            size(obj.compleximage,4));
-
-        nT_img = size(img_c, 3);
-
-        if numel(invtimes_ms) ~= nT_img
-            nT = min(numel(invtimes_ms), nT_img);
-
-            warning('T1dispersion:TimeImageMismatch', ...
-                'Field %d: time vector length does not match image time dimension. Using first %d points.', ...
-                n, nT);
-
-            invtimes_ms = invtimes_ms(1:nT);
-            img_c = img_c(:,:,1:nT);
-        end
-
-        valid_time = isfinite(invtimes_ms);
-
-        invtimes_ms = invtimes_ms(valid_time);
-        img_c = img_c(:,:,valid_time);
-
-        if numel(invtimes_ms) < 4
-            warning('T1dispersion:TooFewTimepoints', ...
-                'Field %d has fewer than 4 valid timepoints. Skipping.', n);
-            fit_qc(n) = "too few points";
-            continue
-        end
-
-        % ------------------------------------------------------
-        % Complex ROI signal
-        % ------------------------------------------------------
-        z_roi = complexRoiSignal(img_c, mask2d);
-
-        valid = isfinite(invtimes_ms) & ...
-                isfinite(real(z_roi)) & ...
-                isfinite(imag(z_roi));
-
-        x_ms = invtimes_ms(valid);
-        z    = z_roi(valid);
-
-        if numel(z) < 4
-            warning('T1dispersion:TooFewValidSignalPoints', ...
-                'Field %d has fewer than 4 valid complex signal points. Skipping.', n);
-            fit_qc(n) = "too few valid points";
-            continue
-        end
-
-        [x_ms, ord] = sort(x_ms);
-        z = z(ord);
-
-        % Previous R1 as a useful starting point
-        if n > 1 && isfinite(R1dispersion(n-1)) && R1dispersion(n-1) > 0
-            R1start_centre = R1dispersion(n-1);
-        else
-            R1start_centre = 1; % s^-1
-        end
-
-        % ------------------------------------------------------
-        % Initial complex fit
-        % ------------------------------------------------------
-        [p, ci, gof, ok, xs, z_used, residual_complex] = fitComplexFcModelAuto( ...
-            x_ms, z, R1start_centre, lb, ub, lsqOpts, last_good_p);
-
-        if ~ok
-            warning('T1dispersion:FitFailed', ...
-                'Complex fit failed for field %d.', n);
-            fit_qc(n) = "fit failed";
-            continue
-        end
-
-        % ------------------------------------------------------
-        % Automatic polarity search
-        % ------------------------------------------------------
-        auto_flip_idx = [];
-
-        if ENABLE_AUTOMATIC_POLARITY_SEARCH && shouldTryAutoPolaritySearch(gof, p, xs, z_used)
-
-            [p_auto, ci_auto, gof_auto, ok_auto, xs_auto, z_auto, residual_auto, flip_idx_auto] = ...
-                automaticPolarityFlipSearch( ...
-                    p, ci, gof, xs, z_used, residual_complex, ...
-                    R1start_centre, lb, ub, lsqOpts);
-
-            if ok_auto && ~isempty(flip_idx_auto)
-
-                rmseImproved = isfinite(gof_auto.rmse) && isfinite(gof.rmse) && ...
-                    gof_auto.rmse < AUTO_POLARITY_ACCEPT_RMSE_RATIO .* gof.rmse;
-
-                rsqImproved = isfinite(gof_auto.rsquare) && isfinite(gof.rsquare) && ...
-                    gof_auto.rsquare > gof.rsquare + AUTO_POLARITY_ACCEPT_RSQ_GAIN && ...
-                    gof_auto.rsquare > AUTO_POLARITY_MIN_RSQ_ACCEPT;
-
-                if rmseImproved || rsqImproved
-
-                    p = p_auto;
-                    ci = ci_auto;
-                    gof = gof_auto;
-                    xs = xs_auto;
-                    z_used = z_auto;
-                    residual_complex = residual_auto;
-
-                    auto_flip_idx = flip_idx_auto;
-                    auto_polarity_flips{n} = auto_flip_idx;
-
-                    warning('T1dispersion:AutoPolarityFlip', ...
-                        'Field %d: automatically flipped point(s) %s. New R^2 = %.4f.', ...
-                        n, mat2str(auto_flip_idx), gof.rsquare);
+            if sources.useComplex
+                [complexSignal, complexMeta] = extractRoiSignal( ...
+                    sources.complexData, mask2d, slice, fieldLoopIndex, ...
+                    'complex', opts);
+            end
+            if sources.useMagnitude
+                [magnitudeSignal, magnitudeMeta] = extractRoiSignal( ...
+                    sources.magnitudeData, mask2d, slice, fieldLoopIndex, ...
+                    'magnitude', opts);
+            elseif ~isempty(complexSignal)
+                % Magnitude is taken only after complex ROI averaging, which
+                % avoids per-voxel Rician bias as far as the available data allow.
+                magnitudeSignal = abs(complexSignal);
+                magnitudeMeta = complexMeta;
+                magnitudeMeta.aggregation = 'magnitude_of_complex_roi_mean';
+                if isfield(magnitudeMeta, 'roiNoiseSigma') && ...
+                        isfinite(magnitudeMeta.roiNoiseSigma)
+                    magnitudeMeta.backgroundMagnitudeMean = ...
+                        magnitudeMeta.roiNoiseSigma .* sqrt(pi ./ 2);
                 end
             end
-        end
 
-        % ------------------------------------------------------
-        % Optional automatic trimming: disabled by default
-        % ------------------------------------------------------
-        if ENABLE_AUTOMATIC_TRIMMING && ok && numel(z_used) >= 6 && gof.rsquare < 0.70
-            [p2, ci2, gof2, ok2, xs2, z2, residual2, removed_idx] = ...
-                fitComplexFcModelWithSingleTrim( ...
-                    xs .* 1000, z_used, R1start_centre, lb, ub, lsqOpts, p);
+            [complexTime, complexSignal] = prepareFieldSamples( ...
+                t_ms, complexSignal, fieldLoopIndex, 'complex');
+            [magnitudeTime, magnitudeSignal] = prepareFieldSamples( ...
+                t_ms, magnitudeSignal, fieldLoopIndex, 'magnitude');
 
-            if ok2 && isfinite(gof2.rmse) && isfinite(gof.rmse) && gof2.rmse < 0.75 .* gof.rmse
-                p = p2;
-                ci = ci2;
-                gof = gof2;
-                xs = xs2;
-                z_used = z2;
-                residual_complex = residual2;
-                auto_points_removed(n) = numel(removed_idx);
-
-                warning('T1dispersion:AutoPointRemoved', ...
-                    'Field %d: automatically removed point(s): %s', ...
-                    n, mat2str(removed_idx));
+            switch signalMode
+                case 'complex'
+                    polarity = fieldPolarityConstraints(obj, opts, ...
+                        fieldLoopIndex, numel(complexTime));
+                    currentFieldResult = fitOrFailComplex(complexTime, complexSignal, ...
+                        opts, fieldTemplate, polarity, fieldLoopIndex);
+                    currentFieldResult.roiMeta = complexMeta;
+                case 'magnitude'
+                    polarity = fieldPolarityConstraints(obj, opts, ...
+                        fieldLoopIndex, numel(magnitudeTime));
+                    currentFieldResult = fitOrFailMagnitude( ...
+                        magnitudeTime, magnitudeSignal, ...
+                        opts, fieldTemplate, polarity, fieldLoopIndex, ...
+                        magnitudeMeta);
+                    currentFieldResult.roiMeta = magnitudeMeta;
+                otherwise % hybrid_auto
+                    polarity = fieldPolarityConstraints(obj, opts, ...
+                        fieldLoopIndex, max(numel(complexTime), ...
+                        numel(magnitudeTime)));
+                    complexFit = fitOrFailComplex(complexTime, complexSignal, ...
+                        opts, fieldTemplate, polarity, fieldLoopIndex);
+                    magnitudeFit = fitOrFailMagnitude(magnitudeTime, magnitudeSignal, ...
+                        opts, fieldTemplate, polarity, fieldLoopIndex, ...
+                        magnitudeMeta);
+                    currentFieldResult = selectHybridFit( ...
+                        complexFit, magnitudeFit, opts);
+                    currentFieldResult.roiMeta = struct('complex', complexMeta, ...
+                        'magnitude', magnitudeMeta);
             end
+            currentFieldResult.fieldIndex = fieldLoopIndex;
+            currentFieldResult.field_mT = fields_mT(fieldLoopIndex);
+            fieldResult(fieldLoopIndex) = currentFieldResult;
+        catch fieldException
+            currentFieldResult = fieldTemplate;
+            currentFieldResult.fieldIndex = fieldLoopIndex;
+            currentFieldResult.field_mT = fields_mT(fieldLoopIndex);
+            currentFieldResult.method = signalMode;
+            currentFieldResult.qc = ['failed: ' fieldException.message];
+            currentFieldResult.qcReasons = ...
+                {fieldException.identifier, fieldException.message};
+            fieldResult(fieldLoopIndex) = currentFieldResult;
+            warning('T1dispersion:FieldFitFailed', ...
+                'Field %d (%.5g mT) failed: %s', fieldLoopIndex, ...
+                fields_mT(fieldLoopIndex), fieldException.message);
         end
-
-        % ------------------------------------------------------
-        % Optional manual polarity correction during checkfit
-        % ------------------------------------------------------
-        manual_flip_idx = [];
-
-        if ENABLE_MANUAL_POLARITY_CORRECTION && hasProp(obj, 'checkfit') && obj.checkfit == 1
-
-            [p, ci, gof, xs, z_used, residual_complex, manual_flip_idx] = ...
-                manualPolarityCorrectionLoop( ...
-                    n, p, ci, gof, xs, z_used, residual_complex, ...
-                    R1start_centre, lb, ub, lsqOpts, auto_flip_idx);
-
-            manual_polarity_flips{n} = manual_flip_idx;
-
-        elseif hasProp(obj, 'checkfit') && obj.checkfit == 1
-
-            showStaticFitFigure(n, p, gof, xs, z_used, auto_flip_idx);
-
-        end
-
-        % ------------------------------------------------------
-        % Store result
-        % ------------------------------------------------------
-        A_fit    = p(1); %#ok<NASGU>
-        B_fit    = p(2); %#ok<NASGU>
-        R1_fit   = p(3);
-        phi0_fit = p(4); %#ok<NASGU>
-        phi1_fit = p(5); %#ok<NASGU>
-
-        R1dispersion(n) = R1_fit;
-        fit_params(n,:) = p;
-
-        fit_sse(n)  = gof.sse;
-        fit_rsq(n)  = gof.rsquare;
-        fit_rmse(n) = gof.rmse;
-        fit_dfe(n)  = gof.dfe;
-
-        if all(isfinite(ci(:))) && size(ci,1) == 2 && size(ci,2) >= 3
-            R1error(n) = diff(ci(:,3)) ./ 2;
-        else
-            R1error(n) = nan;
-        end
-
-        if gof.rsquare < 0.70
-            fit_qc(n) = "poor";
-        elseif gof.rsquare < 0.90
-            fit_qc(n) = "questionable";
-        else
-            fit_qc(n) = "good";
-        end
-
-        if ~isempty(auto_flip_idx)
-            fit_qc(n) = fit_qc(n) + " / auto-flipped";
-        end
-
-        if ~isempty(manual_flip_idx)
-            fit_qc(n) = fit_qc(n) + " / manually corrected";
-        end
-
-        if isfinite(R1_fit) && R1_fit > 0
-            last_good_p = p;
-        end
-
-        if PRINT_FIT_TIMING
-            fprintf('Field %d fit time: %.3f s, R1 = %.4g s^-1, R2 = %.4f\n', ...
-                n, toc(tField), R1_fit, gof.rsquare);
-        end
-
     end
 
-    % ==========================================================
-    % Convert R1 to T1 with proper uncertainty propagation
-    % ==========================================================
-    valid_R1 = isfinite(R1dispersion) & R1dispersion > 0;
-
-    T1dispersion(valid_R1) = 1000 ./ R1dispersion(valid_R1);
-
-    % T1 = 1000/R1
-    % dT1 = 1000*dR1/R1^2
-    T1error(valid_R1) = 1000 .* R1error(valid_R1) ./ ...
-        (R1dispersion(valid_R1).^2);
-
-    % ==========================================================
-    % Display and plot
-    % ==========================================================
-    if hasProp(obj, 'R1T1') && obj.R1T1 == 1
-
-        disp(['Fields (MHz): ' num2str(fieldMHz(1:n_fields).')])
-        disp(['R1 (s^-1): ' num2str(R1dispersion)])
-        disp(['R1 error (s^-1): ' num2str(R1error)])
-        disp(['Fit QC: ' char(join(fit_qc, ', '))])
-
-        valid_plot = isfinite(fieldMHz(1:n_fields)) & fieldMHz(1:n_fields) > 0 & ...
-                     isfinite(R1dispersion(:).') & R1dispersion > 0;
-
-        figure;
-        scatter(fieldMHz(valid_plot), R1dispersion(valid_plot), 'o');
-        set(gca, 'xscale', 'log', 'yscale', 'log');
-        xlabel('Evolution Field (MHz)');
-        ylabel('R_1 (s^{-1})');
-        title('Complex T1 dispersion fit: R_1 versus evolution field');
-        grid on;
-
-    else
-
-        disp(['Fields (T): ' num2str(fieldsT(1:n_fields).')])
-        disp(['T1 (ms): ' num2str(T1dispersion)])
-        disp(['T1 error (ms): ' num2str(T1error)])
-        disp(['R1 (s^-1): ' num2str(R1dispersion)])
-        disp(['Fit QC: ' char(join(fit_qc, ', '))])
-
-        valid_plot = isfinite(fieldsT(1:n_fields)) & fieldsT(1:n_fields) > 0 & ...
-                     isfinite(T1dispersion(:).') & T1dispersion > 0;
-
-        figure;
-        plot(fieldsT(valid_plot), T1dispersion(valid_plot), 'o');
-        set(gca, 'xscale', 'log', 'yscale', 'log');
-        xlabel('Evolution Field (T)');
-        ylabel('T_1 (ms)');
-        title('Complex T1 dispersion fit: T_1 versus evolution field');
-        grid on;
-
+    % Every field slot must have been touched, whether the individual fit
+    % succeeded or failed. This turns traversal corruption into an immediate
+    % diagnostic instead of silently printing nine "not fitted" rows.
+    untouchedFieldSlots = find(strcmp({fieldResult.qc}, 'not fitted'));
+    writtenFieldIndices = [fieldResult.fieldIndex];
+    if ~isempty(untouchedFieldSlots) || ...
+            ~isequal(writtenFieldIndices, 1:nFields)
+        error('T1dispersion:InternalFieldTraversalFailure', ...
+            ['The field loop did not populate every result slot. Untouched ', ...
+             'slots: %s; written indices: %s.'], ...
+            mat2str(untouchedFieldSlots), mat2str(writtenFieldIndices));
     end
 
-    % ==========================================================
-    % Store results where possible
-    % ==========================================================
-    obj = safeSet(obj, 'dispersioncurve', R1dispersion);
-
-    obj = safeSet(obj, 'R1dispersion', R1dispersion);
-    obj = safeSet(obj, 'R1error', R1error);
-    obj = safeSet(obj, 'T1dispersion', T1dispersion);
-    obj = safeSet(obj, 'T1error', T1error);
-
-    obj = safeSet(obj, 'fit_params', fit_params);
-    obj = safeSet(obj, 'fit_sse', fit_sse);
-    obj = safeSet(obj, 'fit_rsq', fit_rsq);
-    obj = safeSet(obj, 'fit_rmse', fit_rmse);
-    obj = safeSet(obj, 'fit_dfe', fit_dfe);
-    obj = safeSet(obj, 'fit_qc', fit_qc);
-
-    obj = safeSet(obj, 'manual_polarity_flips', manual_polarity_flips);
-    obj = safeSet(obj, 'auto_polarity_flips', auto_polarity_flips);
-    obj = safeSet(obj, 'auto_points_removed', auto_points_removed);
-
-    % ==========================================================
-    % Nested helper: complex ROI signal
-    % ==========================================================
-    function z_roi = complexRoiSignal(img_c, mask2d)
-
-        nT_local = size(img_c, 3);
-        z_roi = nan(nT_local, 1);
-
-        for tt = 1:nT_local
-            tmp = img_c(:,:,tt);
-            vals = tmp(mask2d);
-
-            finiteVals = isfinite(real(vals)) & isfinite(imag(vals));
-            vals = vals(finiteVals);
-
-            if isempty(vals)
-                z_roi(tt) = nan;
+    independentFieldResult = fieldResult;
+    jointDiagnostics = emptyJointDiagnostics(fields_mT, opts);
+    if strcmp(opts.fitMode, 'joint')
+        try
+            [fieldResult, jointDiagnostics] = fitJointMultiField( ...
+                fieldResult, fields_mT, opts);
+        catch jointException
+            jointDiagnostics.attempted = true;
+            jointDiagnostics.used = false;
+            jointDiagnostics.failureIdentifier = jointException.identifier;
+            jointDiagnostics.failureMessage = jointException.message;
+            if opts.jointFallbackToIndependent
+                warning('T1dispersion:JointFitFailed', ...
+                    ['Joint multi-field fitting failed; returning the ', ...
+                     'independent initial fits. Cause: %s'], ...
+                    jointException.message);
+                fieldResult = independentFieldResult;
             else
-                z_roi(tt) = mean(vals);
+                rethrow(jointException);
             end
         end
-
     end
 
-    % ==========================================================
-    % Nested helper: automatic fitter
-    % ==========================================================
-    function [p, ci, gof, ok, xs, z_used, residual_complex] = fitComplexFcModelAuto( ...
-            x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint)
+    results = assembleResults(fieldResult, fields_mT, slice, signalMode, opts);
+    results.implementation = implementationTag;
+    results.inputDiagnostics = inputDiagnostics;
+    results.joint = jointDiagnostics;
+    results.independentInitial = arrayfun(@fitSummary, ...
+        independentFieldResult, 'UniformOutput', false);
+    if jointDiagnostics.used
+        results.modelEquation = jointDiagnostics.modelEquation;
+        results.modelName = ...
+            'joint_multifield_inversion_constrained_variable_projection';
+    end
+    obj = storeResults(obj, results);
 
-        if USE_FAST_FITTER_FIRST
-            [p, ci, gof, ok, xs, z_used, residual_complex] = fitComplexFcModelFast( ...
-                x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint);
-
-            needsFallback = ~ok || ~isfinite(gof.rsquare) || gof.rsquare < FALLBACK_RSQ_THRESHOLD;
-
-            if USE_EXPENSIVE_FALLBACK && needsFallback
-                [p2, ci2, gof2, ok2, xs2, z2, residual2] = fitComplexFcModelBroad( ...
-                    x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint);
-
-                if ok2 && (~ok || gof2.sse < gof.sse)
-                    p = p2;
-                    ci = ci2;
-                    gof = gof2;
-                    ok = ok2;
-                    xs = xs2;
-                    z_used = z2;
-                    residual_complex = residual2;
-                end
-            end
-        else
-            [p, ci, gof, ok, xs, z_used, residual_complex] = fitComplexFcModelBroad( ...
-                x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint);
-        end
-
+    if opts.printSummary
+        printFitSummary(results);
+    end
+    if opts.makeDispersionPlot
+        makeDispersionPlot(results, obj);
+    end
+    if opts.showDashboard
+        makeQaDashboard(results);
     end
 
-    % ==========================================================
-    % Nested helper: fast complex fitter
-    % ==========================================================
-    function [bestP, bestCi, bestGof, ok, xs, z_used, residual_complex] = fitComplexFcModelFast( ...
-            x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint)
 
-        ok = false;
+% ========================================================================
+% Nested helpers
+%
+% These functions deliberately remain inside T1dispersion rather than being
+% file-local subfunctions. ImageReconCore defines T1dispersion as a class
+% method; in that context file-local helpers may instead be parsed as class
+% methods and a bare call such as defaultOptions() is then unresolved.
+% Nesting keeps the implementation self-contained in both installation
+% layouts.
+% ========================================================================
 
-        bestP = nan(1, numel(lb));
-        bestCi = nan(2, numel(lb));
-        bestGof = emptyGof(Inf);
+% ========================================================================
+% Options and input handling
+% ========================================================================
 
-        x_s = double(x_ms(:)) ./ 1000;
-        z   = complex(z(:));
+function opts = defaultOptions()
+    opts = struct();
+    opts.fitMode = 'independent';
+    opts.signalMode = 'magnitude';
+    opts.sequenceMode = 'inversion';
+    opts.roiAggregation = 'phase_aligned_trimmed_mean';
+    opts.trimFraction = 0.10;
+    opts.anchorMinFraction = 0.05;
+    opts.robust = false;
+    opts.robustTune = 2.5;
+    opts.robustIterations = 8;
+    opts.robustTolerance = 1e-3;
+    opts.minimumWeight = 0.05;
+    opts.outlierWeightThreshold = 0.70;
+    opts.T1BoundsMs = [20 3000];
+    opts.rateGridPoints = 120;
+    opts.profileGridPoints = 320;
+    opts.confidenceLevel = 0.95;
+    opts.minimumPoints = 6;
+    opts.minimumInitialMagnetizationFraction = 0.05;
+    opts.phaseDriftOrder = 1;
+    opts.maximumPhaseResidualDegrees = 40;
+    opts.minimumPhaseSNR = 3;
+    opts.phaseReliableMagnitudeFraction = 0.15;
+    opts.magnitudeNoiseSigma = NaN;
+    opts.magnitudeNoiseModel = 'auto';
+    opts.magnitudeCoilCount = NaN;
+    opts.backgroundFraction = 0.20;
+    opts.forcedNegativeIndices = {};
+    opts.forcedPositiveIndices = {};
+    opts.signAmbiguityRatio = 1.10;
+    opts.signAmbiguityLogRateDifference = 0.15;
+    opts.boundCandidatePenaltyFraction = 0.05;
+    opts.maximumReliableSignTransitions = 1;
+    opts.maximumSignIndexDisagreement = 1;
+    opts.minimumDynamicSNR = 4;
+    opts.maximumNRMSE = 0.20;
+    opts.maximumOrthogonalNRMSE = 0.20;
+    opts.minimumLateCoverageT1 = 1.5;
+    opts.maximumEarlyCoverageT1 = 0.5;
+    opts.maximumT1CIRatio = 2.0;
+    opts.detectionField_mT = 200;
+    opts.jointMinimumFields = 2;
+    opts.jointRateSweeps = 5;
+    opts.jointRobustIterations = 5;
+    opts.jointSignIterations = 3;
+    opts.jointTolerance = 1e-3;
+    opts.jointMinimumAlpha = 0.10;
+    opts.jointTimeWeighting = false;
+    opts.jointLateTimeWeight = 4;
+    opts.jointTimeWeightExponent = 1;
+    opts.jointNoiseWeighting = true;
+    opts.jointMaximumNoiseWeightRatio = 25;
+    opts.jointFallbackToIndependent = true;
+    opts.makeDispersionPlot = true;
+    opts.showDashboard = true;
+    opts.printSummary = true;
+end
 
-        [xs, ord] = sort(x_s);
-        z_used = z(ord);
-
-        ydata = [real(z_used); imag(z_used)];
-        residual_complex = nan(size(z_used));
-
-        % Initial phase from early high-SNR point.
-        n_early = min(3, numel(z_used));
-        early_idx = 1:n_early;
-
-        [~, idx_local] = max(abs(z_used(early_idx)));
-        ref_idx = early_idx(idx_local);
-
-        phi0 = wrapPiLocal(angle(z_used(ref_idx)) - pi);
-
-        phi0Starts = wrapPiLocal(phi0 + [-pi/12, 0, pi/12]);
-
-        if ~isempty(p_hint) && numel(p_hint) >= 4 && isfinite(p_hint(4))
-            phi0Starts = [p_hint(4), phi0Starts];
+function opts = mergeOptions(opts, userOptions)
+    names = fieldnames(userOptions);
+    for k = 1:numel(names)
+        name = names{k};
+        if ~isfield(opts, name)
+            error('T1dispersion:UnknownOption', 'Unknown option "%s".', name);
         end
+        opts.(name) = userOptions.(name);
+    end
+end
 
-        phi0Starts = unique(round(wrapPiLocal(phi0Starts), 10), 'stable');
-
-        % Include small phase slopes. Optimiser can move from these.
-        phi1Starts = [0, -10, 10];
-
-        if ~isempty(p_hint) && numel(p_hint) >= 5 && isfinite(p_hint(5))
-            phi1Starts = [p_hint(5), phi1Starts];
-        end
-
-        phi1Starts = phi1Starts(phi1Starts >= lb(5) & phi1Starts <= ub(5));
-        phi1Starts = unique(round(phi1Starts, 10), 'stable');
-
-        R1start_centre = max(R1start_centre, 0.001);
-
-        if ~isempty(p_hint) && numel(p_hint) >= 3 && isfinite(p_hint(3)) && p_hint(3) > 0
-            R1base = p_hint(3);
-        else
-            R1base = R1start_centre;
-        end
-
-        R1starts = [ ...
-            R1base, ...
-            R1base/2, ...
-            R1base*2, ...
-            R1start_centre, ...
-            0.1, 0.5, 1, 2, 5, 10];
-
-        R1starts = R1starts(isfinite(R1starts) & R1starts > 0 & R1starts <= ub(3));
-        R1starts = unique(round(R1starts, 10), 'stable');
-
-        % Build start list
-        p0_list = [];
-
-        p_hint = normaliseParamVector(p_hint);
-
-        if ~isempty(p_hint) && all(isfinite(p_hint))
-            p0 = max(p_hint, lb);
-            p0 = min(p0, ub);
-            p0_list = [p0_list; p0]; %#ok<AGROW>
-        end
-
-        for pp = 1:numel(phi0Starts)
-            for qq = 1:numel(phi1Starts)
-
-                phi0_start = phi0Starts(pp);
-                phi1_start = phi1Starts(qq);
-
-                phase_start = phi0_start + phi1_start .* xs;
-                yrot = real(z_used .* exp(-1i .* phase_start));
-
-                amp_scale = max(abs(yrot));
-                if ~isfinite(amp_scale) || amp_scale == 0
-                    amp_scale = max(abs(z_used));
-                end
-                if ~isfinite(amp_scale) || amp_scale == 0
-                    amp_scale = 1;
-                end
-
-                smallNeg = -max(1e-9 .* amp_scale, 1e-12);
-
-                for rr = 1:numel(R1starts)
-
-                    R1_start = R1starts(rr);
-
-                    u = exp(-xs .* R1_start);
-                    X = [u, ones(size(u))];
-
-                    beta = X \ yrot;
-
-                    A0 = beta(1);
-                    B0 = beta(2);
-
-                    A0 = min(A0, smallNeg);
-                    B0 = max(B0, 0);
-
-                    p0 = [A0, B0, R1_start, phi0_start, phi1_start];
-
-                    p0 = max(p0, lb);
-                    p0 = min(p0, ub);
-
-                    p0_list = [p0_list; p0]; %#ok<AGROW>
-                end
-            end
-        end
-
-        if ~isempty(p0_list)
-            p0_list = unique(round(p0_list, 8), 'rows', 'stable');
-        end
-
-        [bestP, bestCi, bestGof, ok, residual_complex] = runStartList( ...
-            p0_list, xs, z_used, ydata, lb, ub, lsqOpts, bestP, bestCi, bestGof, ok);
-
+function opts = validateOptions(opts)
+    validFitModes = {'joint', 'independent'};
+    if ~ischar(opts.fitMode) && ~(isstring(opts.fitMode) && isscalar(opts.fitMode))
+        error('T1dispersion:InvalidFitMode', 'fitMode must be text.');
+    end
+    opts.fitMode = lower(char(opts.fitMode));
+    if ~any(strcmp(opts.fitMode, validFitModes))
+        error('T1dispersion:InvalidFitMode', ...
+            'fitMode must be joint or independent.');
     end
 
-    % ==========================================================
-    % Nested helper: broader fallback complex fitter
-    % ==========================================================
-    function [bestP, bestCi, bestGof, ok, xs, z_used, residual_complex] = fitComplexFcModelBroad( ...
-            x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint)
-
-        ok = false;
-
-        bestP = nan(1, numel(lb));
-        bestCi = nan(2, numel(lb));
-        bestGof = emptyGof(Inf);
-
-        x_s = double(x_ms(:)) ./ 1000;
-        z   = complex(z(:));
-
-        [xs, ord] = sort(x_s);
-        z_used = z(ord);
-
-        ydata = [real(z_used); imag(z_used)];
-        residual_complex = nan(size(z_used));
-
-        n_early = min(3, numel(z_used));
-        early_idx = 1:n_early;
-
-        [~, idx_local] = max(abs(z_used(early_idx)));
-        ref_idx = early_idx(idx_local);
-
-        phi0 = wrapPiLocal(angle(z_used(ref_idx)) - pi);
-
-        phi0Starts = wrapPiLocal([ ...
-            phi0, ...
-            phi0 - pi/2, phi0 - pi/4, phi0 - pi/8, ...
-            phi0 + pi/8, phi0 + pi/4, phi0 + pi/2, ...
-            angle(mean(z_used))]);
-
-        if ~isempty(p_hint) && numel(p_hint) >= 4 && isfinite(p_hint(4))
-            phi0Starts = [p_hint(4), phi0Starts];
-        end
-
-        phi0Starts = unique(round(wrapPiLocal(phi0Starts), 10), 'stable');
-
-        phi1Starts = [0, -5, 5, -20, 20, -50, 50];
-
-        if ~isempty(p_hint) && numel(p_hint) >= 5 && isfinite(p_hint(5))
-            phi1Starts = [p_hint(5), phi1Starts];
-        end
-
-        phi1Starts = phi1Starts(phi1Starts >= lb(5) & phi1Starts <= ub(5));
-        phi1Starts = unique(round(phi1Starts, 10), 'stable');
-
-        R1start_centre = max(R1start_centre, 0.001);
-
-        R1starts = [ ...
-            R1start_centre/5, ...
-            R1start_centre/2, ...
-            R1start_centre, ...
-            R1start_centre*2, ...
-            R1start_centre*5, ...
-            0.005, 0.01, 0.02, 0.05, ...
-            0.1, 0.2, 0.5, 1, 2, 5, 10, 20];
-
-        if ~isempty(p_hint) && numel(p_hint) >= 3 && isfinite(p_hint(3)) && p_hint(3) > 0
-            R1starts = [p_hint(3), R1starts];
-        end
-
-        R1starts = R1starts(isfinite(R1starts) & R1starts > 0 & R1starts <= ub(3));
-        R1starts = unique(round(R1starts, 10), 'stable');
-
-        p0_list = [];
-
-        p_hint = normaliseParamVector(p_hint);
-
-        if ~isempty(p_hint) && all(isfinite(p_hint))
-            p0 = max(p_hint, lb);
-            p0 = min(p0, ub);
-            p0_list = [p0_list; p0]; %#ok<AGROW>
-        end
-
-        for pp = 1:numel(phi0Starts)
-            for qq = 1:numel(phi1Starts)
-
-                phi0_start = phi0Starts(pp);
-                phi1_start = phi1Starts(qq);
-
-                phase_start = phi0_start + phi1_start .* xs;
-                yrot = real(z_used .* exp(-1i .* phase_start));
-
-                amp_scale = max(abs(yrot));
-                if ~isfinite(amp_scale) || amp_scale == 0
-                    amp_scale = max(abs(z_used));
-                end
-                if ~isfinite(amp_scale) || amp_scale == 0
-                    amp_scale = 1;
-                end
-
-                smallNeg = -max(1e-9 .* amp_scale, 1e-12);
-
-                y_first = mean(yrot(1:min(2,end)));
-                y_last  = mean(yrot(max(1,end-1):end));
-
-                B_guess_1 = max(y_last, 0);
-                B_guess_2 = max(max(yrot), 0);
-                B_guess_3 = max(median(yrot), 0);
-
-                Bstarts = unique([B_guess_1, B_guess_2, B_guess_3, 0], 'stable');
-
-                A_guess_1 = min(y_first - B_guess_1, smallNeg);
-                A_guess_2 = min(min(yrot) - B_guess_2, smallNeg);
-                A_guess_3 = min(-amp_scale, smallNeg);
-                A_guess_4 = min(-2 .* amp_scale, smallNeg);
-
-                Astarts = unique([A_guess_1, A_guess_2, A_guess_3, A_guess_4], 'stable');
-
-                for aa = 1:numel(Astarts)
-                    for bb = 1:numel(Bstarts)
-                        for rr = 1:numel(R1starts)
-
-                            p0 = [Astarts(aa), Bstarts(bb), R1starts(rr), phi0_start, phi1_start];
-
-                            p0 = max(p0, lb);
-                            p0 = min(p0, ub);
-
-                            p0_list = [p0_list; p0]; %#ok<AGROW>
-                        end
-                    end
-                end
-            end
-        end
-
-        if ~isempty(p0_list)
-            p0_list = unique(round(p0_list, 8), 'rows', 'stable');
-        end
-
-        [bestP, bestCi, bestGof, ok, residual_complex] = runStartList( ...
-            p0_list, xs, z_used, ydata, lb, ub, lsqOpts, bestP, bestCi, bestGof, ok);
-
+    validSignalModes = {'auto', 'complex', 'magnitude'};
+    if ~ischar(opts.signalMode) && ~(isstring(opts.signalMode) && isscalar(opts.signalMode))
+        error('T1dispersion:InvalidSignalMode', 'signalMode must be text.');
+    end
+    opts.signalMode = lower(char(opts.signalMode));
+    if ~any(strcmp(opts.signalMode, validSignalModes))
+        error('T1dispersion:InvalidSignalMode', ...
+            'signalMode must be auto, complex, or magnitude.');
     end
 
-    % ==========================================================
-    % Nested helper: run lsqcurvefit from start list
-    % ==========================================================
-   function [bestP, bestCi, bestGof, ok, residual_complex] = runStartList( ...
-        p0_list, xs, z_used, ydata, lb, ub, lsqOpts, bestP, bestCi, bestGof, ok)
+    validSequenceModes = {'inversion', 'unconstrained'};
+    if ~ischar(opts.sequenceMode) && ...
+            ~(isstring(opts.sequenceMode) && isscalar(opts.sequenceMode))
+        error('T1dispersion:InvalidSequenceMode', ...
+            'sequenceMode must be text.');
+    end
+    opts.sequenceMode = lower(char(opts.sequenceMode));
+    if ~any(strcmp(opts.sequenceMode, validSequenceModes))
+        error('T1dispersion:InvalidSequenceMode', ...
+            'sequenceMode must be inversion or unconstrained.');
+    end
 
-    residual_complex = nan(size(z_used));
+    validMagnitudeModels = {'auto', 'rician', 'noncentral_chi_approx'};
+    opts.magnitudeNoiseModel = lower(char(opts.magnitudeNoiseModel));
+    if ~any(strcmp(opts.magnitudeNoiseModel, validMagnitudeModels))
+        error('T1dispersion:InvalidMagnitudeNoiseModel', ...
+            ['magnitudeNoiseModel must be auto, rician, or ', ...
+             'noncentral_chi_approx.']);
+    end
 
-    if isempty(p0_list)
+    validRoiModes = {'phase_aligned_trimmed_mean', 'phase_aligned_mean', 'plain_mean'};
+    opts.roiAggregation = lower(char(opts.roiAggregation));
+    if ~any(strcmp(opts.roiAggregation, validRoiModes))
+        error('T1dispersion:InvalidRoiMode', ...
+            'Unsupported roiAggregation "%s".', opts.roiAggregation);
+    end
+    if ~isscalar(opts.trimFraction) || opts.trimFraction < 0 || opts.trimFraction >= 0.5
+        error('T1dispersion:InvalidTrim', 'trimFraction must be in [0, 0.5).');
+    end
+    if numel(opts.T1BoundsMs) ~= 2 || any(~isfinite(opts.T1BoundsMs)) || ...
+            any(opts.T1BoundsMs <= 0) || opts.T1BoundsMs(1) == opts.T1BoundsMs(2)
+        error('T1dispersion:InvalidBounds', ...
+            'T1BoundsMs must contain two distinct positive finite values.');
+    end
+    opts.T1BoundsMs = sort(double(opts.T1BoundsMs(:).'));
+    opts.R1Bounds = [1000 / opts.T1BoundsMs(2), 1000 / opts.T1BoundsMs(1)];
+
+    scalarNonnegative = {'minimumInitialMagnetizationFraction', ...
+        'maximumPhaseResidualDegrees'};
+    for optionIndex = 1:numel(scalarNonnegative)
+        optionName = scalarNonnegative{optionIndex};
+        optionValue = opts.(optionName);
+        if ~isscalar(optionValue) || ~isfinite(optionValue) || optionValue < 0
+            error('T1dispersion:InvalidOption', ...
+                '%s must be a non-negative finite scalar.', optionName);
+        end
+    end
+    if ~isscalar(opts.phaseDriftOrder) || ~isfinite(opts.phaseDriftOrder) || ...
+            opts.phaseDriftOrder < 0 || fix(opts.phaseDriftOrder) ~= opts.phaseDriftOrder
+        error('T1dispersion:InvalidPhaseDriftOrder', ...
+            'phaseDriftOrder must be a non-negative integer.');
+    end
+    if ~isscalar(opts.minimumPhaseSNR) || ~isfinite(opts.minimumPhaseSNR) || ...
+            opts.minimumPhaseSNR <= 0
+        error('T1dispersion:InvalidMinimumPhaseSNR', ...
+            'minimumPhaseSNR must be a positive finite scalar.');
+    end
+    if ~isscalar(opts.phaseReliableMagnitudeFraction) || ...
+            ~isfinite(opts.phaseReliableMagnitudeFraction) || ...
+            opts.phaseReliableMagnitudeFraction < 0 || ...
+            opts.phaseReliableMagnitudeFraction >= 1
+        error('T1dispersion:InvalidPhaseMagnitudeFraction', ...
+            'phaseReliableMagnitudeFraction must be in [0,1).');
+    end
+    if ~isscalar(opts.backgroundFraction) || ~isfinite(opts.backgroundFraction) || ...
+            opts.backgroundFraction <= 0 || opts.backgroundFraction > 1
+        error('T1dispersion:InvalidBackgroundFraction', ...
+            'backgroundFraction must be in (0,1].');
+    end
+    if ~(isnumeric(opts.magnitudeNoiseSigma) && ...
+            all(isfinite(opts.magnitudeNoiseSigma(:)) | ...
+                isnan(opts.magnitudeNoiseSigma(:))) && ...
+            all(opts.magnitudeNoiseSigma(isfinite(opts.magnitudeNoiseSigma)) > 0))
+        error('T1dispersion:InvalidMagnitudeNoiseSigma', ...
+            'magnitudeNoiseSigma must contain NaN or positive values.');
+    end
+    if ~(isscalar(opts.magnitudeCoilCount) && ...
+            (isnan(opts.magnitudeCoilCount) || ...
+             (isfinite(opts.magnitudeCoilCount) && ...
+              opts.magnitudeCoilCount >= 1 && ...
+              fix(opts.magnitudeCoilCount) == opts.magnitudeCoilCount)))
+        error('T1dispersion:InvalidMagnitudeCoilCount', ...
+            'magnitudeCoilCount must be NaN or a positive integer.');
+    end
+    polarityOptions = {'forcedNegativeIndices', 'forcedPositiveIndices'};
+    for optionIndex = 1:numel(polarityOptions)
+        optionName = polarityOptions{optionIndex};
+        optionValue = opts.(optionName);
+        if ~(isempty(optionValue) || isnumeric(optionValue) || iscell(optionValue))
+            error('T1dispersion:InvalidPolarityConstraint', ...
+                '%s must be numeric, a cell array, or empty.', optionName);
+        end
+    end
+    if opts.rateGridPoints < 20 || opts.profileGridPoints < 50
+        error('T1dispersion:GridTooSmall', ...
+            'rateGridPoints must be >=20 and profileGridPoints >=50.');
+    end
+    if opts.confidenceLevel <= 0 || opts.confidenceLevel >= 1
+        error('T1dispersion:InvalidConfidence', ...
+            'confidenceLevel must lie strictly between 0 and 1.');
+    end
+    if ~isscalar(opts.boundCandidatePenaltyFraction) || ...
+            ~isfinite(opts.boundCandidatePenaltyFraction) || ...
+            opts.boundCandidatePenaltyFraction < 0
+        error('T1dispersion:InvalidBoundPenalty', ...
+            'boundCandidatePenaltyFraction must be a non-negative scalar.');
+    end
+    if ~isscalar(opts.maximumReliableSignTransitions) || ...
+            ~isfinite(opts.maximumReliableSignTransitions) || ...
+            opts.maximumReliableSignTransitions < 0 || ...
+            fix(opts.maximumReliableSignTransitions) ~= opts.maximumReliableSignTransitions
+        error('T1dispersion:InvalidSignTransitions', ...
+            'maximumReliableSignTransitions must be a non-negative integer.');
+    end
+    if ~isscalar(opts.maximumSignIndexDisagreement) || ...
+            ~isfinite(opts.maximumSignIndexDisagreement) || ...
+            opts.maximumSignIndexDisagreement < 0 || ...
+            fix(opts.maximumSignIndexDisagreement) ~= opts.maximumSignIndexDisagreement
+        error('T1dispersion:InvalidSignIndexDifference', ...
+            'maximumSignIndexDisagreement must be a non-negative integer.');
+    end
+    if ~(isscalar(opts.detectionField_mT) && ...
+            (isnan(opts.detectionField_mT) || ...
+             (isfinite(opts.detectionField_mT) && opts.detectionField_mT > 0)))
+        error('T1dispersion:InvalidDetectionField', ...
+            'detectionField_mT must be NaN or a positive finite scalar.');
+    end
+    integerJointOptions = {'jointMinimumFields', 'jointRateSweeps', ...
+        'jointRobustIterations', 'jointSignIterations'};
+    for optionIndex = 1:numel(integerJointOptions)
+        optionName = integerJointOptions{optionIndex};
+        optionValue = opts.(optionName);
+        if ~isscalar(optionValue) || ~isfinite(optionValue) || ...
+                optionValue < 1 || fix(optionValue) ~= optionValue
+            error('T1dispersion:InvalidJointOption', ...
+                '%s must be a positive integer.', optionName);
+        end
+    end
+    if opts.jointMinimumFields < 2
+        error('T1dispersion:InvalidJointFieldCount', ...
+            'jointMinimumFields must be at least 2.');
+    end
+    if ~isscalar(opts.jointTolerance) || ~isfinite(opts.jointTolerance) || ...
+            opts.jointTolerance <= 0
+        error('T1dispersion:InvalidJointTolerance', ...
+            'jointTolerance must be a positive finite scalar.');
+    end
+    if ~isscalar(opts.jointMinimumAlpha) || ...
+            ~isfinite(opts.jointMinimumAlpha) || opts.jointMinimumAlpha < 0
+        error('T1dispersion:InvalidJointAlphaFloor', ...
+            'jointMinimumAlpha must be a non-negative finite scalar.');
+    end
+    if ~isscalar(opts.jointLateTimeWeight) || ...
+            ~isfinite(opts.jointLateTimeWeight) || ...
+            opts.jointLateTimeWeight < 1
+        error('T1dispersion:InvalidLateTimeWeight', ...
+            'jointLateTimeWeight must be a finite scalar >= 1.');
+    end
+    if ~isscalar(opts.jointTimeWeightExponent) || ...
+            ~isfinite(opts.jointTimeWeightExponent) || ...
+            opts.jointTimeWeightExponent <= 0
+        error('T1dispersion:InvalidTimeWeightExponent', ...
+            'jointTimeWeightExponent must be a positive finite scalar.');
+    end
+    if ~isscalar(opts.jointMaximumNoiseWeightRatio) || ...
+            ~isfinite(opts.jointMaximumNoiseWeightRatio) || ...
+            opts.jointMaximumNoiseWeightRatio < 1
+        error('T1dispersion:InvalidJointNoiseRatio', ...
+            'jointMaximumNoiseWeightRatio must be at least 1.');
+    end
+    logicalJointOptions = {'jointNoiseWeighting', ...
+        'jointTimeWeighting', 'jointFallbackToIndependent'};
+    for optionIndex = 1:numel(logicalJointOptions)
+        optionName = logicalJointOptions{optionIndex};
+        optionValue = opts.(optionName);
+        if ~(islogical(optionValue) && isscalar(optionValue)) && ...
+                ~(isnumeric(optionValue) && isscalar(optionValue) && ...
+                  isfinite(optionValue) && any(optionValue == [0 1]))
+            error('T1dispersion:InvalidJointOption', ...
+                '%s must be a logical scalar.', optionName);
+        end
+        opts.(optionName) = logical(optionValue);
+    end
+end
+
+function polarity = fieldPolarityConstraints(obj, opts, fieldIndex, sampleCount)
+    negative = polarityOptionForField(opts.forcedNegativeIndices, fieldIndex);
+    positive = polarityOptionForField(opts.forcedPositiveIndices, fieldIndex);
+    if memberExists(obj, 'manual_polarity_flips') && ...
+            ~isempty(obj.manual_polarity_flips)
+        manualNegative = polarityOptionForField( ...
+            obj.manual_polarity_flips, fieldIndex);
+        negative = [negative(:); manualNegative(:)];
+    end
+    negative = unique(round(double(negative(:).')));
+    positive = unique(round(double(positive(:).')));
+    negative = negative(isfinite(negative) & negative >= 1 & ...
+        negative <= sampleCount);
+    positive = positive(isfinite(positive) & positive >= 1 & ...
+        positive <= sampleCount);
+    overlap = intersect(negative, positive);
+    if ~isempty(overlap)
+        error('T1dispersion:ConflictingPolarityConstraint', ...
+            ['Field %d constrains sample(s) %s to be both negative ', ...
+             'and positive.'], fieldIndex, mat2str(overlap));
+    end
+    polarity = struct('negativeIndices', negative, ...
+        'positiveIndices', positive);
+end
+
+function indices = polarityOptionForField(value, fieldIndex)
+    indices = [];
+    if isempty(value)
         return
     end
-
-    nStarts = size(p0_list, 1);
-    nParams = numel(lb);
-    nZ = numel(z_used);
-
-    % Only use parfor when there are enough starts to justify the overhead.
-    usePar = USE_PARFOR_STARTLIST && nStarts >= 8;
-
-    if usePar
-
-        p_all        = nan(nStarts, nParams);
-        sse_all      = inf(nStarts, 1);
-        rsq_all      = nan(nStarts, 1);
-        adjrsq_all   = nan(nStarts, 1);
-        dfe_all      = nan(nStarts, 1);
-        rmse_all     = nan(nStarts, 1);
-        exitflag_all = nan(nStarts, 1);
-        residual_all = nan(numel(ydata), nStarts);
-
-        % Important:
-        % Do not call nested functions inside this parfor.
-        parfor ii = 1:nStarts
-
-            p0 = p0_list(ii,:);
-
-            local_p        = nan(1, nParams);
-            local_sse      = inf;
-            local_rsq      = nan;
-            local_adjrsq   = nan;
-            local_dfe      = nan;
-            local_rmse     = nan;
-            local_exitflag = nan;
-            local_residual = nan(numel(ydata), 1);
-
-            try
-                % Self-contained model. Do NOT call complexModelVector here.
-                localModelFun = @(p, x) [ ...
-                    real(exp(1i .* (p(4) + p(5) .* x(:))) .* ...
-                         (p(1) .* exp(-x(:) .* p(3)) + p(2))); ...
-                    imag(exp(1i .* (p(4) + p(5) .* x(:))) .* ...
-                         (p(1) .* exp(-x(:) .* p(3)) + p(2)))];
-
-                [pfit, resnorm, residual, exitflag] = ...
-                    lsqcurvefit(localModelFun, p0, xs, ydata, lb, ub, lsqOpts);
-
-                if isfinite(resnorm)
-
-                    local_p = pfit(:).';
-                    local_sse = resnorm;
-                    local_exitflag = exitflag;
-                    local_residual = residual(:);
-
-                    nObs = numel(ydata);
-                    nPar = numel(local_p);
-                    dfe = max(nObs - nPar, 0);
-
-                    sst = sum((ydata - mean(ydata)).^2);
-
-                    if sst > 0
-                        rsq = 1 - resnorm ./ sst;
-                    else
-                        rsq = NaN;
-                    end
-
-                    if dfe > 0 && isfinite(rsq)
-                        adjrsq = 1 - (1 - rsq) .* ((nObs - 1) ./ dfe);
-                        rmse = sqrt(resnorm ./ dfe);
-                    else
-                        adjrsq = NaN;
-                        rmse = NaN;
-                    end
-
-                    local_rsq = rsq;
-                    local_adjrsq = adjrsq;
-                    local_dfe = dfe;
-                    local_rmse = rmse;
-
-                end
-
-            catch
-                % Leave local result as failed.
-            end
-
-            p_all(ii,:)        = local_p;
-            sse_all(ii)        = local_sse;
-            rsq_all(ii)        = local_rsq;
-            adjrsq_all(ii)     = local_adjrsq;
-            dfe_all(ii)        = local_dfe;
-            rmse_all(ii)       = local_rmse;
-            exitflag_all(ii)   = local_exitflag;
-            residual_all(:,ii) = local_residual;
-
+    if iscell(value)
+        if fieldIndex <= numel(value) && ~isempty(value{fieldIndex})
+            indices = value{fieldIndex};
         end
+    elseif isnumeric(value)
+        indices = value;
+    end
+    if ~isnumeric(indices)
+        error('T1dispersion:InvalidPolarityConstraint', ...
+            'Polarity indices for field %d must be numeric.', fieldIndex);
+    end
+end
 
-        [bestSse, bestIdx] = min(sse_all);
-
-        if isfinite(bestSse)
-
-            bestP = p_all(bestIdx,:);
-
-            bestGof = struct( ...
-                'sse',        sse_all(bestIdx), ...
-                'rsquare',    rsq_all(bestIdx), ...
-                'adjrsquare', adjrsq_all(bestIdx), ...
-                'dfe',        dfe_all(bestIdx), ...
-                'rmse',       rmse_all(bestIdx), ...
-                'exitflag',   exitflag_all(bestIdx));
-
-            residual = residual_all(:,bestIdx);
-            residual_complex = residual(1:nZ) + 1i .* residual(nZ+1:end);
-
-            ok = true;
-
-            % Re-run only the best solution once, in serial, to get the Jacobian
-            % for confidence intervals. This avoids calling nested helper
-            % functions inside parfor.
-            try
-                serialModelFun = @(p, x) complexModelVector(p, x);
-
-                [pfit2, resnorm2, residual2, exitflag2, ~, ~, jacobian2] = ...
-                    lsqcurvefit(serialModelFun, bestP, xs, ydata, lb, ub, lsqOpts);
-
-                if isfinite(resnorm2) && resnorm2 <= bestGof.sse .* 1.001
-
-                    bestP = pfit2(:).';
-
-                    nObs = numel(ydata);
-                    nPar = numel(bestP);
-                    dfe = max(nObs - nPar, 0);
-
-                    sst = sum((ydata - mean(ydata)).^2);
-
-                    if sst > 0
-                        rsq = 1 - resnorm2 ./ sst;
-                    else
-                        rsq = NaN;
-                    end
-
-                    if dfe > 0 && isfinite(rsq)
-                        adjrsq = 1 - (1 - rsq) .* ((nObs - 1) ./ dfe);
-                        rmse = sqrt(resnorm2 ./ dfe);
-                    else
-                        adjrsq = NaN;
-                        rmse = NaN;
-                    end
-
-                    bestGof = struct( ...
-                        'sse',        resnorm2, ...
-                        'rsquare',    rsq, ...
-                        'adjrsquare', adjrsq, ...
-                        'dfe',        dfe, ...
-                        'rmse',       rmse, ...
-                        'exitflag',   exitflag2);
-
-                    bestCi = approximateParameterCi(bestP, resnorm2, jacobian2, dfe);
-
-                    residual_complex = residual2(1:nZ) + 1i .* residual2(nZ+1:end);
-
-                else
-                    bestCi = nan(2, nParams);
-                end
-
-            catch
-                bestCi = nan(2, nParams);
-            end
-
+function mask2d = selectMask(mask, slice)
+    if ndims(mask) >= 3 && size(mask, 3) > 1
+        if slice > size(mask, 3)
+            error('T1dispersion:MaskSliceOutOfRange', ...
+                'Mask has %d slices; slice %d was requested.', size(mask, 3), slice);
         end
-
+        mask2d = mask(:, :, slice);
     else
+        mask2d = mask(:, :, 1);
+    end
+    mask2d = logical(mask2d);
+end
 
-        % Serial version can still call nested functions.
-        modelFun = @(p, x) complexModelVector(p, x);
+function sources = resolveSignalSources(obj, requestedMode, nFields, mask, slice)
+    sources = struct('mode', '', 'useComplex', false, 'useMagnitude', false, ...
+        'complexData', [], 'magnitudeData', [], ...
+        'complexMember', '', 'magnitudeMember', '', ...
+        'complexRejectedReason', '');
 
-        for ii = 1:nStarts
+    hasComplex = memberExists(obj, 'compleximage') && ~isempty(obj.compleximage);
+    hasMagnitude = memberExists(obj, 'magimage') && ~isempty(obj.magimage);
+    complexFull = false;
+    magnitudeFull = false;
 
-            p0 = p0_list(ii,:);
+    % buildimages intentionally leaves compleximage six-dimensional in RSSQ
+    % mode, while magimage is the fully combined five-dimensional dataset.
+    % In auto mode an uncombined complex array must therefore be ignored, not
+    % allowed to prevent the valid magnitude dispersion from being fitted.
+    if hasMagnitude
+        validateImageGeometry(obj.magimage, mask, slice, 'magimage');
+        magnitudeFull = size(obj.magimage, 5) >= nFields;
+        if magnitudeFull
+            sources.magnitudeMember = 'magimage';
+        end
+    end
+    if hasComplex
+        if ndims(obj.compleximage) > 5 && size(obj.compleximage, 6) > 1
+            sources.complexRejectedReason = sprintf( ...
+                'compleximage retains %d receiver channels', ...
+                size(obj.compleximage, 6));
+            if strcmp(requestedMode, 'complex')
+                error('T1dispersion:UncombinedComplexImage', ...
+                    ['signalMode="complex" was requested, but obj.compleximage ', ...
+                     'still has %d receiver channels. Use an Adaptive or ', ...
+                     'ACS/Walsh complex combination, or use auto/magnitude.'], ...
+                    size(obj.compleximage, 6));
+            end
+            warning('T1dispersion:UncombinedComplexImageIgnored', ...
+                ['Ignoring %s and fitting the complete magimage dispersion.'], ...
+                sources.complexRejectedReason);
+        else
+            validateImageGeometry(obj.compleximage, mask, slice, 'compleximage');
+            complexFull = size(obj.compleximage, 5) >= nFields;
+            if complexFull
+                sources.complexMember = 'compleximage';
+            elseif size(obj.compleximage, 5) == 1 && nFields > 1
+                warning('T1dispersion:DisplayedComplexImageIgnored', ...
+                    ['obj.compleximage contains only one field and therefore ', ...
+                     'appears to be the displayed-field image. It will not be ', ...
+                     'used as though it represented the full dispersion data.']);
+            end
+        end
+    end
 
-            try
-                [pfit, resnorm, residual, exitflag, ~, ~, jacobian] = ...
-                    lsqcurvefit(modelFun, p0, xs, ydata, lb, ub, lsqOpts);
+    switch requestedMode
+        case 'complex'
+            if ~complexFull
+                error('T1dispersion:IncompleteComplexFields', ...
+                    ['Complex fitting requires [X Y slice time field] data ', ...
+                     'for all %d fieldpoints; obj.compleximage contains %d field(s).'], ...
+                    nFields, imageFieldCount(obj, 'compleximage'));
+            end
+            sources.mode = 'complex';
+            sources.useComplex = true;
+            sources.complexData = obj.compleximage;
 
-                if isfinite(resnorm) && resnorm < bestGof.sse
+        case 'magnitude'
+            if complexFull
+                sources.mode = 'magnitude';
+                sources.useComplex = true; % magnitude after complex ROI mean
+                sources.complexData = obj.compleximage;
+            elseif magnitudeFull
+                sources.mode = 'magnitude';
+                sources.useMagnitude = true;
+                sources.magnitudeData = obj.magimage;
+            else
+                error('T1dispersion:IncompleteMagnitudeFields', ...
+                    'No image member contains all %d magnetic fields.', nFields);
+            end
 
-                    bestP = pfit(:).';
-                    ok = true;
+        otherwise % auto: fit both when possible
+            if complexFull
+                sources.useComplex = true;
+                sources.complexData = obj.compleximage;
+            end
+            if magnitudeFull && ~complexFull
+                sources.useMagnitude = true;
+                sources.magnitudeData = obj.magimage;
+            end
 
-                    nObs = numel(ydata);
-                    nPar = numel(bestP);
-                    dfe = max(nObs - nPar, 0);
+            if sources.useComplex
+                sources.mode = 'hybrid_auto';
+            elseif sources.useMagnitude
+                sources.mode = 'magnitude';
+            else
+                error('T1dispersion:NoFullDispersionImage', ...
+                    ['Neither obj.compleximage nor obj.magimage contains all ', ...
+                     '%d fields in obj.fieldpoints. The fitter will not ', ...
+                     'silently process only the displayed field.'], nFields);
+            end
+    end
+end
 
-                    sst = sum((ydata - mean(ydata)).^2);
+function validateImageGeometry(imageData, mask, slice, memberName)
+    if ndims(imageData) < 4
+        error('T1dispersion:ImageDimensions', ...
+            'obj.%s must have at least [X Y slice time] dimensions.', memberName);
+    end
+    if ndims(imageData) > 5 && size(imageData, 6) > 1
+        error('T1dispersion:UncombinedCoils', ...
+            'obj.%s contains an uncombined sixth coil dimension.', memberName);
+    end
+    if slice < 1 || slice > size(imageData, 3)
+        error('T1dispersion:SliceOutOfRange', ...
+            'Requested slice %d; obj.%s contains %d slice(s).', ...
+            slice, memberName, size(imageData, 3));
+    end
+    if size(mask, 1) ~= size(imageData, 1) || size(mask, 2) ~= size(imageData, 2)
+        error('T1dispersion:MaskSizeMismatch', ...
+            'Mask size %s does not match obj.%s size [%d %d].', ...
+            mat2str(size(mask)), memberName, size(imageData, 1), size(imageData, 2));
+    end
+end
 
-                    if sst > 0
-                        rsq = 1 - resnorm ./ sst;
-                    else
-                        rsq = NaN;
-                    end
+function count = imageFieldCount(obj, memberName)
+    count = 0;
+    if memberExists(obj, memberName) && ~isempty(obj.(memberName))
+        count = size(obj.(memberName), 5);
+    end
+end
 
-                    if dfe > 0 && isfinite(rsq)
-                        adjrsq = 1 - (1 - rsq) .* ((nObs - 1) ./ dfe);
-                        rmse = sqrt(resnorm ./ dfe);
-                    else
-                        adjrsq = NaN;
-                        rmse = NaN;
-                    end
+function dimensions = memberSize(obj, memberName)
+    if memberExists(obj, memberName) && ~isempty(obj.(memberName))
+        dimensions = size(obj.(memberName));
+    else
+        dimensions = [];
+    end
+end
 
-                    bestGof = struct( ...
-                        'sse',        resnorm, ...
-                        'rsquare',    rsq, ...
-                        'adjrsquare', adjrsq, ...
-                        'dfe',        dfe, ...
-                        'rmse',       rmse, ...
-                        'exitflag',   exitflag);
-
-                    bestCi = approximateParameterCi(bestP, resnorm, jacobian, dfe);
-
-                    residual_complex = residual(1:nZ) + 1i .* residual(nZ+1:end);
-
-                end
-
-            catch
-                % Try next start point.
+function coilCount = inferMagnitudeCoilCount(obj, sources)
+    coilCount = 1;
+    if isfield(sources, 'complexData') && ~isempty(sources.complexData) && ...
+            ndims(sources.complexData) > 5 && size(sources.complexData, 6) > 1
+        coilCount = size(sources.complexData, 6);
+        return
+    end
+    if memberExists(obj, 'compleximage') && ~isempty(obj.compleximage) && ...
+            ndims(obj.compleximage) > 5 && size(obj.compleximage, 6) > 1
+        coilCount = size(obj.compleximage, 6);
+        return
+    end
+    possibleMembers = {'n_coils', 'ncoils', 'channels'};
+    for memberIndex = 1:numel(possibleMembers)
+        name = possibleMembers{memberIndex};
+        if memberExists(obj, name)
+            value = double(obj.(name));
+            if isscalar(value) && isfinite(value) && value >= 1
+                coilCount = round(value);
+                return
             end
         end
     end
 end
 
-    % ==========================================================
-    % Nested helper: complex model vector
-    % ==========================================================
-    function yvec = complexModelVector(p, x_s)
-        % p = [A B R1 phi0 phi1]
+function t = timeVectorForField(times, fieldIndex, nFields)
+    if isvector(times)
+        t = times(:);
+    elseif size(times, 1) == nFields
+        t = times(fieldIndex, :).';
+    elseif size(times, 2) == nFields
+        t = times(:, fieldIndex);
+    else
+        error('T1dispersion:TimeDimensions', ...
+            ['timepoints size %s has neither rows nor columns equal to the ', ...
+             '%d values in fieldpoints.'], mat2str(size(times)), nFields);
+    end
+    t = double(t(:));
+end
 
-        A    = p(1);
-        B    = p(2);
-        R1   = p(3);
-        phi0 = p(4);
-        phi1 = p(5);
+function [t_s, signal] = prepareFieldSamples(t_ms, signal, fieldIndex, label)
+    if isempty(signal)
+        t_s = [];
+        return
+    end
+    nUse = min(numel(t_ms), numel(signal));
+    if numel(t_ms) ~= numel(signal)
+        warning('T1dispersion:TimeImageMismatch', ...
+            ['Field %d %s data: %d evolution times but %d images. ', ...
+             'Using the first %d paired samples.'], ...
+            fieldIndex, label, numel(t_ms), numel(signal), nUse);
+    end
+    t_s = double(t_ms(1:nUse)) ./ 1000;
+    signal = signal(1:nUse);
+    [t_s, signal] = cleanAndCombineSamples(t_s, signal);
+end
 
-        x_s = x_s(:);
+function [signal, meta] = extractRoiSignal(imageData, mask, slice, fieldIndex, mode, opts)
+    nx = size(imageData, 1);
+    ny = size(imageData, 2);
+    nt = size(imageData, 4);
+    block = reshape(imageData(:, :, slice, :, fieldIndex), nx, ny, nt);
+    allVoxels = reshape(block, nx * ny, nt);
+    backgroundVoxels = allVoxels(~mask(:), :);
+    [backgroundSigma, backgroundMean, backgroundSource] = ...
+        estimateBackgroundNoise(backgroundVoxels, mode, opts);
+    voxels = allVoxels(mask(:), :);
 
-        realSignal = A .* exp(-x_s .* R1) + B;
-        phase = phi0 + phi1 .* x_s;
+    meta = struct('voxelCount', size(voxels, 1), ...
+        'usedVoxelCount', size(voxels, 1), 'anchorTimeIndex', NaN, ...
+        'aggregation', opts.roiAggregation, ...
+        'backgroundNoiseSigma', backgroundSigma, ...
+        'backgroundMagnitudeMean', backgroundMean, ...
+        'roiNoiseSigma', backgroundSigma, ...
+        'noiseSource', backgroundSource);
 
-        zModel = exp(1i .* phase) .* realSignal;
-
-        yvec = [real(zModel); imag(zModel)];
+    if strcmp(mode, 'magnitude')
+        signal = nan(nt, 1);
+        for k = 1:nt
+            values = real(voxels(:, k));
+            values = values(isfinite(values));
+            signal(k) = robustSpatialMean(values, opts.trimFraction, ...
+                strcmp(opts.roiAggregation, 'phase_aligned_trimmed_mean'));
+        end
+        return
     end
 
-    % ==========================================================
-    % Nested helper: should automatic polarity search run?
-    % ==========================================================
-    function tf = shouldTryAutoPolaritySearch(gof, p, xs, z_used)
-
-        tf = false;
-
-        if ~isfinite(gof.rsquare) || gof.rsquare < AUTO_POLARITY_RSQ_TRIGGER
-            tf = true;
-            return
-        end
-
-        [imagFrac, ~] = imaginaryFractionAfterFit(p, xs, z_used);
-
-        if isfinite(imagFrac) && imagFrac > AUTO_POLARITY_IMAG_TRIGGER
-            tf = true;
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: automatic polarity flip search
-    % ==========================================================
-    function [bestP, bestCi, bestGof, okBest, bestXs, bestZ, bestResidual, bestFlipIdx] = ...
-        automaticPolarityFlipSearch( ...
-            p_current, ci_current, gof_current, xs_current, z_current, residual_current, ...
-            R1start_centre, lb, ub, lsqOpts)
-
-        bestP = p_current;
-        bestCi = ci_current;
-        bestGof = gof_current;
-        bestXs = xs_current;
-        bestZ = z_current;
-        bestResidual = residual_current;
-        bestFlipIdx = [];
-        okBest = true;
-
-        nPts = numel(z_current);
-
-        if nPts < 4
-            return
-        end
-
-        maxFlips = min(MAX_AUTO_POLARITY_FLIPS, nPts);
-        maxCandidates = min(MAX_AUTO_POLARITY_CANDIDATES, nPts);
-
-        candidateIdx = rankPolarityFlipCandidates(p_current, xs_current, z_current, maxCandidates);
-
-        if isempty(candidateIdx)
-            return
-        end
-
-        baselineScore = autoPolarityScore(gof_current, 0, p_current, xs_current, z_current, ub);
-
-        for nFlip = 1:maxFlips
-
-            if numel(candidateIdx) < nFlip
-                continue
-            end
-
-            combos = nchoosek(candidateIdx(:).', nFlip);
-
-            for cc = 1:size(combos, 1)
-
-                flipIdx = combos(cc,:);
-
-                z_try = z_current;
-                z_try(flipIdx) = -z_try(flipIdx);
-
-                % Use the fast fitter only here to keep the automatic search manageable.
-                [p_try, ci_try, gof_try, ok_try, xs_try, z_used_try, residual_try] = ...
-                    fitComplexFcModelFast( ...
-                        xs_current .* 1000, z_try, ...
-                        R1start_centre, lb, ub, lsqOpts, p_current);
-
-                if ~ok_try
-                    continue
-                end
-
-                tryScore = autoPolarityScore(gof_try, nFlip, p_try, xs_try, z_used_try, ub);
-                bestScore = autoPolarityScore(bestGof, numel(bestFlipIdx), bestP, bestXs, bestZ, ub);
-
-                betterThanBest = isfinite(tryScore) && tryScore < bestScore;
-                betterThanBaseline = isfinite(tryScore) && tryScore < baselineScore;
-
-                if betterThanBest && betterThanBaseline
-                    bestP = p_try;
-                    bestCi = ci_try;
-                    bestGof = gof_try;
-                    bestXs = xs_try;
-                    bestZ = z_used_try;
-                    bestResidual = residual_try;
-                    bestFlipIdx = sort(flipIdx);
-                    okBest = true;
-                end
+    if strcmp(opts.roiAggregation, 'plain_mean')
+        signal = nan(nt, 1);
+        for k = 1:nt
+            values = voxels(:, k);
+            good = isfinite(real(values)) & isfinite(imag(values));
+            values = values(good);
+            if ~isempty(values)
+                signal(k) = mean(values);
             end
         end
-
+        return
     end
 
-    % ==========================================================
-    % Nested helper: rank likely polarity-error points
-    % ==========================================================
-    function candidateIdx = rankPolarityFlipCandidates(p, xs, z_used, maxCandidates)
-
-        candidateIdx = [];
-
-        if isempty(z_used) || isempty(xs) || numel(p) < 5
-            return
+    anchorScore = nan(1, nt);
+    for k = 1:nt
+        a = abs(voxels(:, k));
+        a = a(isfinite(a));
+        if ~isempty(a)
+            anchorScore(k) = median(a);
         end
+    end
+    if ~any(isfinite(anchorScore))
+        signal = complex(nan(nt, 1), nan(nt, 1));
+        return
+    end
+    [~, anchorIndex] = max(anchorScore);
+    anchor = voxels(:, anchorIndex);
+    anchorMagnitude = abs(anchor);
+    finiteAnchor = isfinite(real(anchor)) & isfinite(imag(anchor)) & ...
+        isfinite(anchorMagnitude) & anchorMagnitude > 0;
+    positiveAnchor = anchorMagnitude(finiteAnchor);
+    if isempty(positiveAnchor)
+        signal = complex(nan(nt, 1), nan(nt, 1));
+        return
+    end
+    anchorThreshold = opts.anchorMinFraction * median(positiveAnchor);
+    keepVoxel = finiteAnchor & anchorMagnitude >= anchorThreshold;
+    voxels = voxels(keepVoxel, :);
+    anchor = anchor(keepVoxel);
+    rotation = conj(anchor ./ abs(anchor));
+    voxels = bsxfun(@times, voxels, rotation);
 
-        A    = p(1);
-        B    = p(2);
-        R1   = p(3);
-        phi0 = p(4);
-        phi1 = p(5);
+    signal = complex(nan(nt, 1), nan(nt, 1));
+    useTrim = strcmp(opts.roiAggregation, 'phase_aligned_trimmed_mean');
+    for k = 1:nt
+        values = voxels(:, k);
+        good = isfinite(real(values)) & isfinite(imag(values));
+        values = values(good);
+        signal(k) = robustComplexSpatialMean(values, opts.trimFraction, useTrim);
+    end
+    meta.usedVoxelCount = size(voxels, 1);
+    meta.anchorTimeIndex = anchorIndex;
+    if isfinite(backgroundSigma) && backgroundSigma > 0 && ...
+            meta.usedVoxelCount > 0
+        retainedFraction = max(1 - opts.trimFraction, eps);
+        meta.roiNoiseSigma = backgroundSigma ./ ...
+            sqrt(meta.usedVoxelCount .* retainedFraction);
+    end
+end
 
-        xs = xs(:);
-        z_used = z_used(:);
-
-        phase_fit = phi0 + phi1 .* xs;
-
-        z_rot = z_used .* exp(-1i .* phase_fit);
-
-        y_real = real(z_rot);
-        y_imag = imag(z_rot);
-
-        y_fit = A .* exp(-xs .* R1) + B;
-
-        scale = max(abs([y_real(:); y_fit(:)]));
-        if ~isfinite(scale) || scale == 0
-            scale = max(abs(z_used));
+function [sigma, magnitudeMean, source] = estimateBackgroundNoise( ...
+        backgroundVoxels, mode, opts)
+    sigma = NaN;
+    magnitudeMean = NaN;
+    source = 'unavailable';
+    if isempty(backgroundVoxels)
+        return
+    end
+    temporalScore = nan(size(backgroundVoxels, 1), 1);
+    for backgroundIndex = 1:size(backgroundVoxels, 1)
+        values = backgroundVoxels(backgroundIndex, :);
+        good = isfinite(real(values)) & isfinite(imag(values));
+        if any(good)
+            temporalScore(backgroundIndex) = median(abs(values(good)));
         end
-        if ~isfinite(scale) || scale == 0
-            scale = 1;
+    end
+    validScore = temporalScore(isfinite(temporalScore));
+    if isempty(validScore)
+        return
+    end
+    sortedScore = sort(validScore, 'ascend');
+    selectionIndex = max(1, min(numel(sortedScore), ...
+        ceil(opts.backgroundFraction .* numel(sortedScore))));
+    threshold = sortedScore(selectionIndex);
+    selected = backgroundVoxels(temporalScore <= threshold, :);
+    selected = selected(:);
+    selected = selected(isfinite(real(selected)) & isfinite(imag(selected)));
+    if isempty(selected)
+        return
+    end
+    magnitudeMean = mean(abs(selected));
+    if strcmp(mode, 'complex')
+        realScale = robustRealScale(real(selected));
+        imaginaryScale = robustRealScale(imag(selected));
+        validScale = [realScale imaginaryScale];
+        validScale = validScale(isfinite(validScale) & validScale > 0);
+        if ~isempty(validScale)
+            sigma = median(validScale);
+            source = 'low-signal complex background';
         end
-
-        realResidual = abs(y_real - y_fit) ./ scale;
-        imagResidual = abs(y_imag) ./ scale;
-
-        wrongSign = sign(y_real) ~= sign(y_fit) & ...
-                    abs(y_real) > 0.15 .* scale & ...
-                    abs(y_fit)  > 0.15 .* scale;
-
-        candidateScore = realResidual + 0.75 .* imagResidual + 1.0 .* double(wrongSign);
-
-        nearZero = abs(y_real) < 0.05 .* scale & abs(y_fit) < 0.05 .* scale;
-        candidateScore(nearZero) = 0.5 .* candidateScore(nearZero);
-
-        finiteScore = isfinite(candidateScore);
-
-        if ~any(finiteScore)
-            return
+    else
+        magnitudeMedian = median(abs(selected));
+        if isfinite(magnitudeMedian) && magnitudeMedian > 0
+            % Exact for single-coil Rayleigh background.  For a combined
+            % magnitude image this is used only as a scale estimate; the
+            % noncentral-chi approximation uses the measured mean floor.
+            sigma = magnitudeMedian ./ sqrt(2 .* log(2));
+            source = 'low-signal magnitude background';
         end
+    end
+end
 
-        candidateScore(~finiteScore) = -Inf;
+function value = robustSpatialMean(values, trimFraction, useTrim)
+    if isempty(values)
+        value = NaN;
+        return
+    end
+    values = values(:);
+    if ~useTrim || trimFraction <= 0 || numel(values) < 8
+        value = mean(values);
+        return
+    end
+    centre = median(values);
+    [~, order] = sort(abs(values - centre), 'ascend');
+    nKeep = max(1, floor((1 - trimFraction) * numel(values)));
+    value = mean(values(order(1:nKeep)));
+end
 
-        [~, order] = sort(candidateScore, 'descend');
+function value = robustComplexSpatialMean(values, trimFraction, useTrim)
+    if isempty(values)
+        value = complex(NaN, NaN);
+        return
+    end
+    values = values(:);
+    if ~useTrim || trimFraction <= 0 || numel(values) < 8
+        value = mean(values);
+        return
+    end
+    centre = median(real(values)) + 1i * median(imag(values));
+    [~, order] = sort(abs(values - centre), 'ascend');
+    nKeep = max(1, floor((1 - trimFraction) * numel(values)));
+    value = mean(values(order(1:nKeep)));
+end
 
-        nTake = min(maxCandidates, numel(order));
-        candidateIdx = order(1:nTake).';
-
+function [t, y] = cleanAndCombineSamples(t, y)
+    t = double(t(:));
+    y = y(:);
+    good = isfinite(t) & t >= 0 & isfinite(real(y)) & isfinite(imag(y));
+    t = t(good);
+    y = y(good);
+    [t, order] = sort(t, 'ascend');
+    y = y(order);
+    if isempty(t)
+        return
     end
 
-    % ==========================================================
-    % Nested helper: score automatic polarity candidate
-    % ==========================================================
-    function score = autoPolarityScore(gof, nFlips, p, xs, z_used, ub)
+    [uniqueTimes, ~, group] = unique(t);
+    if numel(uniqueTimes) == numel(t)
+        return
+    end
+    combined = zeros(size(uniqueTimes), 'like', y);
+    for k = 1:numel(uniqueTimes)
+        combined(k) = mean(y(group == k));
+    end
+    t = uniqueTimes;
+    y = combined;
+end
 
+
+% ========================================================================
+% Complex and magnitude fitting
+% ========================================================================
+
+function r = fitOrFailComplex(t, signal, opts, template, polarity, fieldIndex)
+    if numel(t) < opts.minimumPoints
+        r = template;
+        r.method = 'complex_phase_drift_ir';
+        r.tSeconds = t;
+        r.rawSignal = signal;
+        r.displaySignal = real(signal);
+        r.qc = sprintf('failed: fewer than %d valid complex time points', ...
+            opts.minimumPoints);
+        r.qcReasons = {r.qc};
+    else
+        r = fitComplexPhaseDriftIR(t, signal, opts, polarity, fieldIndex);
+    end
+end
+
+function r = fitOrFailMagnitude(t, signal, opts, template, polarity, ...
+        fieldIndex, magnitudeMeta)
+    if numel(t) < opts.minimumPoints
+        r = template;
+        r.method = 'magnitude_rician_ir';
+        r.tSeconds = t;
+        r.rawSignal = signal;
+        r.displaySignal = real(signal);
+        r.qc = sprintf('failed: fewer than %d valid magnitude time points', ...
+            opts.minimumPoints);
+        r.qcReasons = {r.qc};
+    else
+        r = fitMagnitudeRicianIR(t, signal, opts, polarity, ...
+            fieldIndex, magnitudeMeta);
+    end
+end
+
+function selected = selectHybridFit(complexFit, magnitudeFit, opts)
+    complexProblems = {};
+    if ~complexFit.ok
+        complexProblems{end + 1} = 'complex fit failed'; %#ok<AGROW>
+    else
+        if complexFit.boundHit
+            complexProblems{end + 1} = 'complex rate reached a bound'; %#ok<AGROW>
+        end
+        if isfinite(complexFit.phaseResidualDegrees) && ...
+                complexFit.phaseResidualDegrees > ...
+                opts.maximumPhaseResidualDegrees
+            complexProblems{end + 1} = sprintf( ...
+                'complex phase residual is %.3g degrees', ...
+                complexFit.phaseResidualDegrees); %#ok<AGROW>
+        end
+        if complexFit.reliableSignTransitions > opts.maximumReliableSignTransitions
+            complexProblems{end + 1} = sprintf( ...
+                'complex projection has %d reliable sign transitions', ...
+                complexFit.reliableSignTransitions); %#ok<AGROW>
+        end
+        if isfinite(complexFit.orthogonalNRMSE) && ...
+                complexFit.orthogonalNRMSE > opts.maximumOrthogonalNRMSE
+            complexProblems{end + 1} = 'complex phase trajectory is incoherent'; %#ok<AGROW>
+        end
+        if isfinite(complexFit.nrmse) && complexFit.nrmse > opts.maximumNRMSE
+            complexProblems{end + 1} = 'complex residual is large'; %#ok<AGROW>
+        end
+        magnitudeBranchTrusted = magnitudeFit.ok && ~magnitudeFit.boundHit && ...
+            ~magnitudeFit.signAmbiguous && isfinite(magnitudeFit.nrmse) && ...
+            magnitudeFit.nrmse <= opts.maximumNRMSE;
+        if magnitudeBranchTrusted && isfinite(complexFit.signChangeIndex) && ...
+                isfinite(magnitudeFit.signChangeIndex) && ...
+                abs(complexFit.signChangeIndex - magnitudeFit.signChangeIndex) > ...
+                opts.maximumSignIndexDisagreement
+            complexProblems{end + 1} = sprintf( ...
+                'complex and magnitude fits place the zero crossing at indices %d and %d', ...
+                complexFit.signChangeIndex, magnitudeFit.signChangeIndex); %#ok<AGROW>
+        end
+    end
+
+    if isempty(complexProblems)
+        selected = complexFit;
+        selected.selectionReason = ...
+            'complex fit retained: phase projection has at most one reliable sign transition';
+    elseif magnitudeFit.ok
+        selected = magnitudeFit;
+        selected.selectionReason = ['magnitude-constrained fit selected: ' ...
+            strjoin(complexProblems, '; ')];
+    else
+        selected = complexFit;
+        selected.selectionReason = ['complex fit retained because magnitude fit failed: ' ...
+            strjoin(complexProblems, '; ')];
+    end
+
+    selected.complexCandidateSummary = fitSummary(complexFit);
+    selected.magnitudeCandidateSummary = fitSummary(magnitudeFit);
+end
+
+function summary = fitSummary(r)
+    summary = struct('ok', r.ok, 'method', r.method, 'R1', r.R1, ...
+        'T1ms', r.T1ms, 'boundHit', r.boundHit, ...
+        'signChangeIndex', r.signChangeIndex, ...
+        'reliableSignTransitions', r.reliableSignTransitions, ...
+        'signAmbiguous', r.signAmbiguous, 'nrmse', r.nrmse, ...
+        'orthogonalNRMSE', r.orthogonalNRMSE, ...
+        'phaseResidualDegrees', r.phaseResidualDegrees, 'qc', r.qc);
+end
+
+function r = fitComplexPhaseDriftIR(t, z, opts, polarity, fieldIndex)
+    if strcmp(opts.sequenceMode, 'unconstrained')
+        r = fitComplexAffine(t, z, opts);
+        return
+    end
+    r = emptyFieldResult();
+    r.method = 'complex_phase_drift_ir';
+    r.tSeconds = t(:);
+    r.rawSignal = z(:);
+    n = numel(t);
+    signalScale = max(abs(z));
+    if ~isfinite(signalScale) || signalScale <= eps
+        r.qc = 'failed: complex signal has no finite dynamic range';
+        r.qcReasons = {r.qc};
+        return
+    end
+
+    candidateTemplate = struct('ok', false, 'score', Inf, 'R1', NaN, ...
+        'fit', struct(), 'corrected', [], 'phaseTrend', [], ...
+        'phaseResidualDegrees', Inf, 'branchIndex', NaN);
+    candidates = repmat(candidateTemplate, 1, n + 1);
+    magnitude = abs(z(:));
+    phaseNoiseProxy = max(min(magnitude) ./ sqrt(pi ./ 2), eps);
+    reliableThreshold = max(opts.phaseReliableMagnitudeFraction .* ...
+        signalScale, opts.minimumPhaseSNR .* phaseNoiseProxy);
+    reliable = magnitude >= reliableThreshold & isfinite(magnitude);
+    if sum(reliable) < max(3, opts.phaseDriftOrder + 1)
+        [~, reliableOrder] = sort(magnitude, 'descend');
+        reliable(:) = false;
+        reliable(reliableOrder(1:min(n, max(3, ...
+            opts.phaseDriftOrder + 1)))) = true;
+    end
+
+    for branchIndex = 0:n
+        if ~phaseBranchAllowed(branchIndex, n, polarity)
+            continue
+        end
+        signs = ones(n, 1);
+        signs(1:branchIndex) = -1;
+        aligned = z(:) .* signs;
+        [phaseTrend, phaseResidualDegrees] = smoothPhaseTrend( ...
+            aligned, reliable, magnitude, opts.phaseDriftOrder);
+        corrected = z(:) .* exp(-1i .* phaseTrend);
+        branchPolarity = struct('negativeIndices', 1:branchIndex, ...
+            'positiveIndices', (branchIndex + 1):n);
+        signedFit = fitConstrainedSignedIR(t, real(corrected), ...
+            ones(n, 1), opts, branchPolarity);
+        if ~signedFit.ok
+            continue
+        end
+        complexResidual = corrected - signedFit.prediction;
+        score = sum(abs(complexResidual).^2) ./ max(signalScale.^2, eps);
+        candidates(branchIndex + 1).ok = true;
+        candidates(branchIndex + 1).score = score;
+        candidates(branchIndex + 1).R1 = signedFit.R1;
+        candidates(branchIndex + 1).fit = signedFit;
+        candidates(branchIndex + 1).corrected = corrected;
+        candidates(branchIndex + 1).phaseTrend = phaseTrend;
+        candidates(branchIndex + 1).phaseResidualDegrees = ...
+            phaseResidualDegrees;
+        candidates(branchIndex + 1).branchIndex = branchIndex;
+    end
+
+    scores = [candidates.score];
+    [sortedScores, order] = sort(scores, 'ascend');
+    if isempty(order) || ~isfinite(sortedScores(1))
+        r.qc = sprintf(['failed: no phase-drift IR branch satisfied the ', ...
+            'polarity constraints for field %d'], fieldIndex);
+        r.qcReasons = {r.qc};
+        return
+    end
+    best = candidates(order(1));
+    fit = best.fit;
+    corrected = best.corrected;
+    prediction = fit.prediction;
+    residual = corrected - prediction;
+    noiseSigma = robustComplexScale(residual);
+    dfe = max(2 .* n - (4 + opts.phaseDriftOrder), 1);
+    sse = sum(abs(residual).^2);
+    rmse = sqrt(sse ./ dfe);
+    sst = sum(abs(corrected - mean(corrected)).^2);
+    scaleAmplitude = max([fit.C, signalScale, eps]);
+    signAmbiguous = false;
+    if numel(order) > 1 && isfinite(sortedScores(2))
+        second = candidates(order(2));
+        closeScore = sortedScores(2) <= opts.signAmbiguityRatio .* ...
+            max(sortedScores(1), eps);
+        differentRate = isfinite(second.R1) && ...
+            abs(log(second.R1 ./ best.R1)) > ...
+            opts.signAmbiguityLogRateDifference;
+        signAmbiguous = closeScore && differentRate;
+    end
+
+    r.ok = true;
+    r.B = fit.B;
+    r.C = fit.C;
+    r.S0 = fit.B - fit.C;
+    r.Sinf = fit.B;
+    r.R1 = fit.R1;
+    r.T1ms = 1000 ./ fit.R1;
+    r.R1CI95 = fit.R1CI95;
+    r.T1CI95 = rateCiToT1Ci(fit.R1CI95);
+    zCritical = sqrt(2) .* erfinv(opts.confidenceLevel);
+    r.R1SE = intervalToSE(r.R1CI95, zCritical);
+    r.T1SE = intervalToSE(r.T1CI95, zCritical);
+    r.ciOpen = fit.ciOpen;
+    if any(r.ciOpen)
+        r.R1SE = NaN;
+        r.T1SE = NaN;
+    end
+    r.phaseRad = median(best.phaseTrend);
+    r.phaseTrendRad = best.phaseTrend;
+    r.phaseResidualDegrees = best.phaseResidualDegrees;
+    r.displaySignal = real(corrected);
+    r.displayFit = prediction;
+    r.predictionComplex = prediction;
+    r.residual = residual;
+    r.weights = fit.weights;
+    r.outlierIndices = find(fit.weights < opts.outlierWeightThreshold).';
+    r.noiseSigma = noiseSigma;
+    r.dynamicSNR = fit.C ./ max(noiseSigma, eps);
+    r.sse = sse;
+    r.rsquare = safeRsquare(sse, sst);
+    r.rmse = rmse;
+    r.nrmse = rmse ./ scaleAmplitude;
+    r.dfe = dfe;
+    r.boundHit = fit.boundHit;
+    r.zeroCrossingSeconds = zeroCrossingTime(fit.B, fit.C, fit.R1);
+    r.signChangeIndex = best.branchIndex;
+    r.reliableSignTransitions = countReliableSignTransitions( ...
+        real(corrected), noiseSigma, fit.C);
+    r.orthogonalOffset = 0;
+    r.orthogonalNRMSE = sqrt(mean(imag(corrected).^2)) ./ scaleAmplitude;
+    r.signAmbiguous = signAmbiguous;
+    r.candidateRates = [candidates.R1];
+    r.candidateScores = scores;
+    r.selectionReason = sprintf( ...
+        ['phase drift order %d; branch %d; RMS phase residual %.3g degrees'], ...
+        opts.phaseDriftOrder, best.branchIndex, best.phaseResidualDegrees);
+    r = applyQualityControl(r, opts);
+end
+
+function allowed = phaseBranchAllowed(branchIndex, sampleCount, polarity)
+    negative = polarity.negativeIndices;
+    positive = polarity.positiveIndices;
+    allowed = all(negative <= branchIndex) && ...
+        all(positive > branchIndex) && branchIndex >= 0 && ...
+        branchIndex <= sampleCount;
+end
+
+function [trend, residualDegrees] = smoothPhaseTrend( ...
+        alignedSignal, reliable, magnitude, requestedOrder)
+    sampleCount = numel(alignedSignal);
+    coordinate = linspace(-1, 1, sampleCount).';
+    reliableIndex = find(reliable(:));
+    order = min(requestedOrder, max(numel(reliableIndex) - 1, 0));
+    designAll = polynomialDesign(coordinate, order);
+    phase = unwrap(angle(alignedSignal(reliableIndex)));
+    design = designAll(reliableIndex, :);
+    weights = magnitude(reliableIndex).^2;
+    weights = weights ./ max(mean(weights), eps);
+    weightedDesign = bsxfun(@times, design, sqrt(weights));
+    weightedPhase = phase .* sqrt(weights);
+    coefficient = weightedDesign \ weightedPhase;
+    trend = designAll * coefficient;
+    circularResidual = angle(alignedSignal(reliableIndex) .* ...
+        exp(-1i .* trend(reliableIndex)));
+    residualDegrees = 180 ./ pi .* sqrt(sum(weights .* ...
+        circularResidual.^2) ./ max(sum(weights), eps));
+end
+
+function design = polynomialDesign(coordinate, order)
+    design = ones(numel(coordinate), order + 1);
+    for polynomialOrder = 1:order
+        design(:, polynomialOrder + 1) = coordinate(:) .^ polynomialOrder;
+    end
+end
+
+function fit = fitConstrainedSignedIR(t, y, initialWeights, opts, polarity)
+    weights = initialWeights(:);
+    previousRate = NaN;
+    for robustIndex = 1:max(1, opts.robustIterations)
+        fit = optimiseConstrainedIRRate(t, y, weights, opts, polarity);
+        if ~fit.ok || ~opts.robust
+            break
+        end
+        residual = y(:) - fit.prediction;
+        sigma = robustRealScale(residual);
+        proposedWeights = huberWeights(abs(residual), sigma, opts);
+        newWeights = 0.5 .* weights + 0.5 .* proposedWeights;
+        if isfinite(previousRate)
+            rateChange = abs(log(fit.R1 ./ previousRate));
+        else
+            rateChange = Inf;
+        end
+        weightChange = max(abs(newWeights - weights));
+        weights = newWeights;
+        previousRate = fit.R1;
+        if rateChange < opts.robustTolerance && ...
+                weightChange < opts.robustTolerance
+            break
+        end
+    end
+    fit = optimiseConstrainedIRRate(t, y, weights, opts, polarity);
+    fit.weights = weights;
+    if fit.ok
+        [fit.R1CI95, fit.ciOpen] = constrainedRateCI( ...
+            t, y, weights, fit.R1, opts, polarity);
+    else
+        fit.R1CI95 = [NaN NaN];
+        fit.ciOpen = [false false];
+    end
+end
+
+function fit = optimiseConstrainedIRRate(t, y, weights, opts, polarity)
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    logGrid = linspace(logLower, logUpper, opts.rateGridPoints);
+    score = inf(size(logGrid));
+    for rateIndex = 1:numel(logGrid)
+        [~, ~, ~, score(rateIndex)] = solveConstrainedIRAtRate( ...
+            exp(logGrid(rateIndex)), t, y, weights, opts, polarity);
+    end
+    [~, bestIndex] = min(score);
+    candidateLogRate = [logGrid(bestIndex), logLower, logUpper];
+    if bestIndex > 1 && bestIndex < numel(logGrid)
+        fminOptions = optimset('Display', 'off', 'TolX', 1e-8, ...
+            'MaxIter', 100, 'MaxFunEvals', 220);
+        objective = @(logRate) constrainedIRProfileObjective( ...
+            logRate, t, y, weights, opts, polarity);
+        refined = fminbnd(objective, logGrid(bestIndex - 1), ...
+            logGrid(bestIndex + 1), fminOptions);
+        candidateLogRate(end + 1) = refined; %#ok<AGROW>
+    end
+    candidateScore = inf(size(candidateLogRate));
+    for candidateIndex = 1:numel(candidateLogRate)
+        candidateScore(candidateIndex) = constrainedIRProfileObjective( ...
+            candidateLogRate(candidateIndex), t, y, weights, opts, polarity);
+    end
+    [~, selected] = min(candidateScore);
+    selectedLogRate = candidateLogRate(selected);
+    rate = exp(selectedLogRate);
+    [B, C, prediction, sse] = solveConstrainedIRAtRate( ...
+        rate, t, y, weights, opts, polarity);
+    constraintsSatisfied = all(prediction(polarity.negativeIndices) < 0) && ...
+        all(prediction(polarity.positiveIndices) > 0);
+    logSpan = logUpper - logLower;
+    fit = struct('ok', isfinite(sse) && isfinite(B) && isfinite(C) && ...
+        constraintsSatisfied, ...
+        'R1', rate, 'B', B, 'C', C, 'prediction', prediction, ...
+        'sse', sse, 'boundHit', selectedLogRate <= ...
+        logLower + 0.01 .* logSpan || selectedLogRate >= ...
+        logUpper - 0.01 .* logSpan, 'weights', weights, ...
+        'R1CI95', [NaN NaN], 'ciOpen', [false false]);
+end
+
+function value = constrainedIRProfileObjective( ...
+        logRate, t, y, weights, opts, polarity)
+    [~, ~, ~, value] = solveConstrainedIRAtRate( ...
+        exp(logRate), t, y, weights, opts, polarity);
+    if ~isfinite(value)
+        value = realmax('double');
+    end
+end
+
+function [B, C, prediction, sse] = solveConstrainedIRAtRate( ...
+        rate, t, y, weights, opts, polarity)
+    exponential = exp(-rate .* t(:));
+    signalScale = max(max(abs(y)), eps);
+    minimumInitial = opts.minimumInitialMagnetizationFraction .* signalScale;
+    design = [1 - exponential, -exponential];
+    adjustedObservation = y(:) + minimumInitial .* exponential;
+    squareRootWeight = sqrt(max(weights(:), 0));
+    weightedDesign = bsxfun(@times, design, squareRootWeight);
+    weightedObservation = adjustedObservation .* squareRootWeight;
+    coefficient = nonnegativeCoordinateLeastSquares( ...
+        weightedDesign, weightedObservation, opts.robustTolerance);
+    if numel(coefficient) ~= 2 || any(~isfinite(coefficient))
+        B = NaN;
+        C = NaN;
+        prediction = nan(size(t(:)));
+        sse = Inf;
+        return
+    end
+    B = coefficient(1);
+    initialMagnitude = minimumInitial + coefficient(2);
+    C = B + initialMagnitude;
+    prediction = B - C .* exponential;
+    residual = y(:) - prediction;
+    sse = sum(weights(:) .* residual.^2);
+    scalePenalty = max(sum(weights(:) .* y(:).^2), signalScale.^2);
+    negativeViolation = polarity.negativeIndices( ...
+        prediction(polarity.negativeIndices) >= 0);
+    positiveViolation = polarity.positiveIndices( ...
+        prediction(polarity.positiveIndices) <= 0);
+    if ~isempty(negativeViolation) || ~isempty(positiveViolation)
+        sse = sse + 1e6 .* scalePenalty .* ...
+            (numel(negativeViolation) + numel(positiveViolation));
+    end
+end
+
+function [rateCI, openBound] = constrainedRateCI( ...
+        t, y, weights, rateHat, opts, polarity)
+    logGrid = linspace(log(opts.R1Bounds(1)), ...
+        log(opts.R1Bounds(2)), opts.profileGridPoints);
+    logGrid = unique(sort([logGrid log(rateHat)]));
+    profile = inf(size(logGrid));
+    for profileIndex = 1:numel(logGrid)
+        profile(profileIndex) = constrainedIRProfileObjective( ...
+            logGrid(profileIndex), t, y, weights, opts, polarity);
+    end
+    [minimumSse, minimumIndex] = min(profile);
+    dfe = max(numel(t) - (4 + opts.phaseDriftOrder), 1);
+    fThreshold = fQuantileOneDof(opts.confidenceLevel, dfe);
+    threshold = minimumSse .* (1 + fThreshold ./ dfe);
+    [rateCI, openBound] = intervalFromProfile( ...
+        logGrid, profile, minimumIndex, threshold);
+end
+
+function quantile = fQuantileOneDof(probability, denominatorDof)
+    try
+        betaValue = betaincinv(probability, 0.5, denominatorDof ./ 2);
+        quantile = denominatorDof .* betaValue ./ max(1 - betaValue, eps);
+    catch
+        quantile = 2 .* erfinv(probability).^2;
+    end
+end
+
+function [rateCI, openBound] = intervalFromProfile( ...
+        logGrid, profile, minimumIndex, threshold)
+    inside = profile <= threshold;
+    leftIndex = minimumIndex;
+    while leftIndex > 1 && inside(leftIndex - 1)
+        leftIndex = leftIndex - 1;
+    end
+    rightIndex = minimumIndex;
+    while rightIndex < numel(logGrid) && inside(rightIndex + 1)
+        rightIndex = rightIndex + 1;
+    end
+    leftOpen = leftIndex == 1;
+    rightOpen = rightIndex == numel(logGrid);
+    if leftOpen
+        leftLog = logGrid(1);
+    else
+        leftLog = interpolateThreshold(logGrid(leftIndex - 1), ...
+            profile(leftIndex - 1), logGrid(leftIndex), ...
+            profile(leftIndex), threshold);
+    end
+    if rightOpen
+        rightLog = logGrid(end);
+    else
+        rightLog = interpolateThreshold(logGrid(rightIndex), ...
+            profile(rightIndex), logGrid(rightIndex + 1), ...
+            profile(rightIndex + 1), threshold);
+    end
+    rateCI = sort(exp([leftLog rightLog]));
+    openBound = [leftOpen rightOpen];
+end
+
+function r = fitMagnitudeRicianIR(t, magnitudeSignal, opts, polarity, ...
+        fieldIndex, magnitudeMeta)
+    if strcmp(opts.sequenceMode, 'unconstrained')
+        r = fitMagnitudeAffine(t, magnitudeSignal, opts);
+        return
+    end
+    r = emptyFieldResult();
+    r.method = 'magnitude_rician_ir';
+    r.tSeconds = t(:);
+    magnitudeSignal = abs(real(magnitudeSignal(:)));
+    r.rawSignal = magnitudeSignal;
+    [noiseSigma, noiseFloor, noiseModel, noiseSource, coilCount] = ...
+        resolveMagnitudeNoise(magnitudeSignal, opts, fieldIndex, magnitudeMeta);
+    weights = ones(size(t(:)));
+    previousRate = NaN;
+    for robustIndex = 1:max(1, opts.robustIterations)
+        fit = optimiseMagnitudeIRRate(t, magnitudeSignal, weights, ...
+            noiseSigma, noiseFloor, noiseModel, opts, polarity);
+        if ~fit.ok || ~opts.robust
+            break
+        end
+        residual = magnitudeSignal - fit.magnitudePrediction;
+        residualScale = robustRealScale(residual);
+        proposedWeights = huberWeights(abs(residual), residualScale, opts);
+        newWeights = 0.5 .* weights + 0.5 .* proposedWeights;
+        if isfinite(previousRate)
+            rateChange = abs(log(fit.R1 ./ previousRate));
+        else
+            rateChange = Inf;
+        end
+        weightChange = max(abs(newWeights - weights));
+        weights = newWeights;
+        previousRate = fit.R1;
+        if rateChange < opts.robustTolerance && ...
+                weightChange < opts.robustTolerance
+            break
+        end
+    end
+    fit = optimiseMagnitudeIRRate(t, magnitudeSignal, weights, ...
+        noiseSigma, noiseFloor, noiseModel, opts, polarity);
+    if ~fit.ok
+        r.qc = sprintf('failed: constrained magnitude IR fit failed at field %d', ...
+            fieldIndex);
+        r.qcReasons = {r.qc};
+        return
+    end
+
+    latentSignal = fit.latentPrediction;
+    if strcmp(noiseModel, 'rician')
+        debiasedMagnitude = sqrt(max(magnitudeSignal.^2 - ...
+            2 .* noiseSigma.^2, 0));
+    else
+        debiasedMagnitude = sqrt(max(magnitudeSignal.^2 - noiseFloor.^2, 0));
+    end
+    latentSigns = sign(latentSignal);
+    latentSigns(latentSigns == 0) = 1;
+    signedDisplay = latentSigns .* debiasedMagnitude;
+    residual = magnitudeSignal - fit.magnitudePrediction;
+    residualScale = robustRealScale(residual);
+    dfe = max(numel(t) - 3, 1);
+    sse = sum(residual.^2);
+    rmse = sqrt(sse ./ dfe);
+    scaleAmplitude = max([fit.C, max(magnitudeSignal), eps]);
+    sst = sum((magnitudeSignal - mean(magnitudeSignal)).^2);
+    zCritical = sqrt(2) .* erfinv(opts.confidenceLevel);
+
+    r.ok = true;
+    r.B = fit.B;
+    r.C = fit.C;
+    r.S0 = fit.B - fit.C;
+    r.Sinf = fit.B;
+    r.R1 = fit.R1;
+    r.T1ms = 1000 ./ fit.R1;
+    r.R1CI95 = fit.R1CI95;
+    r.T1CI95 = rateCiToT1Ci(fit.R1CI95);
+    r.R1SE = intervalToSE(r.R1CI95, zCritical);
+    r.T1SE = intervalToSE(r.T1CI95, zCritical);
+    r.ciOpen = fit.ciOpen;
+    if any(r.ciOpen)
+        r.R1SE = NaN;
+        r.T1SE = NaN;
+    end
+    r.displaySignal = signedDisplay;
+    r.displayFit = latentSignal;
+    r.magnitudePrediction = fit.magnitudePrediction;
+    r.magnitudeNoiseModel = noiseModel;
+    r.magnitudeNoiseSigma = noiseSigma;
+    r.magnitudeNoiseFloor = noiseFloor;
+    r.magnitudeCoilCount = coilCount;
+    r.noiseSource = noiseSource;
+    r.residual = residual;
+    r.weights = weights;
+    r.outlierIndices = find(weights < opts.outlierWeightThreshold).';
+    r.noiseSigma = noiseSigma;
+    r.dynamicSNR = fit.C ./ max(noiseSigma, eps);
+    r.sse = sse;
+    r.rsquare = safeRsquare(sse, sst);
+    r.rmse = rmse;
+    r.nrmse = rmse ./ scaleAmplitude;
+    r.dfe = dfe;
+    r.boundHit = fit.boundHit;
+    r.zeroCrossingSeconds = zeroCrossingTime(fit.B, fit.C, fit.R1);
+    r.signChangeIndex = sum(latentSignal < 0);
+    r.reliableSignTransitions = double(r.signChangeIndex > 0 && ...
+        r.signChangeIndex < numel(t));
+    r.signAmbiguous = fit.signAmbiguous;
+    r.candidateRates = fit.profileRates;
+    r.candidateScores = fit.profileScores;
+    r.selectionReason = sprintf( ...
+        '%s magnitude IR; noise %s; sigma %.4g; %d effective coil(s)', ...
+        noiseModel, noiseSource, noiseSigma, coilCount);
+    r = applyQualityControl(r, opts);
+end
+
+function [sigma, noiseFloor, model, source, coilCount] = resolveMagnitudeNoise( ...
+        signal, opts, fieldIndex, meta)
+    sigma = numericOptionForField(opts.magnitudeNoiseSigma, fieldIndex);
+    source = 'OPTIONS.magnitudeNoiseSigma';
+    if ~isfinite(sigma) || sigma <= 0
+        sigma = NaN;
+        if isstruct(meta)
+            if isfield(meta, 'aggregation') && ...
+                    strcmp(meta.aggregation, 'magnitude_of_complex_roi_mean') && ...
+                    isfield(meta, 'roiNoiseSigma') && ...
+                    isfinite(meta.roiNoiseSigma) && meta.roiNoiseSigma > 0
+                sigma = meta.roiNoiseSigma;
+                source = 'complex background propagated through ROI mean';
+            elseif isfield(meta, 'backgroundNoiseSigma') && ...
+                    isfinite(meta.backgroundNoiseSigma) && ...
+                    meta.backgroundNoiseSigma > 0
+                sigma = meta.backgroundNoiseSigma;
+                source = meta.noiseSource;
+            end
+        end
+    end
+    if ~isfinite(sigma) || sigma <= 0
+        sigma = max(min(signal) ./ sqrt(pi ./ 2), ...
+            0.01 .* max(signal));
+        source = 'recovery minimum fallback';
+    end
+
+    coilCount = opts.magnitudeCoilCount;
+    if isnan(coilCount)
+        coilCount = 1;
+    end
+    model = opts.magnitudeNoiseModel;
+    if strcmp(model, 'auto')
+        if coilCount <= 1 || (isstruct(meta) && ...
+                isfield(meta, 'aggregation') && ...
+                strcmp(meta.aggregation, 'magnitude_of_complex_roi_mean'))
+            model = 'rician';
+            coilCount = 1;
+        else
+            model = 'noncentral_chi_approx';
+        end
+    end
+    noiseFloor = NaN;
+    if isstruct(meta) && isfield(meta, 'backgroundMagnitudeMean') && ...
+            isfinite(meta.backgroundMagnitudeMean) && ...
+            meta.backgroundMagnitudeMean > 0
+        noiseFloor = meta.backgroundMagnitudeMean;
+    end
+    if ~isfinite(noiseFloor) || noiseFloor <= 0
+        if strcmp(model, 'rician')
+            noiseFloor = sigma .* sqrt(pi ./ 2);
+        else
+            noiseFloor = sigma .* sqrt(2 .* coilCount);
+        end
+    end
+end
+
+function value = numericOptionForField(option, fieldIndex)
+    value = NaN;
+    if isempty(option)
+        return
+    end
+    if isscalar(option)
+        value = double(option);
+    elseif fieldIndex <= numel(option)
+        value = double(option(fieldIndex));
+    end
+end
+
+function fit = optimiseMagnitudeIRRate(t, magnitude, weights, sigma, ...
+        noiseFloor, model, opts, polarity)
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    logGrid = linspace(logLower, logUpper, opts.rateGridPoints);
+    profile = inf(size(logGrid));
+    for profileIndex = 1:numel(logGrid)
+        solution = solveMagnitudeIRAtRate(exp(logGrid(profileIndex)), ...
+            t, magnitude, weights, sigma, noiseFloor, model, opts, polarity);
+        profile(profileIndex) = solution.score;
+    end
+    [~, bestIndex] = min(profile);
+    candidateLogRate = [logGrid(bestIndex), logLower, logUpper];
+    if bestIndex > 1 && bestIndex < numel(logGrid)
+        fminOptions = optimset('Display', 'off', 'TolX', 2e-6, ...
+            'MaxIter', 80, 'MaxFunEvals', 180);
+        objective = @(logRate) magnitudeIRProfileObjective(logRate, ...
+            t, magnitude, weights, sigma, noiseFloor, model, opts, polarity);
+        refined = fminbnd(objective, logGrid(bestIndex - 1), ...
+            logGrid(bestIndex + 1), fminOptions);
+        candidateLogRate(end + 1) = refined; %#ok<AGROW>
+    end
+    candidateScore = inf(size(candidateLogRate));
+    for candidateIndex = 1:numel(candidateLogRate)
+        candidateScore(candidateIndex) = magnitudeIRProfileObjective( ...
+            candidateLogRate(candidateIndex), t, magnitude, weights, ...
+            sigma, noiseFloor, model, opts, polarity);
+    end
+    [~, selected] = min(candidateScore);
+    selectedLogRate = candidateLogRate(selected);
+    selectedRate = exp(selectedLogRate);
+    solution = solveMagnitudeIRAtRate(selectedRate, t, magnitude, ...
+        weights, sigma, noiseFloor, model, opts, polarity);
+    profileRates = exp(logGrid);
+    [profileRates, profileOrder] = sort([profileRates selectedRate]);
+    profileScores = [profile solution.score];
+    profileScores = profileScores(profileOrder);
+    [profileRates, uniqueIndex] = unique(profileRates, 'stable');
+    profileScores = profileScores(uniqueIndex);
+    threshold = solution.score + erfinv(opts.confidenceLevel).^2;
+    [~, minimumIndex] = min(profileScores);
+    [rateCI, ciOpen] = intervalFromProfile(log(profileRates), ...
+        profileScores, minimumIndex, threshold);
+
+    localMinimum = false(size(profileScores));
+    if numel(profileScores) >= 3
+        localMinimum(2:end-1) = profileScores(2:end-1) <= ...
+            profileScores(1:end-2) & profileScores(2:end-1) <= ...
+            profileScores(3:end);
+    end
+    alternative = find(localMinimum & profileScores <= threshold & ...
+        abs(log(profileRates ./ selectedRate)) > ...
+        opts.signAmbiguityLogRateDifference, 1);
+    signAmbiguous = ~isempty(alternative);
+    logSpan = logUpper - logLower;
+    fit = solution;
+    fit.ok = isfinite(solution.score) && isfinite(solution.B) && ...
+        isfinite(solution.C) && solution.C > solution.B && ...
+        solution.constraintsSatisfied;
+    fit.R1 = selectedRate;
+    fit.boundHit = selectedLogRate <= logLower + 0.01 .* logSpan || ...
+        selectedLogRate >= logUpper - 0.01 .* logSpan;
+    fit.R1CI95 = rateCI;
+    fit.ciOpen = ciOpen;
+    fit.signAmbiguous = signAmbiguous;
+    fit.profileRates = profileRates;
+    fit.profileScores = profileScores;
+end
+
+function value = magnitudeIRProfileObjective(logRate, t, magnitude, ...
+        weights, sigma, noiseFloor, model, opts, polarity)
+    solution = solveMagnitudeIRAtRate(exp(logRate), t, magnitude, ...
+        weights, sigma, noiseFloor, model, opts, polarity);
+    value = solution.score;
+    if ~isfinite(value)
+        value = realmax('double');
+    end
+end
+
+function solution = solveMagnitudeIRAtRate(rate, t, magnitude, weights, ...
+        sigma, noiseFloor, model, opts, polarity)
+    scale = max(max(magnitude), eps);
+    minimumInitial = opts.minimumInitialMagnetizationFraction .* scale;
+    lateCount = min(3, numel(magnitude));
+    B0 = max(mean(magnitude(end-lateCount+1:end)), 0.1 .* scale);
+    initialStarts = [B0, max(magnitude(1), B0); ...
+        0.5 .* scale, scale; scale, scale];
+    bestScore = Inf;
+    bestParameters = [NaN NaN];
+    fminOptions = optimset('Display', 'off', 'TolX', 1e-7, ...
+        'TolFun', 1e-8, 'MaxIter', 180, 'MaxFunEvals', 360);
+    for startIndex = 1:size(initialStarts, 1)
+        startB = max(initialStarts(startIndex, 1), 1e-6 .* scale);
+        startAExcess = max(initialStarts(startIndex, 2) - ...
+            minimumInitial, 1e-6 .* scale);
+        start = log([startB startAExcess] ./ scale);
+        objective = @(parameters) magnitudeAmplitudeObjective(parameters, ...
+            rate, t, magnitude, weights, sigma, noiseFloor, model, ...
+            opts, polarity, scale, minimumInitial);
+        [parameters, score] = fminsearch(objective, start, fminOptions);
+        if score < bestScore
+            bestScore = score;
+            bestParameters = parameters;
+        end
+    end
+    [B, initialMagnitude] = decodeMagnitudeAmplitudes( ...
+        bestParameters, scale, minimumInitial);
+    C = B + initialMagnitude;
+    latent = B - C .* exp(-rate .* t(:));
+    predictedMagnitude = magnitudeObservationMean(abs(latent), sigma, ...
+        noiseFloor, model);
+    constraintsSatisfied = all(latent(polarity.negativeIndices) < 0) && ...
+        all(latent(polarity.positiveIndices) > 0);
+    solution = struct('score', bestScore, 'B', B, 'C', C, ...
+        'latentPrediction', latent, ...
+        'magnitudePrediction', predictedMagnitude, ...
+        'constraintsSatisfied', constraintsSatisfied);
+end
+
+function score = magnitudeAmplitudeObjective(parameters, rate, t, magnitude, ...
+        weights, sigma, noiseFloor, model, opts, polarity, scale, minimumInitial)
+    [B, initialMagnitude] = decodeMagnitudeAmplitudes( ...
+        parameters, scale, minimumInitial);
+    C = B + initialMagnitude;
+    latent = B - C .* exp(-rate .* t(:));
+    negativeValues = latent(polarity.negativeIndices);
+    positiveValues = latent(polarity.positiveIndices);
+    constraintPenalty = 1e6 .* (sum(max(negativeValues, 0).^2) + ...
+        sum(max(-positiveValues, 0).^2)) ./ max(scale.^2, eps);
+    noncentrality = abs(latent);
+    if strcmp(model, 'rician')
+        argument = magnitude(:) .* noncentrality ./ max(sigma.^2, eps);
+        logBessel = log(max(besseli(0, argument, 1), realmin)) + ...
+            abs(argument);
+        term = (magnitude(:).^2 + noncentrality.^2) ./ ...
+            max(2 .* sigma.^2, eps) - logBessel;
+        score = sum(weights(:) .* term);
+    else
+        predicted = magnitudeObservationMean(noncentrality, sigma, ...
+            noiseFloor, model);
+        varianceScale = max(sigma.^2, (0.02 .* scale).^2);
+        score = 0.5 .* sum(weights(:) .* ...
+            (magnitude(:) - predicted).^2 ./ varianceScale);
+    end
+    score = score + constraintPenalty;
+    if ~isfinite(score)
+        score = realmax('double');
+    end
+end
+
+function [B, initialMagnitude] = decodeMagnitudeAmplitudes( ...
+        parameters, scale, minimumInitial)
+    parameters = min(max(real(parameters(:).'), -20), log(50));
+    B = scale .* exp(parameters(1));
+    initialMagnitude = minimumInitial + scale .* exp(parameters(2));
+end
+
+function meanMagnitude = magnitudeObservationMean( ...
+        noncentrality, sigma, noiseFloor, model)
+    if strcmp(model, 'rician')
+        if ~isfinite(sigma) || sigma <= eps
+            meanMagnitude = noncentrality;
+            return
+        end
+        q = noncentrality.^2 ./ (4 .* sigma.^2);
+        scaledI0 = besseli(0, q, 1);
+        scaledI1 = besseli(1, q, 1);
+        meanMagnitude = sigma .* sqrt(pi ./ 2) .* ...
+            ((1 + 2 .* q) .* scaledI0 + 2 .* q .* scaledI1);
+        large = q > 1e4 | ~isfinite(meanMagnitude);
+        meanMagnitude(large) = noncentrality(large) + ...
+            sigma.^2 ./ max(2 .* noncentrality(large), eps);
+    else
+        meanMagnitude = sqrt(noncentrality.^2 + noiseFloor.^2);
+    end
+end
+
+function r = fitComplexAffine(t, z, opts)
+    r = emptyFieldResult();
+    r.method = 'complex_affine_variable_projection';
+    r.tSeconds = t(:);
+    r.rawSignal = z(:);
+
+    weights = ones(size(t));
+    previousR = NaN;
+    for iteration = 1:max(1, opts.robustIterations)
+        [R1, beta, ~, boundHit] = optimiseRate(t, z, weights, opts);
+        prediction = affinePrediction(t, R1, beta);
+        residual = z - prediction;
+        noiseSigma = robustComplexScale(residual);
+
+        if ~opts.robust
+            break
+        end
+        newWeights = huberWeights(abs(residual), noiseSigma, opts);
+        if isfinite(previousR)
+            rateChange = abs(log(R1 / previousR));
+        else
+            rateChange = Inf;
+        end
+        weightChange = max(abs(newWeights - weights));
+        weights = 0.5 * weights + 0.5 * newWeights;
+        previousR = R1;
+        if rateChange < opts.robustTolerance && weightChange < opts.robustTolerance
+            break
+        end
+    end
+    [R1, beta, ~, boundHit] = optimiseRate(t, z, weights, opts);
+    prediction = affinePrediction(t, R1, beta);
+    residual = z - prediction;
+    noiseSigma = robustComplexScale(residual);
+
+    % Choose the arbitrary global phase so the exponential coefficient is
+    % negative.  The displayed scalar curve is then B - C exp(-R1 t).
+    if abs(beta(2)) > 0
+        phase = angle(-beta(2));
+    elseif abs(beta(1)) > 0
+        phase = angle(beta(1));
+    else
+        phase = 0;
+    end
+    rotation = exp(-1i * phase);
+    rotatedBeta = beta .* rotation;
+    B = real(rotatedBeta(1));
+    C = max(-real(rotatedBeta(2)), 0);
+    displaySignal = real(z .* rotation);
+    displayFit = B - C .* exp(-R1 .* t);
+    orthogonalOffset = imag(rotatedBeta(1));
+    orthogonalResidual = imag(z .* rotation) - orthogonalOffset;
+
+    n = numel(t);
+    dfe = max(2 * n - 5, 1);
+    sse = sum(abs(residual).^2);
+    sst = sum(abs(z - mean(z)).^2);
+    rmse = sqrt(sse / dfe);
+    rsq = safeRsquare(sse, sst);
+    scaleAmplitude = max([C, max(abs(displaySignal - median(displaySignal))), eps]);
+
+    [R1CI, ciOpen] = profileRateCI(t, z, weights, R1, 2 * n, 5, opts);
+    T1CI = rateCiToT1Ci(R1CI);
+    zCritical = sqrt(2) * erfinv(opts.confidenceLevel);
+
+    r.ok = isfinite(R1) && R1 > 0 && all(isfinite(beta));
+    r.B = B;
+    r.C = C;
+    r.S0 = B - C;
+    r.Sinf = B;
+    r.R1 = R1;
+    r.T1ms = 1000 / R1;
+    r.R1CI95 = R1CI;
+    r.T1CI95 = T1CI;
+    r.R1SE = intervalToSE(R1CI, zCritical);
+    r.T1SE = intervalToSE(T1CI, zCritical);
+    if any(ciOpen)
+        r.R1SE = NaN;
+        r.T1SE = NaN;
+    end
+    r.betaComplex = beta(:).';
+    r.phaseRad = phase;
+    r.signChangeIndex = sum(displayFit < 0);
+    r.reliableSignTransitions = countReliableSignTransitions( ...
+        displaySignal, noiseSigma, C);
+    r.orthogonalOffset = orthogonalOffset;
+    r.orthogonalNRMSE = sqrt(mean(orthogonalResidual.^2)) / scaleAmplitude;
+    r.predictionComplex = prediction;
+    r.displaySignal = displaySignal;
+    r.displayFit = displayFit;
+    r.residual = residual;
+    r.weights = weights;
+    r.outlierIndices = find(weights < opts.outlierWeightThreshold).';
+    r.noiseSigma = noiseSigma;
+    r.dynamicSNR = C / max(noiseSigma, eps);
+    r.sse = sse;
+    r.rsquare = rsq;
+    r.rmse = rmse;
+    r.nrmse = rmse / scaleAmplitude;
+    r.dfe = dfe;
+    r.boundHit = boundHit;
+    r.ciOpen = ciOpen;
+    r.zeroCrossingSeconds = zeroCrossingTime(B, C, R1);
+    r = applyQualityControl(r, opts);
+end
+
+function r = fitMagnitudeAffine(t, magnitudeSignal, opts)
+    r = emptyFieldResult();
+    r.method = 'magnitude_all_zero_crossings';
+    r.tSeconds = t(:);
+    magnitudeSignal = abs(real(magnitudeSignal(:)));
+    r.rawSignal = magnitudeSignal;
+
+    n = numel(t);
+    candidate = repmat(emptyMagnitudeCandidate(), 1, n);
+    for k = 0:(n - 1)
+        signs = ones(n, 1);
+        if k > 0
+            signs(1:k) = -1;
+        end
+        candidate(k + 1) = fitSignedCandidate(t, signs .* magnitudeSignal, ...
+            magnitudeSignal, signs, k, opts);
+    end
+
+    scores = [candidate.score];
+    [sortedScores, order] = sort(scores, 'ascend');
+    if isempty(order) || ~isfinite(sortedScores(1))
+        r.qc = 'failed: no magnitude sign pattern produced a finite fit';
+        r.qcReasons = {r.qc};
+        return
+    end
+    best = candidate(order(1));
+
+    signAmbiguous = false;
+    if numel(order) >= 2 && isfinite(sortedScores(2))
+        signalScale = max(sum(magnitudeSignal.^2), eps);
+        closeScore = sortedScores(2) <= opts.signAmbiguityRatio * ...
+            max(sortedScores(1), eps * signalScale);
+        differentRate = abs(log(candidate(order(2)).R1 / best.R1)) > ...
+            opts.signAmbiguityLogRateDifference;
+        signAmbiguous = closeScore && differentRate;
+    end
+
+    beta = best.beta;
+    ySigned = best.ySigned;
+    prediction = best.prediction;
+    % Overall polarity is unknowable from magnitude. Orient the curve so the
+    % exponential coefficient is negative, matching B - C exp(-R1 t).
+    if beta(2) > 0
+        beta = -beta;
+        ySigned = -ySigned;
+        prediction = -prediction;
+    end
+    B = beta(1);
+    C = max(-beta(2), 0);
+    residual = ySigned - prediction;
+    n = numel(t);
+    dfe = max(n - 3, 1);
+    sse = sum(residual.^2);
+    sst = sum((ySigned - mean(ySigned)).^2);
+    rmse = sqrt(sse / dfe);
+    scaleAmplitude = max([C, max(abs(ySigned - median(ySigned))), eps]);
+    noiseSigma = robustRealScale(residual);
+
+    [R1CI, ciOpen] = profileRateCI(t, ySigned, best.weights, ...
+        best.R1, n, 3, opts);
+    T1CI = rateCiToT1Ci(R1CI);
+    zCritical = sqrt(2) * erfinv(opts.confidenceLevel);
+
+    r.ok = isfinite(best.R1) && best.R1 > 0;
+    r.B = B;
+    r.C = C;
+    r.S0 = B - C;
+    r.Sinf = B;
+    r.R1 = best.R1;
+    r.T1ms = 1000 / best.R1;
+    r.R1CI95 = R1CI;
+    r.T1CI95 = T1CI;
+    r.R1SE = intervalToSE(R1CI, zCritical);
+    r.T1SE = intervalToSE(T1CI, zCritical);
+    if any(ciOpen)
+        r.R1SE = NaN;
+        r.T1SE = NaN;
+    end
+    r.displaySignal = ySigned;
+    r.displayFit = prediction;
+    r.residual = residual;
+    r.weights = best.weights;
+    r.outlierIndices = find(best.weights < opts.outlierWeightThreshold).';
+    r.noiseSigma = noiseSigma;
+    r.dynamicSNR = C / max(noiseSigma, eps);
+    r.sse = sse;
+    r.rsquare = safeRsquare(sse, sst);
+    r.rmse = rmse;
+    r.nrmse = rmse / scaleAmplitude;
+    r.dfe = dfe;
+    r.boundHit = best.boundHit;
+    r.ciOpen = ciOpen;
+    % signChangeIndex is the number of negative samples in the final,
+    % increasing orientation. It is n for a wholly negative -M0-to-zero
+    % recovery, zero for a wholly positive saturation recovery, and an
+    % interior index for a genuine zero crossing.
+    r.signChangeIndex = sum(ySigned < 0);
+    if r.signChangeIndex > 0 && r.signChangeIndex < n
+        r.reliableSignTransitions = 1;
+    else
+        r.reliableSignTransitions = 0;
+    end
+    r.signAmbiguous = signAmbiguous;
+    r.zeroCrossingSeconds = zeroCrossingTime(B, C, best.R1);
+    r.candidateRates = [candidate.R1];
+    r.candidateScores = scores;
+    r = applyQualityControl(r, opts);
+end
+
+function c = fitSignedCandidate(t, y, magnitudeSignal, desiredSigns, signIndex, opts)
+    c = emptyMagnitudeCandidate();
+    c.signChangeIndex = signIndex;
+    weights = ones(size(t));
+    previousR = NaN;
+    for iteration = 1:max(1, opts.robustIterations)
+        [R1, beta, ~, boundHit] = optimiseRate(t, y, weights, opts);
+        prediction = affinePrediction(t, R1, beta);
+        residual = y - prediction;
+        noiseSigma = robustRealScale(residual);
+        if ~opts.robust
+            break
+        end
+        newWeights = huberWeights(abs(residual), noiseSigma, opts);
+        if isfinite(previousR)
+            rateChange = abs(log(R1 / previousR));
+        else
+            rateChange = Inf;
+        end
+        weightChange = max(abs(newWeights - weights));
+        weights = 0.5 * weights + 0.5 * newWeights;
+        previousR = R1;
+        if rateChange < opts.robustTolerance && weightChange < opts.robustTolerance
+            break
+        end
+    end
+    [R1, beta, ~, boundHit] = optimiseRate(t, y, weights, opts);
+    prediction = affinePrediction(t, R1, beta);
+    residual = y - prediction;
+    noiseSigma = robustRealScale(residual);
+    % Use the ordinary residual energy for choosing the polarity branch.
+    % Allowing every branch to hide different samples with robust weights can
+    % otherwise reward an implausible sign pattern. Robust weights are still
+    % retained for the final parameter estimate after the branch is selected.
+    score = sum(residual.^2);
+
+    % A candidate sign pattern is only meaningful if the fitted signed curve
+    % follows it away from the noise floor. Penalise clear inconsistencies.
+    strong = magnitudeSignal > 2 * max(noiseSigma, eps);
+    predictedSigns = sign(prediction);
+    predictedSigns(predictedSigns == 0) = desiredSigns(predictedSigns == 0);
+    mismatch = strong & predictedSigns ~= desiredSigns;
+    if any(mismatch)
+        score = score + 4 * sum(magnitudeSignal(mismatch).^2);
+    end
+    if boundHit
+        score = score + opts.boundCandidatePenaltyFraction * ...
+            max(sum(magnitudeSignal.^2), eps);
+    end
+    if signIndex > 0 && beta(2) >= 0
+        % An interior negative-to-positive branch must be increasing. A
+        % non-negative exponential coefficient describes a decreasing curve
+        % and is therefore not a physically admissible orientation.
         score = Inf;
-
-        if isempty(gof) || ~isfinite(gof.rmse)
-            return
-        end
-
-        score = gof.rmse;
-
-        % Penalise flipping more points.
-        score = score .* (1 + 0.20 .* nFlips);
-
-        % Penalise fits that hit parameter bounds.
-        if numel(p) >= 5
-
-            R1 = p(3);
-            phi1 = p(5);
-
-            if isfinite(R1) && R1 > 0.95 .* ub(3)
-                score = score .* 1.25;
-            end
-
-            if isfinite(phi1) && abs(phi1) > 0.95 .* ub(5)
-                score = score .* 1.20;
-            end
-        end
-
-        [imagFrac, ~] = imaginaryFractionAfterFit(p, xs, z_used);
-
-        if isfinite(imagFrac)
-            score = score .* (1 + 0.5 .* imagFrac);
-        end
-
     end
 
-    % ==========================================================
-    % Nested helper: imaginary-component diagnostic
-    % ==========================================================
-    function [imagFrac, scale] = imaginaryFractionAfterFit(p, xs, z_used)
+    c.R1 = R1;
+    c.beta = beta;
+    c.ySigned = y;
+    c.prediction = prediction;
+    c.weights = weights;
+    c.score = score;
+    c.boundHit = boundHit;
+end
 
-        imagFrac = NaN;
-        scale = NaN;
+function count = countReliableSignTransitions(signal, noiseSigma, amplitude)
+    signal = real(signal(:));
+    threshold = max(2 * max(noiseSigma, eps), 0.05 * max(amplitude, eps));
+    reliable = abs(signal) > threshold & isfinite(signal);
+    signs = sign(signal(reliable));
+    if numel(signs) < 2
+        count = 0;
+    else
+        count = sum(signs(2:end) ~= signs(1:end-1));
+    end
+end
 
-        if isempty(z_used) || isempty(xs) || numel(p) < 5
-            return
+
+% ========================================================================
+% Joint multi-field fitting
+% ========================================================================
+
+function diagnostics = emptyJointDiagnostics(evolutionFields_mT, opts)
+    diagnostics = struct( ...
+        'attempted', false, ...
+        'used', false, ...
+        'modelName', ...
+            'joint_multifield_inversion_constrained_variable_projection', ...
+        'modelEquation', ['S_f(t) = M0_D*[r_f*(1-exp(-R1_f*t)) - ', ...
+            'alpha_f*exp(-R1_f*t)]'], ...
+        'representation', 'per-field phase-projected/signed ROI signal', ...
+        'paperRelation', ['M0_D=C*B_D; r_f=B_E,f/B_D; ', ...
+            'S_f(0)=-M0_D*alpha_f'], ...
+        'fields_mT', evolutionFields_mT(:).', ...
+        'fieldRatios', nan(size(evolutionFields_mT(:).')), ...
+        'detectionField_mT', opts.detectionField_mT, ...
+        'detectionFieldInferred', isnan(opts.detectionField_mT), ...
+        'minimumAlpha', opts.jointMinimumAlpha, ...
+        'timeWeightingEnabled', opts.jointTimeWeighting, ...
+        'configuredLateTimeWeight', opts.jointLateTimeWeight, ...
+        'lateTimeWeight', 1 + double(opts.jointTimeWeighting) * ...
+            (opts.jointLateTimeWeight - 1), ...
+        'timeWeightExponent', opts.jointTimeWeightExponent, ...
+        'timeWeights', {cell(1, numel(evolutionFields_mT))}, ...
+        'eligibleFieldIndices', [], ...
+        'excludedFieldIndices', [], ...
+        'initialR1', nan(size(evolutionFields_mT(:).')), ...
+        'finalR1', nan(size(evolutionFields_mT(:).')), ...
+        'initialSharedM0Detection', NaN, ...
+        'sharedM0Detection', NaN, ...
+        'sharedCPer_mT', NaN, ...
+        'inversionAmplitude', nan(size(evolutionFields_mT(:).')), ...
+        'Q', nan(size(evolutionFields_mT(:).')), ...
+        'alpha', nan(size(evolutionFields_mT(:).')), ...
+        'noisePrecision', nan(size(evolutionFields_mT(:).')), ...
+        'magnitudeBranchIndex', nan(size(evolutionFields_mT(:).')), ...
+        'weightedSSE', NaN, ...
+        'globalDfe', NaN, ...
+        'normalMatrixRcond', NaN, ...
+        'rateUncertaintyMethod', ...
+            'approximate joint weighted-Jacobian covariance', ...
+        'robustIterations', 0, ...
+        'rateSweeps', 0, ...
+        'optimizerFunctionEvaluations', 0, ...
+        'converged', false, ...
+        'failureIdentifier', '', ...
+        'failureMessage', '');
+end
+
+function [updatedResults, diagnostics] = fitJointMultiField( ...
+        initialResults, evolutionFields_mT, opts)
+    diagnostics = emptyJointDiagnostics(evolutionFields_mT, opts);
+    diagnostics.attempted = true;
+    updatedResults = initialResults;
+
+    evolutionFields_mT = double(evolutionFields_mT(:).');
+    if any(~isfinite(evolutionFields_mT)) || any(evolutionFields_mT < 0)
+        error('T1dispersion:InvalidJointFields', ...
+            'Joint fitting requires finite, non-negative evolution fields.');
+    end
+    positiveFields = evolutionFields_mT(evolutionFields_mT > 0);
+    if isempty(positiveFields)
+        error('T1dispersion:NoPositiveJointField', ...
+            'At least one positive evolution field is required.');
+    end
+    if isnan(opts.detectionField_mT)
+        detectionField_mT = max(positiveFields);
+    else
+        detectionField_mT = opts.detectionField_mT;
+    end
+    fieldRatios = evolutionFields_mT ./ detectionField_mT;
+    diagnostics.detectionField_mT = detectionField_mT;
+    diagnostics.fieldRatios = fieldRatios;
+
+    eligible = false(1, numel(initialResults));
+    for jointEligibilityIndex = 1:numel(initialResults)
+        candidateResult = initialResults(jointEligibilityIndex);
+        eligible(jointEligibilityIndex) = ...
+            numel(candidateResult.tSeconds) >= opts.minimumPoints && ...
+            numel(candidateResult.displaySignal) == ...
+                numel(candidateResult.tSeconds) && ...
+            all(isfinite(candidateResult.tSeconds(:))) && ...
+            all(isfinite(real(candidateResult.displaySignal(:))));
+    end
+    eligibleIndices = find(eligible);
+    diagnostics.eligibleFieldIndices = eligibleIndices;
+    diagnostics.excludedFieldIndices = find(~eligible);
+    if numel(eligibleIndices) < opts.jointMinimumFields
+        diagnostics.failureIdentifier = 'T1dispersion:InsufficientJointFields';
+        diagnostics.failureMessage = sprintf( ...
+            'Only %d fields contain enough signed samples for a joint fit.', ...
+            numel(eligibleIndices));
+        if ~opts.jointFallbackToIndependent
+            error(diagnostics.failureIdentifier, '%s', ...
+                diagnostics.failureMessage);
         end
-
-        phi0 = p(4);
-        phi1 = p(5);
-
-        phase_fit = phi0 + phi1 .* xs(:);
-
-        z_rot = z_used(:) .* exp(-1i .* phase_fit);
-
-        y_real = real(z_rot);
-        y_imag = imag(z_rot);
-
-        scale = median(abs(y_real), 'omitnan');
-
-        if ~isfinite(scale) || scale == 0
-            scale = median(abs(z_used), 'omitnan');
-        end
-
-        if ~isfinite(scale) || scale == 0
-            return
-        end
-
-        imagFrac = median(abs(y_imag), 'omitnan') ./ scale;
-
+        return
     end
 
-    % ==========================================================
-    % Nested helper: manual polarity correction loop
-    % ==========================================================
-    function [p, ci, gof, xs, z_used, residual_complex, manual_flip_idx] = ...
-        manualPolarityCorrectionLoop( ...
-            field_index, p, ci, gof, xs, z_used, residual_complex, ...
-            R1start_centre, lb, ub, lsqOpts, auto_flip_idx)
-
-        manual_flip_idx = [];
-
-        h = figure('Name', sprintf('Manual polarity correction: field %d', field_index));
-
-        while true
-
-            drawManualComplexFitFigure( ...
-                h, field_index, xs, z_used, p, gof, manual_flip_idx, auto_flip_idx);
-
-            fprintf('\nField %d manual correction:\n', field_index);
-            fprintf('  Left-click a point to flip its polarity and refit.\n');
-            fprintf('  Press Enter or right-click to accept and continue.\n');
-            fprintf('  Press u to undo the most recent manual flip.\n');
-
-            figure(h);
-
-            try
-                [xclick, yclick, button] = ginput(1);
-            catch
-                break
-            end
-
-            if isempty(button)
-                break
-            end
-
-            if button == 3
-                break
-            end
-
-            % Keyboard undo
-            if button == double('u') || button == double('U')
-                if ~isempty(manual_flip_idx)
-
-                    undo_idx = manual_flip_idx(end);
-                    z_used(undo_idx) = -z_used(undo_idx);
-                    manual_flip_idx(end) = [];
-
-                    R1start_refit = p(3);
-                    if ~isfinite(R1start_refit) || R1start_refit <= 0
-                        R1start_refit = R1start_centre;
-                    end
-
-                    [p2, ci2, gof2, ok2, xs2, z2, residual2] = fitComplexFcModelAuto( ...
-                        xs .* 1000, z_used, R1start_refit, lb, ub, lsqOpts, p);
-
-                    if ok2
-                        p = p2;
-                        ci = ci2;
-                        gof = gof2;
-                        xs = xs2;
-                        z_used = z2;
-                        residual_complex = residual2;
-                    else
-                        z_used(undo_idx) = -z_used(undo_idx);
-                        manual_flip_idx(end+1) = undo_idx;
-
-                        warndlg('Undo caused the refit to fail, so it was reverted.', ...
-                            'Refit failed');
-                    end
-                end
-
-                continue
-            end
-
-            % Only left-click flips a point
-            if button ~= 1
-                continue
-            end
-
-            idx = nearestRealFitPoint(xs, z_used, p, xclick, yclick);
-
-            if isempty(idx) || ~isfinite(idx)
-                continue
-            end
-
-            msg = sprintf(['Flip polarity of point %d?\n\n', ...
-                           'Evolution time = %.4g s\n', ...
-                           'This will multiply the complex ROI point by -1 and refit.'], ...
-                           idx, xs(idx));
-
-            choice = questdlg(msg, ...
-                'Manual polarity correction', ...
-                'Flip and refit', 'Cancel', 'Flip and refit');
-
-            if ~strcmp(choice, 'Flip and refit')
-                continue
-            end
-
-            z_old = z_used;
-            p_old = p;
-            ci_old = ci;
-            gof_old = gof;
-            xs_old = xs;
-            residual_old = residual_complex;
-            flips_old = manual_flip_idx;
-
-            z_used(idx) = -z_used(idx);
-
-            R1start_refit = p(3);
-            if ~isfinite(R1start_refit) || R1start_refit <= 0
-                R1start_refit = R1start_centre;
-            end
-
-            [p2, ci2, gof2, ok2, xs2, z2, residual2] = fitComplexFcModelAuto( ...
-                xs .* 1000, z_used, R1start_refit, lb, ub, lsqOpts, p);
-
-            if ok2
-                p = p2;
-                ci = ci2;
-                gof = gof2;
-                xs = xs2;
-                z_used = z2;
-                residual_complex = residual2;
-
-                if any(manual_flip_idx == idx)
-                    manual_flip_idx(manual_flip_idx == idx) = [];
-                else
-                    manual_flip_idx(end+1) = idx;
-                end
-            else
-                z_used = z_old;
-                p = p_old;
-                ci = ci_old;
-                gof = gof_old;
-                xs = xs_old;
-                residual_complex = residual_old;
-                manual_flip_idx = flips_old;
-
-                warndlg('The polarity flip caused the refit to fail, so it was reverted.', ...
-                    'Refit failed');
-            end
-        end
-
-        if isgraphics(h)
-            close(h);
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: draw interactive fit figure
-    % ==========================================================
-    function drawManualComplexFitFigure(h, field_index, xs, z_used, p, gof, manual_flip_idx, auto_flip_idx)
-
-        if ~isgraphics(h)
-            return
-        end
-
-        figure(h);
-        clf(h);
-
-        A    = p(1);
-        B    = p(2);
-        R1   = p(3);
-        phi0 = p(4);
-        phi1 = p(5);
-
-        phase_fit = phi0 + phi1 .* xs(:);
-        z_rot = z_used .* exp(-1i .* phase_fit);
-
-        y_real = real(z_rot);
-        y_imag = imag(z_rot);
-
-        xfit = linspace(min(xs), max(xs), 300).';
-        yfit = A .* exp(-xfit .* R1) + B;
-
-        plot(xs, y_real, 'o', ...
-            'DisplayName', 'Real data after fitted phase correction');
-        hold on;
-
-        plot(xs, y_imag, 'x', ...
-            'DisplayName', 'Imaginary component after fitted phase correction');
-
-        plot(xfit, yfit, '-', ...
-            'DisplayName', 'Real exponential fit');
-
-        yline(0, '--', 'DisplayName', 'Zero');
-
-        if nargin >= 8 && ~isempty(auto_flip_idx)
-            auto_flip_idx = auto_flip_idx(auto_flip_idx >= 1 & auto_flip_idx <= numel(xs));
-            if ~isempty(auto_flip_idx)
-                plot(xs(auto_flip_idx), y_real(auto_flip_idx), 'd', ...
-                    'MarkerSize', 10, ...
-                    'LineWidth', 1.5, ...
-                    'DisplayName', 'Automatically flipped point(s)');
-            end
-        end
-
-        if ~isempty(manual_flip_idx)
-            manual_flip_idx = manual_flip_idx(manual_flip_idx >= 1 & manual_flip_idx <= numel(xs));
-
-            if ~isempty(manual_flip_idx)
-                plot(xs(manual_flip_idx), y_real(manual_flip_idx), 's', ...
-                    'MarkerSize', 10, ...
-                    'LineWidth', 1.5, ...
-                    'DisplayName', 'Manually flipped point(s)');
-            end
-        end
-
-        hold off;
-        grid on;
-
-        xlabel('Evolution time (s)');
-        ylabel('Signal (AU)');
-
-        title(sprintf(['Field %d: R1 = %.4g s^{-1}, T1 = %.4g ms, ', ...
-                       'A = %.4g, B = %.4g, phi0 = %.2f rad, phi1 = %.2f rad/s, R^2 = %.4f\n', ...
-                       'Left-click point to flip polarity and refit. Enter/right-click accepts. u undoes.'], ...
-            field_index, R1, 1000 ./ R1, A, B, phi0, phi1, gof.rsquare));
-
-        legend('Location', 'best');
-        drawnow;
-
-    end
-
-    % ==========================================================
-    % Nested helper: static fit figure
-    % ==========================================================
-    function showStaticFitFigure(field_index, p, gof, xs, z_used, auto_flip_idx)
-
-        h = figure;
-
-        drawManualComplexFitFigure(h, field_index, xs, z_used, p, gof, [], auto_flip_idx);
-
-        try
-            waitforbuttonpress;
-            close(h);
-        catch
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: nearest plotted real point
-    % ==========================================================
-    function idx = nearestRealFitPoint(xs, z_used, p, xclick, yclick)
-
-        idx = [];
-
-        if isempty(xs) || isempty(z_used) || numel(p) < 5
-            return
-        end
-
-        phi0 = p(4);
-        phi1 = p(5);
-
-        phase_fit = phi0 + phi1 .* xs(:);
-        z_rot = z_used .* exp(-1i .* phase_fit);
-
-        y_real = real(z_rot);
-
-        ax = gca;
-        xl = xlim(ax);
-        yl = ylim(ax);
-
-        xrange = diff(xl);
-        yrange = diff(yl);
-
-        if xrange == 0 || ~isfinite(xrange)
-            xrange = max(range(xs), eps);
-        end
-
-        if yrange == 0 || ~isfinite(yrange)
-            yrange = max(range(y_real), eps);
-        end
-
-        d2 = ((xs(:) - xclick) ./ xrange).^2 + ...
-             ((y_real(:) - yclick) ./ yrange).^2;
-
-        [~, idx] = min(d2);
-
-    end
-
-    % ==========================================================
-    % Nested helper: optional single-point trimming
-    % ==========================================================
-    function [bestP, bestCi, bestGof, okBest, bestXs, bestZ, bestResidual, bestRemoved] = ...
-        fitComplexFcModelWithSingleTrim( ...
-            x_ms, z, R1start_centre, lb, ub, lsqOpts, p_hint)
-
-        okBest = false;
-
-        bestP = nan(1, numel(lb));
-        bestCi = nan(2, numel(lb));
-        bestGof = emptyGof(Inf);
-        bestXs = [];
-        bestZ = [];
-        bestResidual = [];
-        bestRemoved = [];
-
-        x_ms = x_ms(:);
-        z = z(:);
-
-        [x_ms_sorted, ord] = sort(x_ms);
-        z_sorted = z(ord);
-
-        nPts = numel(z_sorted);
-
-        if nPts < 6
-            return
-        end
-
-        for remove_idx = 1:nPts
-
-            keep = true(nPts,1);
-            keep(remove_idx) = false;
-
-            [p_try, ci_try, gof_try, ok_try, xs_try, z_try, residual_try] = ...
-                fitComplexFcModelAuto( ...
-                    x_ms_sorted(keep), z_sorted(keep), ...
-                    R1start_centre, lb, ub, lsqOpts, p_hint);
-
-            if ~ok_try
-                continue
-            end
-
-            if ~okBest || gof_try.rmse < bestGof.rmse
-                bestP = p_try;
-                bestCi = ci_try;
-                bestGof = gof_try;
-                bestXs = xs_try;
-                bestZ = z_try;
-                bestResidual = residual_try;
-                bestRemoved = remove_idx;
-                okBest = true;
-            end
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: approximate confidence intervals
-    % ==========================================================
-    function ci = approximateParameterCi(p, resnorm, J, dfe)
-
-        ci = nan(2, numel(p));
-
-        if isempty(J) || dfe <= 0 || ~all(isfinite(p))
-            return
-        end
-
-        try
-            mse = resnorm ./ dfe;
-            JTJ = full(J.' * J);
-            covp = mse .* pinv(JTJ);
-
-            se = sqrt(max(diag(covp), 0)).';
-
-            ci(1,:) = p - 1.96 .* se;
-            ci(2,:) = p + 1.96 .* se;
-
-        catch
-            ci = nan(2, numel(p));
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: empty gof struct
-    % ==========================================================
-    function gof = emptyGof(sseValue)
-
-        gof = struct( ...
-            'sse',        sseValue, ...
-            'rsquare',    NaN, ...
-            'adjrsquare', NaN, ...
-            'dfe',        NaN, ...
-            'rmse',       NaN, ...
-            'exitflag',   NaN);
-
-    end
-
-    % ==========================================================
-    % Nested helper: normalise parameter vector to [A B R1 phi0 phi1]
-    % ==========================================================
-    function p = normaliseParamVector(p)
-
-        if isempty(p)
-            return
-        end
-
-        p = p(:).';
-
-        if numel(p) == 4
-            p = [p, 0];
-        elseif numel(p) > 5
-            p = p(1:5);
-        elseif numel(p) < 4
-            p = [];
-        end
-
-    end
-
-    % ==========================================================
-    % Nested helper: wrap angle to [-pi, pi]
-    % ==========================================================
-    function phi = wrapPiLocal(phi)
-        phi = mod(phi + pi, 2*pi) - pi;
-    end
-
-    % ==========================================================
-    % Nested helper: property/field detection
-    % ==========================================================
-    function tf = hasProp(s, name)
-
-        if isobject(s)
-            tf = isprop(s, name);
+    jointData = repmat(emptyJointFieldData(), 1, numel(eligibleIndices));
+    for jointLocalIndex = 1:numel(eligibleIndices)
+        globalIndex = eligibleIndices(jointLocalIndex);
+        sourceResult = initialResults(globalIndex);
+        jointData(jointLocalIndex).globalFieldIndex = globalIndex;
+        jointData(jointLocalIndex).t = double(sourceResult.tSeconds(:));
+        jointData(jointLocalIndex).timeWeights = jointTimeWeights( ...
+            jointData(jointLocalIndex).t, opts);
+        diagnostics.timeWeights{globalIndex} = ...
+            jointData(jointLocalIndex).timeWeights;
+        jointData(jointLocalIndex).y = real(sourceResult.displaySignal(:));
+        jointData(jointLocalIndex).isMagnitude = ...
+            strcmp(sourceResult.method, 'magnitude_all_zero_crossings');
+        if jointData(jointLocalIndex).isMagnitude
+            jointData(jointLocalIndex).magnitude = ...
+                abs(real(sourceResult.rawSignal(:)));
         else
-            tf = isfield(s, name);
+            jointData(jointLocalIndex).magnitude = [];
         end
-
+        if numel(sourceResult.weights) == numel(sourceResult.tSeconds) && ...
+                all(isfinite(sourceResult.weights(:)))
+            jointData(jointLocalIndex).robustWeights = min(max( ...
+                double(sourceResult.weights(:)), opts.minimumWeight), 1);
+        else
+            jointData(jointLocalIndex).robustWeights = ...
+                ones(size(jointData(jointLocalIndex).t));
+        end
+        jointData(jointLocalIndex).noiseSigma = sourceResult.noiseSigma;
+        jointData(jointLocalIndex).branchIndex = ...
+            sourceResult.signChangeIndex;
+        jointData(jointLocalIndex).signAmbiguous = ...
+            sourceResult.signAmbiguous;
     end
 
-    % ==========================================================
-    % Nested helper: safe object/struct assignment
-    % ==========================================================
-    function s = safeSet(s, name, value)
+    eligibleRatios = fieldRatios(eligibleIndices);
+    initialRates = initialJointRates(initialResults(eligibleIndices), ...
+        evolutionFields_mT(eligibleIndices), opts);
+    diagnostics.initialR1(eligibleIndices) = initialRates;
+    noisePrecision = jointNoisePrecision(jointData, opts);
+    diagnostics.noisePrecision(eligibleIndices) = noisePrecision;
 
-        try
-            if isobject(s)
-                if isprop(s, name)
-                    s.(name) = value;
-                end
+    % The independent magnitude fit is deliberately permissive and can
+    % initialise a monotonically increasing magnitude trace as all-positive.
+    % Before the first joint solve, reconstruct every magnitude branch against
+    % a robust estimate of the shared equilibrium scale using the actual
+    % inversion constraint S_f(0)<=-alpha_min*M0_D.
+    initialSharedM0 = estimateInitialJointM0( ...
+        initialResults(eligibleIndices), jointData, eligibleRatios);
+    diagnostics.initialSharedM0Detection = initialSharedM0;
+    initialBranchWeights = cell(1, numel(jointData));
+    for initialBranchIndex = 1:numel(jointData)
+        initialBranchWeights{initialBranchIndex} = ...
+            jointData(initialBranchIndex).robustWeights;
+    end
+    [jointData, ~, branchRates] = refineJointMagnitudeBranches( ...
+        jointData, eligibleRatios, initialSharedM0, ...
+        initialBranchWeights, opts);
+    validBranchRates = isfinite(branchRates) & branchRates > 0;
+    initialRates(validBranchRates) = branchRates(validBranchRates);
+
+    totalSignPasses = max(1, opts.jointSignIterations);
+    jointFit = struct();
+    for jointSignPass = 1:totalSignPasses
+        jointFit = runJointRobustFit(jointData, eligibleRatios, ...
+            initialRates, noisePrecision, opts);
+        initialRates = jointFit.rates;
+        if jointSignPass >= totalSignPasses
+            break
+        end
+        [jointData, branchesChanged, branchRates] = ...
+            refineJointMagnitudeBranches( ...
+            jointData, eligibleRatios, jointFit.sharedM0, ...
+            jointFit.robustWeights, opts);
+        validBranchRates = isfinite(branchRates) & branchRates > 0;
+        initialRates(validBranchRates) = branchRates(validBranchRates);
+        if ~branchesChanged
+            break
+        end
+    end
+
+    [rateSE, covarianceInfo] = jointRateUncertainty(jointData, ...
+        eligibleRatios, jointFit, opts);
+    updatedResults = updateJointFieldResults(initialResults, jointData, ...
+        eligibleIndices, fieldRatios, jointFit, rateSE, opts);
+
+    diagnostics.used = true;
+    diagnostics.finalR1(eligibleIndices) = jointFit.rates;
+    diagnostics.sharedM0Detection = jointFit.sharedM0;
+    diagnostics.sharedCPer_mT = jointFit.sharedM0 / detectionField_mT;
+    diagnostics.inversionAmplitude(eligibleIndices) = ...
+        jointFit.inversionAmplitude;
+    diagnostics.Q(eligibleIndices) = jointFit.Q;
+    diagnostics.alpha(eligibleIndices) = jointFit.alpha;
+    diagnostics.weightedSSE = jointFit.weightedSSE;
+    diagnostics.globalDfe = covarianceInfo.dfe;
+    diagnostics.normalMatrixRcond = covarianceInfo.normalMatrixRcond;
+    diagnostics.robustIterations = jointFit.robustIterations;
+    diagnostics.rateSweeps = jointFit.rateSweeps;
+    diagnostics.optimizerFunctionEvaluations = ...
+        jointFit.optimizerFunctionEvaluations;
+    diagnostics.converged = jointFit.converged;
+    for jointLocalIndex = 1:numel(eligibleIndices)
+        diagnostics.magnitudeBranchIndex(eligibleIndices(jointLocalIndex)) = ...
+            jointData(jointLocalIndex).branchIndex;
+    end
+end
+
+function data = emptyJointFieldData()
+    data = struct('globalFieldIndex', NaN, 't', [], 'y', [], ...
+        'magnitude', [], 'isMagnitude', false, 'robustWeights', [], ...
+        'timeWeights', [], 'noiseSigma', NaN, 'branchIndex', NaN, ...
+        'signAmbiguous', false);
+end
+
+function weights = jointTimeWeights(time, opts)
+    time = double(time(:));
+    weights = ones(size(time));
+    if ~opts.jointTimeWeighting || numel(time) < 2 || ...
+            opts.jointLateTimeWeight == 1
+        return
+    end
+    timeMinimum = min(time);
+    timeSpan = max(time) - timeMinimum;
+    if ~isfinite(timeSpan) || timeSpan <= eps(max(abs(time)))
+        return
+    end
+    normalizedTime = min(max((time - timeMinimum) ./ timeSpan, 0), 1);
+    weights = 1 + (opts.jointLateTimeWeight - 1) .* ...
+        normalizedTime .^ opts.jointTimeWeightExponent;
+    % Keep each field's total leverage unchanged. Only its distribution over
+    % evolution time changes, so fields with longer absolute schedules do not
+    % dominate fields acquired on shorter schedules.
+    weights = weights ./ mean(weights);
+end
+
+function rates = initialJointRates(initialResults, eligibleFields_mT, opts)
+    rateLower = opts.R1Bounds(1);
+    rateUpper = opts.R1Bounds(2);
+    rates = nan(1, numel(initialResults));
+    reliable = false(size(rates));
+    for jointInitialIndex = 1:numel(initialResults)
+        value = initialResults(jointInitialIndex).R1;
+        if isfinite(value) && value > rateLower && value < rateUpper
+            rates(jointInitialIndex) = value;
+            reliable(jointInitialIndex) = ...
+                ~initialResults(jointInitialIndex).boundHit;
+        end
+    end
+    if any(reliable)
+        reliableIndices = find(reliable);
+        positiveEligibleFields = eligibleFields_mT(eligibleFields_mT > 0);
+        if isempty(positiveEligibleFields)
+            fieldFloor = 1;
+        else
+            fieldFloor = min(positiveEligibleFields) / 10;
+        end
+        logarithmicFields = log(max(eligibleFields_mT, fieldFloor));
+        for missingIndex = find(~reliable)
+            [~, nearestPosition] = min(abs( ...
+                logarithmicFields(reliableIndices) - ...
+                logarithmicFields(missingIndex)));
+            rates(missingIndex) = ...
+                rates(reliableIndices(nearestPosition));
+        end
+    else
+        rates(:) = sqrt(rateLower * rateUpper);
+    end
+    rates(~isfinite(rates)) = sqrt(rateLower * rateUpper);
+    rates = min(max(rates, rateLower * (1 + 1e-6)), ...
+        rateUpper * (1 - 1e-6));
+end
+
+function sharedM0 = estimateInitialJointM0( ...
+        initialResults, jointData, fieldRatios)
+    maximumRatio = max(fieldRatios);
+    preferredCandidates = [];
+    fallbackCandidates = [];
+    for jointM0Index = 1:numel(initialResults)
+        ratio = fieldRatios(jointM0Index);
+        asymptote = initialResults(jointM0Index).B;
+        if ratio <= 0 || ~isfinite(asymptote) || asymptote <= 0
+            continue
+        end
+        candidate = asymptote / ratio;
+        if ~isfinite(candidate) || candidate <= 0
+            continue
+        end
+        fallbackCandidates(end + 1) = candidate; %#ok<AGROW>
+        if ratio >= 0.25 * maximumRatio && ...
+                ~initialResults(jointM0Index).boundHit
+            preferredCandidates(end + 1) = candidate; %#ok<AGROW>
+        end
+    end
+    if ~isempty(preferredCandidates)
+        candidates = preferredCandidates;
+    else
+        candidates = fallbackCandidates;
+    end
+    if ~isempty(candidates)
+        centre = median(candidates);
+        consistent = candidates >= centre / 10 & candidates <= centre * 10;
+        if any(consistent)
+            candidates = candidates(consistent);
+        end
+        sharedM0 = median(candidates);
+        return
+    end
+
+    % Last-resort scale estimate from the field with the largest equilibrium
+    % ratio. It is used only to initialise polarity; the joint fit re-estimates
+    % M0_D immediately afterwards.
+    [largestRatio, largestIndex] = max(fieldRatios);
+    if largestRatio > 0
+        observations = abs(real(jointData(largestIndex).y(:)));
+        observations = observations(isfinite(observations));
+        if ~isempty(observations)
+            sharedM0 = max(observations) / largestRatio;
+        else
+            sharedM0 = 1;
+        end
+    else
+        sharedM0 = 1;
+    end
+    sharedM0 = max(sharedM0, eps);
+end
+
+function precision = jointNoisePrecision(jointData, opts)
+    precision = ones(1, numel(jointData));
+    if ~opts.jointNoiseWeighting
+        return
+    end
+    sigma = nan(size(precision));
+    for jointNoiseIndex = 1:numel(jointData)
+        value = jointData(jointNoiseIndex).noiseSigma;
+        if isfinite(value) && value > eps
+            sigma(jointNoiseIndex) = value;
+        end
+    end
+    validSigma = sigma(isfinite(sigma) & sigma > 0);
+    if isempty(validSigma)
+        return
+    end
+    referenceSigma = median(validSigma);
+    sigma(~isfinite(sigma) | sigma <= 0) = referenceSigma;
+    precision = (referenceSigma ./ sigma).^2;
+    precision = min(max(precision, ...
+        1 / opts.jointMaximumNoiseWeightRatio), ...
+        opts.jointMaximumNoiseWeightRatio);
+end
+
+function fit = runJointRobustFit(jointData, fieldRatios, ...
+        initialRates, noisePrecision, opts)
+    robustWeights = cell(1, numel(jointData));
+    for jointWeightIndex = 1:numel(jointData)
+        robustWeights{jointWeightIndex} = ...
+            jointData(jointWeightIndex).robustWeights(:);
+    end
+    rates = initialRates;
+    previousRates = nan(size(rates));
+    previousM0 = NaN;
+    totalSweeps = 0;
+    totalFunctionEvaluations = 0;
+    converged = false;
+
+    for jointRobustIndex = 1:max(1, opts.jointRobustIterations)
+        totalWeights = combineJointWeights( ...
+            robustWeights, noisePrecision, jointData);
+        [rates, linearFit, optimizerInfo] = optimiseJointRates( ...
+            jointData, fieldRatios, totalWeights, rates, opts);
+        totalSweeps = totalSweeps + optimizerInfo.sweeps;
+        totalFunctionEvaluations = totalFunctionEvaluations + ...
+            optimizerInfo.functionEvaluations;
+
+        newRobustWeights = cell(size(robustWeights));
+        maximumWeightChange = 0;
+        for jointResidualIndex = 1:numel(jointData)
+            residual = linearFit.residual{jointResidualIndex};
+            noiseSigma = robustRealScale(residual);
+            if opts.robust
+                proposedWeights = huberWeights(abs(residual), ...
+                    noiseSigma, opts);
+                newRobustWeights{jointResidualIndex} = ...
+                    0.5 .* robustWeights{jointResidualIndex} + ...
+                    0.5 .* proposedWeights;
             else
-                s.(name) = value;
+                newRobustWeights{jointResidualIndex} = ...
+                    ones(size(residual));
             end
-        catch
-            % Do not fail the fit because a convenience property does not exist.
+            maximumWeightChange = max(maximumWeightChange, max(abs( ...
+                newRobustWeights{jointResidualIndex} - ...
+                robustWeights{jointResidualIndex})));
         end
-
+        if all(isfinite(previousRates))
+            maximumRateChange = max(abs(log(rates ./ previousRates)));
+        else
+            maximumRateChange = Inf;
+        end
+        if isfinite(previousM0)
+            m0Change = abs(linearFit.sharedM0 - previousM0) / ...
+                max(abs(previousM0), eps);
+        else
+            m0Change = Inf;
+        end
+        robustWeights = newRobustWeights;
+        previousRates = rates;
+        previousM0 = linearFit.sharedM0;
+        if maximumRateChange < opts.jointTolerance && ...
+                m0Change < opts.jointTolerance && ...
+                maximumWeightChange < opts.jointTolerance
+            converged = true;
+            break
+        end
     end
+
+    totalWeights = combineJointWeights( ...
+        robustWeights, noisePrecision, jointData);
+    [rates, linearFit, optimizerInfo] = optimiseJointRates( ...
+        jointData, fieldRatios, totalWeights, rates, opts);
+    totalSweeps = totalSweeps + optimizerInfo.sweeps;
+    totalFunctionEvaluations = totalFunctionEvaluations + ...
+        optimizerInfo.functionEvaluations;
+
+    fit = linearFit;
+    fit.rates = rates;
+    fit.robustWeights = robustWeights;
+    fit.totalWeights = totalWeights;
+    fit.robustIterations = jointRobustIndex;
+    fit.rateSweeps = totalSweeps;
+    fit.optimizerFunctionEvaluations = totalFunctionEvaluations;
+    fit.converged = converged || optimizerInfo.converged;
+end
+
+function totalWeights = combineJointWeights( ...
+        robustWeights, noisePrecision, jointData)
+    totalWeights = cell(size(robustWeights));
+    for jointWeightIndex = 1:numel(robustWeights)
+        totalWeights{jointWeightIndex} = ...
+            robustWeights{jointWeightIndex} .* ...
+            jointData(jointWeightIndex).timeWeights .* ...
+            noisePrecision(jointWeightIndex);
+    end
+end
+
+function [rates, linearFit, optimizerInfo] = optimiseJointRates( ...
+        jointData, fieldRatios, totalWeights, initialRates, opts)
+    rates = min(max(initialRates(:).', opts.R1Bounds(1)), ...
+        opts.R1Bounds(2));
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    fminOptions = optimset('Display', 'off', 'TolX', 1e-7, ...
+        'MaxIter', 100, 'MaxFunEvals', 240);
+    functionEvaluations = 0;
+    converged = false;
+
+    for jointSweepIndex = 1:max(1, opts.jointRateSweeps)
+        previousRates = rates;
+        for jointRateIndex = 1:numel(rates)
+            objective = @(logRate) jointObjectiveWithRate(logRate, ...
+                jointRateIndex, rates, jointData, fieldRatios, ...
+                totalWeights, opts);
+            [refinedLogRate, refinedValue, ~, output] = fminbnd( ...
+                objective, logLower, logUpper, fminOptions);
+            functionEvaluations = functionEvaluations + output.funcCount;
+            candidateLogRates = [log(rates(jointRateIndex)), ...
+                refinedLogRate, logLower, logUpper];
+            candidateValues = nan(size(candidateLogRates));
+            for jointCandidateIndex = 1:numel(candidateLogRates)
+                if jointCandidateIndex == 2
+                    candidateValues(jointCandidateIndex) = refinedValue;
+                else
+                    candidateValues(jointCandidateIndex) = ...
+                        objective(candidateLogRates(jointCandidateIndex));
+                    functionEvaluations = functionEvaluations + 1;
+                end
+            end
+            [~, bestCandidate] = min(candidateValues);
+            rates(jointRateIndex) = ...
+                exp(candidateLogRates(bestCandidate));
+        end
+        if max(abs(log(rates ./ previousRates))) < opts.jointTolerance
+            converged = true;
+            break
+        end
+    end
+    linearFit = solveJointLinearAtRates(jointData, fieldRatios, ...
+        totalWeights, rates, opts);
+    optimizerInfo = struct('sweeps', jointSweepIndex, ...
+        'functionEvaluations', functionEvaluations, ...
+        'converged', converged);
+end
+
+function value = jointObjectiveWithRate(logRate, rateIndex, rates, ...
+        jointData, fieldRatios, totalWeights, opts)
+    trialRates = rates;
+    trialRates(rateIndex) = exp(logRate);
+    trialFit = solveJointLinearAtRates(jointData, fieldRatios, ...
+        totalWeights, trialRates, opts);
+    value = trialFit.weightedSSE;
+    if ~isfinite(value)
+        value = realmax('double');
+    end
+end
+
+function fit = solveJointLinearAtRates(jointData, fieldRatios, ...
+        totalWeights, rates, opts)
+    observationCount = sum(arrayfun(@(item) numel(item.t), jointData));
+    fieldCount = numel(jointData);
+    design = zeros(observationCount, 1 + fieldCount);
+    observation = zeros(observationCount, 1);
+    squareRootWeight = zeros(observationCount, 1);
+    rowStart = 1;
+    rowRanges = cell(1, fieldCount);
+    for jointDesignIndex = 1:fieldCount
+        nObservation = numel(jointData(jointDesignIndex).t);
+        rows = rowStart:(rowStart + nObservation - 1);
+        rowRanges{jointDesignIndex} = rows;
+        exponential = exp(-rates(jointDesignIndex) .* ...
+            jointData(jointDesignIndex).t(:));
+        % Paper model:
+        %   S=M0_D*[r*(1-e)-alpha*e].
+        % Write alpha=alpha_min+D/M0_D with D>=0. The linear
+        % coefficients are then [M0_D,D_1,...,D_F], all non-negative.
+        % This enforces a genuinely inverted initial state and removes the
+        % negative-alpha saturation solutions admitted by the v5 Q fit.
+        design(rows, 1) = fieldRatios(jointDesignIndex) .* ...
+            (1 - exponential) - opts.jointMinimumAlpha .* exponential;
+        design(rows, 1 + jointDesignIndex) = -exponential;
+        observation(rows) = jointData(jointDesignIndex).y(:);
+        squareRootWeight(rows) = sqrt(max( ...
+            totalWeights{jointDesignIndex}(:), 0));
+        rowStart = rowStart + nObservation;
+    end
+    weightedDesign = bsxfun(@times, design, squareRootWeight);
+    weightedObservation = observation .* squareRootWeight;
+    coefficient = nonnegativeCoordinateLeastSquares(weightedDesign, ...
+        weightedObservation, opts.jointTolerance);
+    predictionVector = design * coefficient;
+    residualVector = observation - predictionVector;
+
+    fit = struct();
+    fit.sharedM0 = coefficient(1);
+    fit.alphaExcessAmplitude = coefficient(2:end).';
+    fit.inversionAmplitude = opts.jointMinimumAlpha .* fit.sharedM0 + ...
+        fit.alphaExcessAmplitude;
+    fit.Q = fieldRatios .* fit.sharedM0 + fit.inversionAmplitude;
+    if fit.sharedM0 > eps
+        fit.alpha = fit.inversionAmplitude ./ fit.sharedM0;
+    else
+        fit.alpha = nan(1, fieldCount);
+    end
+    fit.prediction = cell(1, fieldCount);
+    fit.residual = cell(1, fieldCount);
+    for jointDesignIndex = 1:fieldCount
+        rows = rowRanges{jointDesignIndex};
+        fit.prediction{jointDesignIndex} = predictionVector(rows);
+        fit.residual{jointDesignIndex} = residualVector(rows);
+    end
+    fit.weightedSSE = sum(squareRootWeight.^2 .* residualVector.^2);
+end
+
+function coefficient = nonnegativeCoordinateLeastSquares( ...
+        design, observation, tolerance)
+    parameterCount = size(design, 2);
+    if isempty(design) || parameterCount == 0
+        coefficient = [];
+        return
+    end
+    normalMatrix = design' * design;
+    normalRightHandSide = design' * observation;
+    conditionEstimate = rcond(normalMatrix);
+    if isfinite(conditionEstimate) && conditionEstimate > 1e-12
+        unconstrained = real(normalMatrix \ normalRightHandSide);
+    else
+        unconstrained = real(pinv(normalMatrix) * normalRightHandSide);
+    end
+    positivityTolerance = max(tolerance, 1e-10) .* ...
+        max(norm(unconstrained, inf), 1);
+    if all(unconstrained >= -positivityTolerance)
+        coefficient = max(unconstrained, 0);
+        return
+    end
+    coefficient = max(unconstrained, 0);
+    columnEnergy = sum(design.^2, 1);
+    residual = observation - design * coefficient;
+    maximumIterations = 200;
+    for nnlsIteration = 1:maximumIterations
+        previousCoefficient = coefficient;
+        for nnlsIndex = 1:parameterCount
+            if columnEnergy(nnlsIndex) <= eps
+                coefficient(nnlsIndex) = 0;
+                continue
+            end
+            oldCoefficient = coefficient(nnlsIndex);
+            partialResidual = residual + ...
+                design(:, nnlsIndex) .* oldCoefficient;
+            newCoefficient = max(0, ...
+                design(:, nnlsIndex)' * partialResidual / ...
+                columnEnergy(nnlsIndex));
+            coefficient(nnlsIndex) = newCoefficient;
+            residual = partialResidual - ...
+                design(:, nnlsIndex) .* newCoefficient;
+        end
+        relativeChange = norm(coefficient - previousCoefficient) / ...
+            max(norm(previousCoefficient), 1);
+        if relativeChange < max(tolerance * 0.1, 1e-8)
+            break
+        end
+    end
+end
+
+function [jointData, changed, selectedRates] = refineJointMagnitudeBranches( ...
+        jointData, fieldRatios, sharedM0, robustWeights, opts)
+    changed = false;
+    selectedRates = nan(1, numel(jointData));
+    for jointBranchFieldIndex = 1:numel(jointData)
+        if ~jointData(jointBranchFieldIndex).isMagnitude
+            continue
+        end
+        magnitude = jointData(jointBranchFieldIndex).magnitude(:);
+        time = jointData(jointBranchFieldIndex).t(:);
+        intercept = sharedM0 * fieldRatios(jointBranchFieldIndex);
+        weights = robustWeights{jointBranchFieldIndex}(:) .* ...
+            jointData(jointBranchFieldIndex).timeWeights(:);
+        sampleCount = numel(time);
+        candidateScore = inf(1, sampleCount + 1);
+        candidateRate = nan(1, sampleCount + 1);
+        candidateQ = nan(1, sampleCount + 1);
+        for branchIndex = 0:sampleCount
+            signs = ones(sampleCount, 1);
+            if branchIndex > 0
+                signs(1:branchIndex) = -1;
+            end
+            signedSignal = signs .* magnitude;
+            [candidateRate(branchIndex + 1), ...
+                candidateQ(branchIndex + 1), ...
+                candidateScore(branchIndex + 1)] = ...
+                fitFixedInterceptBranch(time, signedSignal, weights, ...
+                intercept, sharedM0, opts);
+        end
+        [sortedScores, order] = sort(candidateScore, 'ascend');
+        if isempty(order) || ~isfinite(sortedScores(1))
+            continue
+        end
+        bestBranch = order(1) - 1;
+        signs = ones(sampleCount, 1);
+        if bestBranch > 0
+            signs(1:bestBranch) = -1;
+        end
+        newSignal = signs .* magnitude;
+        if numel(newSignal) ~= numel(jointData(jointBranchFieldIndex).y) || ...
+                any(newSignal ~= jointData(jointBranchFieldIndex).y)
+            changed = true;
+            jointData(jointBranchFieldIndex).y = newSignal;
+        end
+        jointData(jointBranchFieldIndex).branchIndex = bestBranch;
+        selectedRates(jointBranchFieldIndex) = candidateRate(order(1));
+        if numel(sortedScores) > 1 && isfinite(sortedScores(2))
+            signalEnergy = max(sum(magnitude.^2), eps);
+            closeScore = sortedScores(2) <= opts.signAmbiguityRatio * ...
+                max(sortedScores(1), eps * signalEnergy);
+            differentRate = abs(log(candidateRate(order(2)) / ...
+                candidateRate(order(1)))) > ...
+                opts.signAmbiguityLogRateDifference;
+            jointData(jointBranchFieldIndex).signAmbiguous = ...
+                closeScore && differentRate;
+        else
+            jointData(jointBranchFieldIndex).signAmbiguous = false;
+        end
+        minimumQ = intercept + opts.jointMinimumAlpha * sharedM0;
+        if ~isfinite(candidateQ(order(1))) || ...
+                candidateQ(order(1)) < minimumQ
+            jointData(jointBranchFieldIndex).signAmbiguous = true;
+        end
+    end
+end
+
+function [rate, Q, score] = fitFixedInterceptBranch( ...
+        time, signal, weights, intercept, sharedM0, opts)
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    minimumQ = intercept + opts.jointMinimumAlpha * sharedM0;
+    objective = @(logRate) fixedInterceptProfile(logRate, time, ...
+        signal, weights, intercept, minimumQ);
+    fminOptions = optimset('Display', 'off', 'TolX', 1e-8, ...
+        'MaxIter', 100, 'MaxFunEvals', 220);
+    refinedLogRate = fminbnd(objective, logLower, logUpper, fminOptions);
+    candidateLogRate = [refinedLogRate, logLower, logUpper];
+    candidateScore = arrayfun(objective, candidateLogRate);
+    [score, bestIndex] = min(candidateScore);
+    rate = exp(candidateLogRate(bestIndex));
+    [Q, score] = fixedInterceptLinearFit(rate, time, signal, ...
+        weights, intercept, minimumQ);
+    if Q < minimumQ
+        score = Inf;
+        return
+    end
+    tolerance = 0.01 * (logUpper - logLower);
+    if candidateLogRate(bestIndex) <= logLower + tolerance || ...
+            candidateLogRate(bestIndex) >= logUpper - tolerance
+        score = score + opts.boundCandidatePenaltyFraction * ...
+            max(sum(signal.^2), eps);
+    end
+end
+
+function score = fixedInterceptProfile(logRate, time, signal, ...
+        weights, intercept, minimumQ)
+    [~, score] = fixedInterceptLinearFit(exp(logRate), time, ...
+        signal, weights, intercept, minimumQ);
+end
+
+function [Q, score] = fixedInterceptLinearFit(rate, time, signal, ...
+        weights, intercept, minimumQ)
+    exponential = exp(-rate .* time(:));
+    weights = max(weights(:), 0);
+    denominator = sum(weights .* exponential.^2);
+    if denominator <= eps
+        Q = minimumQ;
+    else
+        Q = max(sum(weights .* exponential .* ...
+            (intercept - signal(:))) / denominator, minimumQ);
+    end
+    residual = signal(:) - (intercept - Q .* exponential);
+    score = sum(weights .* residual.^2);
+end
+
+function [rateSE, info] = jointRateUncertainty(jointData, ...
+        fieldRatios, jointFit, opts)
+    fieldCount = numel(jointData);
+    observationCount = sum(arrayfun(@(item) numel(item.t), jointData));
+    parameterCount = 1 + 2 * fieldCount;
+    jacobian = zeros(observationCount, parameterCount);
+    residual = zeros(observationCount, 1);
+    squareRootWeight = zeros(observationCount, 1);
+    rowStart = 1;
+    for jointJacobianIndex = 1:fieldCount
+        time = jointData(jointJacobianIndex).t(:);
+        nObservation = numel(time);
+        rows = rowStart:(rowStart + nObservation - 1);
+        exponential = exp(-jointFit.rates(jointJacobianIndex) .* time);
+        jacobian(rows, 1) = fieldRatios(jointJacobianIndex);
+        jacobian(rows, 1 + jointJacobianIndex) = -exponential;
+        jacobian(rows, 1 + fieldCount + jointJacobianIndex) = ...
+            jointFit.Q(jointJacobianIndex) .* time .* exponential;
+        residual(rows) = jointFit.residual{jointJacobianIndex};
+        squareRootWeight(rows) = sqrt(max( ...
+            jointFit.totalWeights{jointJacobianIndex}(:), 0));
+        rowStart = rowStart + nObservation;
+    end
+    weightedJacobian = bsxfun(@times, jacobian, squareRootWeight);
+    normalMatrix = weightedJacobian' * weightedJacobian;
+    dfe = max(observationCount - parameterCount, 1);
+    varianceEstimate = max(sum((squareRootWeight .* residual).^2) / dfe, eps);
+    covariance = pinv(normalMatrix) .* varianceEstimate;
+    rateVariance = diag(covariance( ...
+        (2 + fieldCount):(1 + 2 * fieldCount), ...
+        (2 + fieldCount):(1 + 2 * fieldCount)));
+    rateSE = sqrt(max(real(rateVariance(:).'), 0));
+    rateSE(~isfinite(rateSE)) = NaN;
+    info = struct('dfe', dfe, 'normalMatrixRcond', rcond(normalMatrix));
+end
+
+function updatedResults = updateJointFieldResults(initialResults, ...
+        jointData, eligibleIndices, allFieldRatios, jointFit, rateSE, opts)
+    updatedResults = initialResults;
+    zCritical = sqrt(2) * erfinv(opts.confidenceLevel);
+    logSpan = log(opts.R1Bounds(2)) - log(opts.R1Bounds(1));
+    for jointUpdateIndex = 1:numel(eligibleIndices)
+        globalIndex = eligibleIndices(jointUpdateIndex);
+        initialResult = initialResults(globalIndex);
+        result = initialResult;
+        time = jointData(jointUpdateIndex).t(:);
+        signal = jointData(jointUpdateIndex).y(:);
+        prediction = jointFit.prediction{jointUpdateIndex};
+        residual = jointFit.residual{jointUpdateIndex};
+        rate = jointFit.rates(jointUpdateIndex);
+        Q = jointFit.Q(jointUpdateIndex);
+        intercept = jointFit.sharedM0 * allFieldRatios(globalIndex);
+        sigma = robustRealScale(residual);
+        sse = sum(residual.^2);
+        sst = sum((signal - mean(signal)).^2);
+        dfe = max(numel(time) - 2, 1);
+        rmse = sqrt(sse / dfe);
+        scaleAmplitude = max([Q, ...
+            max(abs(signal - median(signal))), eps]);
+
+        result.ok = isfinite(rate) && rate > 0 && ...
+            isfinite(Q) && isfinite(intercept);
+        result.method = 'joint_multifield_inversion_constrained';
+        result.tSeconds = time;
+        result.displaySignal = signal;
+        result.displayFit = prediction;
+        result.predictionComplex = [];
+        result.residual = residual;
+        result.weights = jointFit.robustWeights{jointUpdateIndex};
+        result.outlierIndices = find( ...
+            result.weights < opts.outlierWeightThreshold).';
+        result.B = intercept;
+        result.C = Q;
+        result.S0 = intercept - Q;
+        result.Sinf = intercept;
+        result.R1 = rate;
+        result.T1ms = 1000 / rate;
+        if isfinite(rateSE(jointUpdateIndex))
+            rawRateCI = rate + [-1 1] .* ...
+                zCritical .* rateSE(jointUpdateIndex);
+            result.ciOpen = [rawRateCI(1) <= opts.R1Bounds(1), ...
+                rawRateCI(2) >= opts.R1Bounds(2)];
+            result.R1CI95 = [max(rawRateCI(1), opts.R1Bounds(1)), ...
+                min(rawRateCI(2), opts.R1Bounds(2))];
+            if result.R1CI95(1) <= 0
+                result.R1CI95(1) = opts.R1Bounds(1);
+            end
+            result.T1CI95 = rateCiToT1Ci(result.R1CI95);
+            result.R1SE = rateSE(jointUpdateIndex);
+            result.T1SE = 1000 .* rateSE(jointUpdateIndex) ./ rate.^2;
+            if any(result.ciOpen)
+                % A symmetric covariance error is misleading when the
+                % interval reaches a rate bound and can dominate the entire
+                % dispersion plot by several orders of magnitude.
+                result.R1SE = NaN;
+                result.T1SE = NaN;
+            end
+        else
+            result.R1CI95 = [NaN NaN];
+            result.T1CI95 = [NaN NaN];
+            result.R1SE = NaN;
+            result.T1SE = NaN;
+            result.ciOpen = [false false];
+        end
+        result.betaComplex = [intercept, -Q];
+        result.orthogonalOffset = NaN;
+        result.orthogonalNRMSE = NaN;
+        result.noiseSigma = sigma;
+        result.dynamicSNR = Q / max(sigma, eps);
+        result.sse = sse;
+        result.rsquare = safeRsquare(sse, sst);
+        result.rmse = rmse;
+        result.nrmse = rmse / scaleAmplitude;
+        result.dfe = dfe;
+        result.boundHit = abs(log(rate / opts.R1Bounds(1))) <= ...
+            0.01 * logSpan || abs(log(opts.R1Bounds(2) / rate)) <= ...
+            0.01 * logSpan;
+        if result.boundHit
+            result.R1SE = NaN;
+            result.T1SE = NaN;
+        end
+        result.zeroCrossingSeconds = ...
+            zeroCrossingTime(intercept, Q, rate);
+        result.signChangeIndex = sum(signal < 0);
+        result.reliableSignTransitions = countReliableSignTransitions( ...
+            signal, sigma, Q);
+        result.signAmbiguous = jointData(jointUpdateIndex).signAmbiguous;
+        result.jointSharedM0 = jointFit.sharedM0;
+        result.jointFieldRatio = allFieldRatios(globalIndex);
+        result.jointAlpha = jointFit.alpha(jointUpdateIndex);
+        result.jointTimeWeights = ...
+            jointData(jointUpdateIndex).timeWeights;
+        result.jointTotalWeights = ...
+            jointFit.totalWeights{jointUpdateIndex};
+        result.independentFitSummary = fitSummary(initialResult);
+        if isempty(initialResult.selectionReason)
+            result.selectionReason = ...
+                'joint all-field inversion-constrained refinement';
+        else
+            result.selectionReason = [initialResult.selectionReason, ...
+                '; joint all-field inversion-constrained refinement'];
+        end
+        result.qc = 'not fitted';
+        result.qcReasons = {};
+        result = applyQualityControl(result, opts);
+        if ~jointFit.converged && ~strncmp(result.qc, 'failed', 6)
+            result.qcReasons{end + 1} = ...
+                'joint optimizer did not meet the requested tolerance';
+            result.qc = ['review: ' strjoin(result.qcReasons, '; ')];
+        end
+        updatedResults(globalIndex) = result;
+    end
+end
+
+
+% ========================================================================
+% Variable projection, robust weights and profile intervals
+% ========================================================================
+
+function [R1, beta, sse, boundHit] = optimiseRate(t, y, weights, opts)
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    logGrid = linspace(logLower, logUpper, opts.rateGridPoints);
+    gridSse = nan(size(logGrid));
+    for k = 1:numel(logGrid)
+        gridSse(k) = profileSseAtLogRate(logGrid(k), t, y, weights);
+    end
+    [~, bestIndex] = min(gridSse);
+
+    leftIndex = max(1, bestIndex - 1);
+    rightIndex = min(numel(logGrid), bestIndex + 1);
+    localLower = logGrid(leftIndex);
+    localUpper = logGrid(rightIndex);
+    candidates = [logGrid(bestIndex), logLower, logUpper];
+    if localUpper > localLower
+        fminOptions = optimset('Display', 'off', 'TolX', 1e-8, ...
+            'MaxIter', 100, 'MaxFunEvals', 200);
+        refined = fminbnd(@(lr) profileSseAtLogRate(lr, t, y, weights), ...
+            localLower, localUpper, fminOptions);
+        candidates(end + 1) = refined; %#ok<AGROW>
+    end
+
+    candidateSse = nan(size(candidates));
+    for k = 1:numel(candidates)
+        candidateSse(k) = profileSseAtLogRate(candidates(k), t, y, weights);
+    end
+    [sse, selected] = min(candidateSse);
+    selectedLogRate = candidates(selected);
+    R1 = exp(selectedLogRate);
+    [beta, sse] = solveLinearAtRate(t, y, weights, R1);
+
+    tolerance = 0.01 * (logUpper - logLower);
+    boundHit = selectedLogRate <= logLower + tolerance || ...
+        selectedLogRate >= logUpper - tolerance;
+end
+
+function sse = profileSseAtLogRate(logRate, t, y, weights)
+    R1 = exp(logRate);
+    [~, sse] = solveLinearAtRate(t, y, weights, R1);
+    if ~isfinite(sse)
+        sse = realmax('double');
+    end
+end
+
+function [beta, sse] = solveLinearAtRate(t, y, weights, R1)
+    exponential = exp(-R1 .* t(:));
+    X = [ones(size(exponential)), exponential];
+    squareRootWeight = sqrt(max(weights(:), 0));
+    Xw = bsxfun(@times, X, squareRootWeight);
+    yw = y(:) .* squareRootWeight;
+    beta = Xw \ yw;
+    residual = y(:) - X * beta;
+    sse = sum(weights(:) .* abs(residual).^2);
+end
+
+function prediction = affinePrediction(t, R1, beta)
+    prediction = beta(1) + beta(2) .* exp(-R1 .* t(:));
+end
+
+function weights = huberWeights(residualMagnitude, noiseSigma, opts)
+    residualMagnitude = abs(residualMagnitude(:));
+    if ~isfinite(noiseSigma) || noiseSigma <= eps
+        weights = ones(size(residualMagnitude));
+        return
+    end
+    cutoff = opts.robustTune * noiseSigma;
+    weights = ones(size(residualMagnitude));
+    large = residualMagnitude > cutoff;
+    weights(large) = cutoff ./ residualMagnitude(large);
+    weights = max(weights, opts.minimumWeight);
+end
+
+function scale = robustRealScale(residual)
+    residual = real(residual(:));
+    residual = residual(isfinite(residual));
+    if isempty(residual)
+        scale = NaN;
+        return
+    end
+    centre = median(residual);
+    scale = 1.4826 * median(abs(residual - centre));
+    if ~isfinite(scale) || scale <= eps
+        scale = sqrt(mean((residual - mean(residual)).^2));
+    end
+    if ~isfinite(scale) || scale <= eps
+        scale = eps;
+    end
+end
+
+function scale = robustComplexScale(residual)
+    residual = residual(:);
+    good = isfinite(real(residual)) & isfinite(imag(residual));
+    residual = residual(good);
+    if isempty(residual)
+        scale = NaN;
+        return
+    end
+    scaleReal = robustRealScale(real(residual));
+    scaleImag = robustRealScale(imag(residual));
+    scale = sqrt(scaleReal.^2 + scaleImag.^2);
+    if ~isfinite(scale) || scale <= eps
+        scale = sqrt(mean(abs(residual - mean(residual)).^2));
+    end
+    if ~isfinite(scale) || scale <= eps
+        scale = eps;
+    end
+end
+
+function [rateCI, openBound] = profileRateCI(t, y, weights, R1hat, ...
+        realObservationCount, parameterCount, opts)
+    logLower = log(opts.R1Bounds(1));
+    logUpper = log(opts.R1Bounds(2));
+    logGrid = linspace(logLower, logUpper, opts.profileGridPoints);
+    logGrid = unique(sort([logGrid, log(R1hat)]));
+    profile = nan(size(logGrid));
+    for k = 1:numel(logGrid)
+        profile(k) = profileSseAtLogRate(logGrid(k), t, y, weights);
+    end
+    [minimumSse, minimumIndex] = min(profile);
+    dfe = max(realObservationCount - parameterCount, 1);
+    varianceEstimate = max(minimumSse / dfe, eps);
+    chiSquareOneDf = 2 * erfinv(opts.confidenceLevel).^2;
+    threshold = minimumSse + chiSquareOneDf * varianceEstimate;
+    inside = profile <= threshold;
+
+    leftIndex = minimumIndex;
+    while leftIndex > 1 && inside(leftIndex - 1)
+        leftIndex = leftIndex - 1;
+    end
+    rightIndex = minimumIndex;
+    while rightIndex < numel(logGrid) && inside(rightIndex + 1)
+        rightIndex = rightIndex + 1;
+    end
+
+    leftOpen = leftIndex == 1;
+    rightOpen = rightIndex == numel(logGrid);
+    if leftOpen
+        leftLog = logGrid(1);
+    else
+        leftLog = interpolateThreshold(logGrid(leftIndex - 1), ...
+            profile(leftIndex - 1), logGrid(leftIndex), ...
+            profile(leftIndex), threshold);
+    end
+    if rightOpen
+        rightLog = logGrid(end);
+    else
+        rightLog = interpolateThreshold(logGrid(rightIndex), ...
+            profile(rightIndex), logGrid(rightIndex + 1), ...
+            profile(rightIndex + 1), threshold);
+    end
+    rateCI = sort(exp([leftLog, rightLog]));
+    openBound = [leftOpen, rightOpen];
+end
+
+function x = interpolateThreshold(x1, y1, x2, y2, threshold)
+    if ~isfinite(y1) || ~isfinite(y2) || y2 == y1
+        x = 0.5 * (x1 + x2);
+        return
+    end
+    fraction = (threshold - y1) / (y2 - y1);
+    fraction = min(max(fraction, 0), 1);
+    x = x1 + fraction * (x2 - x1);
+end
+
+
+% ========================================================================
+% Diagnostics, storage and plotting
+% ========================================================================
+
+function r = applyQualityControl(r, opts)
+    reasons = {};
+    if ~r.ok || ~isfinite(r.R1) || r.R1 <= 0
+        r.qc = 'failed: non-finite rate';
+        r.qcReasons = {r.qc};
+        return
+    end
+    if r.boundHit
+        reasons{end + 1} = 'rate at search bound'; %#ok<AGROW>
+    end
+    if any(r.ciOpen)
+        reasons{end + 1} = 'profile interval reaches a search bound'; %#ok<AGROW>
+    end
+    if all(isfinite(r.T1CI95)) && min(r.T1CI95) > 0 && ...
+            max(r.T1CI95) / min(r.T1CI95) > opts.maximumT1CIRatio
+        reasons{end + 1} = 'wide T1 profile interval'; %#ok<AGROW>
+    end
+    if ~isfinite(r.dynamicSNR) || r.dynamicSNR < opts.minimumDynamicSNR
+        reasons{end + 1} = 'weak fitted recovery amplitude'; %#ok<AGROW>
+    end
+    if strncmp(r.method, 'joint_multifield', 16) && ...
+            (~isfinite(r.C) || r.C <= 0)
+        reasons{end + 1} = ...
+            'joint fit reached a zero recovery amplitude'; %#ok<AGROW>
+    end
+    if strcmp(r.method, 'joint_multifield_inversion_constrained') && ...
+            isfinite(r.jointAlpha) && ...
+            r.jointAlpha <= opts.jointMinimumAlpha * (1 + 1e-3)
+        reasons{end + 1} = ...
+            'inversion efficiency reached its lower constraint'; %#ok<AGROW>
+    end
+    if ~isfinite(r.nrmse) || r.nrmse > opts.maximumNRMSE
+        reasons{end + 1} = 'large model residuals'; %#ok<AGROW>
+    end
+    if any(strcmp(r.method, {'complex_affine_variable_projection', ...
+            'complex_phase_drift_ir'})) && ...
+            isfinite(r.orthogonalNRMSE) && ...
+            r.orthogonalNRMSE > opts.maximumOrthogonalNRMSE
+        reasons{end + 1} = 'complex trajectory is not approximately one-dimensional'; %#ok<AGROW>
+    end
+    if any(strcmp(r.method, {'complex_affine_variable_projection', ...
+            'complex_phase_drift_ir'})) && ...
+            isfinite(r.reliableSignTransitions) && ...
+            r.reliableSignTransitions > opts.maximumReliableSignTransitions
+        reasons{end + 1} = 'complex projection has more than one reliable sign transition'; %#ok<AGROW>
+    end
+    if strcmp(r.method, 'complex_phase_drift_ir') && ...
+            (~isfinite(r.phaseResidualDegrees) || ...
+             r.phaseResidualDegrees > opts.maximumPhaseResidualDegrees)
+        reasons{end + 1} = 'complex phase drift is not sufficiently coherent'; %#ok<AGROW>
+    end
+    if strcmp(r.method, 'magnitude_rician_ir') && ...
+            strcmp(r.noiseSource, 'recovery minimum fallback')
+        reasons{end + 1} = ...
+            'magnitude noise was estimated from the recovery minimum'; %#ok<AGROW>
+    end
+    if strcmp(r.method, 'magnitude_rician_ir') && ...
+            strcmp(r.magnitudeNoiseModel, 'noncentral_chi_approx')
+        reasons{end + 1} = ...
+            'multi-coil magnitude noise model is approximate'; %#ok<AGROW>
+    end
+    if numel(r.outlierIndices) > max(1, floor(0.25 * numel(r.tSeconds)))
+        reasons{end + 1} = 'several low-weight time points'; %#ok<AGROW>
+    end
+    if r.signAmbiguous
+        reasons{end + 1} = 'magnitude polarity is ambiguous'; %#ok<AGROW>
+    end
+
+    T1seconds = r.T1ms / 1000;
+    finiteTimes = r.tSeconds(isfinite(r.tSeconds) & r.tSeconds >= 0);
+    if isempty(finiteTimes)
+        minimumTime = 0;
+    else
+        minimumTime = min(finiteTimes);
+    end
+    maximumTime = max(r.tSeconds);
+    r.timeCoverageT1 = [minimumTime / T1seconds, maximumTime / T1seconds];
+    if maximumTime / T1seconds < opts.minimumLateCoverageT1
+        reasons{end + 1} = 'no late-time leverage on the asymptote'; %#ok<AGROW>
+    end
+    if minimumTime > 0 && minimumTime / T1seconds > opts.maximumEarlyCoverageT1
+        reasons{end + 1} = 'no early-time leverage on the initial state'; %#ok<AGROW>
+    end
+
+    r.qcReasons = reasons;
+    if isempty(reasons)
+        r.qc = 'good';
+    else
+        r.qc = ['review: ' strjoin(reasons, '; ')];
+    end
+end
+
+function results = assembleResults(fieldResult, fields_mT, slice, signalMode, opts)
+    resultFieldCount = numel(fieldResult);
+    results = struct();
+    results.modelEquation = 'S(t) = S_inf + (S_0-S_inf)*exp(-R1*t)';
+    results.observationEquation = ...
+        'complex: phase-drift-corrected S(t); magnitude: E[|S(t)+noise|]';
+    results.modelName = 'phase_aware_constrained_field_cycling_IR';
+    results.fitMode = opts.fitMode;
+    results.signalMode = signalMode;
+    results.slice = slice;
+    results.fields_mT = fields_mT(:).';
+    results.options = opts;
+    results.field = fieldResult;
+    results.R1 = nan(1, resultFieldCount);
+    results.R1SE = nan(1, resultFieldCount);
+    results.T1ms = nan(1, resultFieldCount);
+    results.T1SE = nan(1, resultFieldCount);
+    results.R1CI95 = nan(2, resultFieldCount);
+    results.T1CI95 = nan(2, resultFieldCount);
+    results.qc = cell(1, resultFieldCount);
+    for n = 1:resultFieldCount
+        results.R1(n) = fieldResult(n).R1;
+        results.R1SE(n) = fieldResult(n).R1SE;
+        results.T1ms(n) = fieldResult(n).T1ms;
+        results.T1SE(n) = fieldResult(n).T1SE;
+        results.R1CI95(:, n) = fieldResult(n).R1CI95(:);
+        results.T1CI95(:, n) = fieldResult(n).T1CI95(:);
+        results.qc{n} = fieldResult(n).qc;
+    end
+end
+
+function obj = storeResults(obj, results)
+    resultFieldCount = numel(results.field);
+    fitParams = cell(1, resultFieldCount);
+    fitSse = nan(1, resultFieldCount);
+    fitRsq = nan(1, resultFieldCount);
+    fitRmse = nan(1, resultFieldCount);
+    fitDfe = nan(1, resultFieldCount);
+    fitWeights = cell(1, resultFieldCount);
+    autoPolarityFlips = cell(1, resultFieldCount);
+    phase = nan(1, resultFieldCount);
+    phaseTrend = cell(1, resultFieldCount);
+    for n = 1:resultFieldCount
+        storedFieldResult = results.field(n);
+        fitParams{n} = [storedFieldResult.B, storedFieldResult.C, storedFieldResult.R1];
+        fitSse(n) = storedFieldResult.sse;
+        fitRsq(n) = storedFieldResult.rsquare;
+        fitRmse(n) = storedFieldResult.rmse;
+        fitDfe(n) = storedFieldResult.dfe;
+        fitWeights{n} = storedFieldResult.weights;
+        phase(n) = storedFieldResult.phaseRad;
+        phaseTrend{n} = storedFieldResult.phaseTrendRad;
+        magnitudeDerived = any(strcmp(storedFieldResult.method, ...
+            {'magnitude_all_zero_crossings', 'magnitude_rician_ir'})) || ...
+            (strcmp(storedFieldResult.method, ...
+                'joint_multifield_inversion_constrained') && ...
+             isstruct(storedFieldResult.independentFitSummary) && ...
+             isfield(storedFieldResult.independentFitSummary, 'method') && ...
+             any(strcmp(storedFieldResult.independentFitSummary.method, ...
+                {'magnitude_all_zero_crossings', 'magnitude_rician_ir'})));
+        if magnitudeDerived && ...
+                numel(storedFieldResult.displaySignal) == ...
+                numel(storedFieldResult.tSeconds)
+            autoPolarityFlips{n} = find(storedFieldResult.displaySignal < 0).';
+        else
+            autoPolarityFlips{n} = [];
+        end
+    end
+
+    obj = safeSet(obj, 'dispersioncurve', results.R1);
+    obj = safeSet(obj, 'T1FitResults', results);
+    obj = safeSet(obj, 'R1dispersion', results.R1);
+    obj = safeSet(obj, 'R1error', results.R1SE);
+    obj = safeSet(obj, 'T1dispersion', results.T1ms);
+    obj = safeSet(obj, 'T1error', results.T1SE);
+    obj = safeSet(obj, 'R1ci95', results.R1CI95);
+    obj = safeSet(obj, 'T1ci95', results.T1CI95);
+    obj = safeSet(obj, 'fit_params', fitParams);
+    obj = safeSet(obj, 'fit_sse', fitSse);
+    obj = safeSet(obj, 'fit_rsq', fitRsq);
+    obj = safeSet(obj, 'fit_rmse', fitRmse);
+    obj = safeSet(obj, 'fit_dfe', fitDfe);
+    obj = safeSet(obj, 'fit_qc', results.qc);
+    obj = safeSet(obj, 'fit_weights', fitWeights);
+    obj = safeSet(obj, 'fit_model_name', results.modelName);
+    obj = safeSet(obj, 'phase_reference_rad', phase);
+    obj = safeSet(obj, 'phase_drift_rad', phaseTrend);
+    obj = safeSet(obj, 'fit_diagnostics', results.field);
+    % Existing manual polarity and point-edit members are intentionally not
+    % reset here. They are user decisions and must survive refitting.
+    obj = safeSet(obj, 'auto_polarity_flips', autoPolarityFlips);
+end
+
+function printFitSummary(results)
+    fprintf('\nRobust field-cycling T1 fit: %s\n', results.signalMode);
+    if isfield(results, 'implementation')
+        fprintf('Implementation: %s\n', results.implementation);
+    end
+    if isfield(results, 'inputDiagnostics')
+        d = results.inputDiagnostics;
+        fprintf(['Input geometry: %d fields | timepoints %s | magimage %s | ', ...
+                 'compleximage %s\n'], d.fieldCount, mat2str(d.timepointsSize), ...
+            mat2str(d.magimageSize), mat2str(d.compleximageSize));
+    end
+    fprintf('Model: %s\n', results.modelEquation);
+    if isfield(results, 'joint') && results.joint.used
+        fprintf(['Joint inversion fit: shared M0_D %.6g | B_D %.6g mT | ', ...
+                 'alpha >= %.4g | late/early weight %.4g | ', ...
+                 'weighted SSE %.6g\n'], ...
+            results.joint.sharedM0Detection, ...
+            results.joint.detectionField_mT, results.joint.minimumAlpha, ...
+            results.joint.lateTimeWeight, ...
+            results.joint.weightedSSE);
+    elseif isfield(results, 'joint') && results.joint.attempted && ...
+            ~isempty(results.joint.failureMessage)
+        fprintf('Joint fit not used: %s\n', results.joint.failureMessage);
+    end
+    fprintf('%6s %10s %12s %12s %-34s %s\n', ...
+        'Index', 'Field_mT', 'R1_s-1', 'T1_ms', 'Method', 'QC');
+    for n = 1:numel(results.field)
+        summaryFieldResult = results.field(n);
+        fprintf('%6d %10.5g %12.5g %12.5g %-34s %s\n', ...
+            n, summaryFieldResult.field_mT, summaryFieldResult.R1, ...
+            summaryFieldResult.T1ms, summaryFieldResult.method, ...
+            summaryFieldResult.qc);
+    end
+end
+
+function makeDispersionPlot(results, obj)
+    valid = isfinite(results.R1) & results.R1 > 0 & isfinite(results.fields_mT);
+    if ~any(valid)
+        return
+    end
+    plotR1 = memberExists(obj, 'R1T1') && isscalar(obj.R1T1) && obj.R1T1 == 1;
+    figure('Name', 'Robust field-cycling T1 dispersion');
+    if plotR1
+        x = results.fields_mT(valid) .* 42.57747892e6 ./ 1e6 ./ 1000;
+        y = results.R1(valid);
+        intervals = results.R1CI95(:, valid);
+        lowerError = max(y - intervals(1, :), 0);
+        upperError = max(intervals(2, :) - y, 0);
+        lowerError(~isfinite(lowerError)) = 0;
+        upperError(~isfinite(upperError)) = 0;
+        errorbar(x, y, lowerError, upperError, 'o-', 'LineWidth', 1.2);
+        xlabel('Evolution field (MHz)');
+        ylabel('R_1 (s^{-1})');
+    else
+        x = results.fields_mT(valid) ./ 1000;
+        y = results.T1ms(valid);
+        intervals = results.T1CI95(:, valid);
+        lowerError = max(y - intervals(1, :), 0);
+        upperError = max(intervals(2, :) - y, 0);
+        lowerError(~isfinite(lowerError)) = 0;
+        upperError(~isfinite(upperError)) = 0;
+        errorbar(x, y, lowerError, upperError, 'o-', 'LineWidth', 1.2);
+        xlabel('Evolution field (T)');
+        ylabel('T_1 (ms)');
+    end
+    hold on;
+    validIndices = find(valid);
+    review = ~arrayfun(@(item) strncmp(item.qc, 'good', 4), ...
+        results.field(valid));
+    if any(review)
+        plot(x(review), y(review), 'rx', 'MarkerSize', 9, ...
+            'LineWidth', 1.5, 'DisplayName', 'review');
+    end
+    for labelIndex = 1:numel(validIndices)
+        text(x(labelIndex), y(labelIndex), ...
+            sprintf('  %d', validIndices(labelIndex)), 'FontSize', 8);
+    end
+    hold off;
+    if all(x > 0)
+        set(gca, 'XScale', 'log');
+    end
+    grid on;
+    if isfield(results, 'joint') && results.joint.used
+        if results.joint.timeWeightingEnabled
+            title(sprintf(['Joint multi-field inversion fit; ', ...
+                'late/early weight %.3g'], results.joint.lateTimeWeight));
+        else
+            title('Joint multi-field inversion-constrained recovery fit');
+        end
+    else
+        title('Independent phase-aware constrained IR fits');
+    end
+end
+
+function makeQaDashboard(results)
+    panelIndex = find(arrayfun(@(r) ~isempty(r.tSeconds), results.field));
+    if isempty(panelIndex)
+        return
+    end
+    nPanels = numel(panelIndex);
+    nColumns = max(2, ceil(sqrt(nPanels)));
+    fitRows = ceil(nPanels / nColumns);
+    overviewRows = 2;
+    nRows = overviewRows + fitRows;
+    figure('Name', 'Robust field-cycling T1 fit QA');
+    layout = tiledlayout(nRows, nColumns, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+    overview = nexttile(layout, 1, [overviewRows nColumns]);
+    valid = isfinite(results.R1) & results.R1 > 0 & isfinite(results.fields_mT);
+    hold(overview, 'on');
+    if any(valid)
+        yValues = results.T1ms(valid);
+        intervals = results.T1CI95(:, valid);
+        lowerError = max(yValues - intervals(1, :), 0);
+        upperError = max(intervals(2, :) - yValues, 0);
+        lowerError(~isfinite(lowerError)) = 0;
+        upperError(~isfinite(upperError)) = 0;
+        errorbar(overview, results.fields_mT(valid), results.T1ms(valid), ...
+            lowerError, upperError, 'o-', 'LineWidth', 1.3, ...
+            'DisplayName', 'all fitted fields');
+        for n = find(valid)
+            text(overview, results.fields_mT(n), results.T1ms(n), ...
+                sprintf('  %d', n), 'FontSize', 8);
+        end
+        reviewIndices = find(valid & ~arrayfun(@(item) ...
+            strncmp(item.qc, 'good', 4), results.field));
+        if ~isempty(reviewIndices)
+            plot(overview, results.fields_mT(reviewIndices), ...
+                results.T1ms(reviewIndices), 'rx', 'MarkerSize', 9, ...
+                'LineWidth', 1.4, 'DisplayName', 'review');
+        end
+    end
+    if all(results.fields_mT(valid) > 0)
+        set(overview, 'XScale', 'log');
+    end
+    grid(overview, 'on');
+    xlabel(overview, 'Evolution field (mT)');
+    ylabel(overview, 'T_1 (ms)');
+    if isfield(results, 'joint') && results.joint.used
+        overviewTitle = sprintf( ...
+            ['Joint all-field fit: %d/%d finite T1 | ', ...
+             'late/early weight %.3g'], ...
+            sum(valid), numel(results.field), results.joint.lateTimeWeight);
+    else
+        overviewTitle = sprintf( ...
+            'Independent constrained IR fits: %d/%d fields returned finite T1', ...
+            sum(valid), numel(results.field));
+    end
+    title(overview, overviewTitle);
+    hold(overview, 'off');
+
+    firstFitTile = overviewRows * nColumns + 1;
+    for k = 1:nPanels
+        dashboardFieldResult = results.field(panelIndex(k));
+        ax = nexttile(layout, firstFitTile + k - 1);
+        hold(ax, 'on');
+        displayed = dashboardFieldResult.displaySignal;
+        if numel(displayed) ~= numel(dashboardFieldResult.tSeconds)
+            displayed = real(dashboardFieldResult.rawSignal);
+        end
+        regular = true(size(dashboardFieldResult.tSeconds));
+        regular(dashboardFieldResult.outlierIndices) = false;
+        plot(ax, dashboardFieldResult.tSeconds(regular), displayed(regular), 'o', ...
+            'DisplayName', 'used');
+        if any(~regular)
+            plot(ax, dashboardFieldResult.tSeconds(~regular), displayed(~regular), 'x', ...
+                'MarkerSize', 8, 'LineWidth', 1.3, 'DisplayName', 'downweighted');
+        end
+        if isfinite(dashboardFieldResult.R1) && ...
+                isfinite(dashboardFieldResult.B) && ...
+                isfinite(dashboardFieldResult.C)
+            denseTime = linspace(min(dashboardFieldResult.tSeconds), ...
+                max(dashboardFieldResult.tSeconds), 300).';
+            denseFit = dashboardFieldResult.B - dashboardFieldResult.C .* ...
+                exp(-dashboardFieldResult.R1 .* denseTime);
+            plot(ax, denseTime, denseFit, '-', 'LineWidth', 1.2, 'DisplayName', 'fit');
+        end
+        yline(ax, 0, '--');
+        grid(ax, 'on');
+        xlabel(ax, 'Evolution time (s)');
+        ylabel(ax, 'Signed signal (AU)');
+        title(ax, sprintf('%d: %.4g mT | T1 %.4g ms | %s | %s', ...
+            dashboardFieldResult.fieldIndex, dashboardFieldResult.field_mT, ...
+            dashboardFieldResult.T1ms, shortMethod(dashboardFieldResult.method), ...
+            shortQc(dashboardFieldResult.qc)), ...
+            'Interpreter', 'none');
+        hold(ax, 'off');
+    end
+    title(layout, ['Multi-field recovery fits; crosses are robustly ', ...
+        'downweighted points']);
+end
+
+function value = shortMethod(method)
+    if strcmp(method, 'complex_affine_variable_projection')
+        value = 'complex';
+    elseif strcmp(method, 'magnitude_all_zero_crossings')
+        value = 'magnitude constrained';
+    elseif strcmp(method, 'complex_phase_drift_ir')
+        value = 'phase-corrected IR';
+    elseif strcmp(method, 'magnitude_rician_ir')
+        value = 'magnitude IR';
+    elseif strcmp(method, 'joint_multifield_inversion_constrained')
+        value = 'joint inversion';
+    else
+        value = method;
+    end
+end
+
+function value = shortQc(qc)
+    if strncmp(qc, 'good', 4)
+        value = 'good';
+    elseif strncmp(qc, 'failed', 6)
+        value = 'failed';
+    else
+        value = 'review';
+    end
+end
+
+
+% ========================================================================
+% Small utilities and result templates
+% ========================================================================
+
+function r = emptyFieldResult()
+    r = struct( ...
+        'fieldIndex', NaN, ...
+        'field_mT', NaN, ...
+        'ok', false, ...
+        'method', '', ...
+        'tSeconds', [], ...
+        'rawSignal', [], ...
+        'displaySignal', [], ...
+        'displayFit', [], ...
+        'predictionComplex', [], ...
+        'residual', [], ...
+        'weights', [], ...
+        'outlierIndices', [], ...
+        'B', NaN, ...
+        'C', NaN, ...
+        'S0', NaN, ...
+        'Sinf', NaN, ...
+        'R1', NaN, ...
+        'T1ms', NaN, ...
+        'R1CI95', [NaN NaN], ...
+        'T1CI95', [NaN NaN], ...
+        'R1SE', NaN, ...
+        'T1SE', NaN, ...
+        'betaComplex', [NaN NaN], ...
+        'phaseRad', NaN, ...
+        'phaseTrendRad', [], ...
+        'phaseResidualDegrees', NaN, ...
+        'orthogonalOffset', NaN, ...
+        'orthogonalNRMSE', NaN, ...
+        'noiseSigma', NaN, ...
+        'dynamicSNR', NaN, ...
+        'sse', NaN, ...
+        'rsquare', NaN, ...
+        'rmse', NaN, ...
+        'nrmse', NaN, ...
+        'dfe', NaN, ...
+        'boundHit', false, ...
+        'ciOpen', [false false], ...
+        'timeCoverageT1', [NaN NaN], ...
+        'zeroCrossingSeconds', NaN, ...
+        'signChangeIndex', NaN, ...
+        'reliableSignTransitions', NaN, ...
+        'signAmbiguous', false, ...
+        'candidateRates', [], ...
+        'candidateScores', [], ...
+        'magnitudePrediction', [], ...
+        'magnitudeNoiseModel', '', ...
+        'magnitudeNoiseSigma', NaN, ...
+        'magnitudeNoiseFloor', NaN, ...
+        'magnitudeCoilCount', NaN, ...
+        'noiseSource', '', ...
+        'selectionReason', '', ...
+        'complexCandidateSummary', struct(), ...
+        'magnitudeCandidateSummary', struct(), ...
+        'independentFitSummary', struct(), ...
+        'jointSharedM0', NaN, ...
+        'jointFieldRatio', NaN, ...
+        'jointAlpha', NaN, ...
+        'jointTimeWeights', [], ...
+        'jointTotalWeights', [], ...
+        'qc', 'not fitted', ...
+        'qcReasons', {{}}, ...
+        'roiMeta', struct());
+end
+
+function c = emptyMagnitudeCandidate()
+    c = struct('R1', NaN, 'beta', [NaN; NaN], 'ySigned', [], ...
+        'prediction', [], 'weights', [], 'score', Inf, ...
+        'boundHit', false, 'signChangeIndex', NaN);
+end
+
+function value = safeRsquare(sse, sst)
+    if isfinite(sse) && isfinite(sst) && sst > 0
+        value = 1 - sse / sst;
+    else
+        value = NaN;
+    end
+end
+
+function T1CI = rateCiToT1Ci(rateCI)
+    if numel(rateCI) ~= 2 || any(~isfinite(rateCI)) || any(rateCI <= 0)
+        T1CI = [NaN NaN];
+    else
+        T1CI = sort(1000 ./ rateCI);
+    end
+end
+
+function standardError = intervalToSE(interval, zCritical)
+    if numel(interval) == 2 && all(isfinite(interval)) && ...
+            isfinite(zCritical) && zCritical > 0
+        standardError = (max(interval) - min(interval)) / (2 * zCritical);
+    else
+        standardError = NaN;
+    end
+end
+
+function tZero = zeroCrossingTime(B, C, R1)
+    tZero = NaN;
+    if ~isfinite(B) || ~isfinite(C) || ~isfinite(R1) || C <= 0 || R1 <= 0
+        return
+    end
+    ratio = B / C;
+    if ratio > 0 && ratio <= 1
+        tZero = -log(ratio) / R1;
+    end
+end
+
+function tf = memberExists(value, name)
+    if isobject(value)
+        tf = isprop(value, name);
+    else
+        tf = isstruct(value) && isfield(value, name);
+    end
+end
+
+function value = safeSet(value, name, newValue)
+    try
+        if isobject(value)
+            if isprop(value, name)
+                value.(name) = newValue;
+            end
+        elseif isstruct(value)
+            value.(name) = newValue;
+        end
+    catch setException
+        warning('T1dispersion:ResultNotStored', ...
+            'Could not store result member "%s": %s', name, setException.message);
+    end
+end
 
 end
 
+
+
+
+
+
+
+
     end
 
 
 end
-
-

@@ -1,4 +1,4 @@
-function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
+function [kspace_whitened, info] = noise_whiten(kspace, opts)
 %NOISE_WHITEN  Coil noise whitening with robust noise covariance estimation.
 %
 % Assumes receiver channels are in the LAST dimension: [Nx Ny ... Nc]
@@ -11,12 +11,11 @@ function [kspace_whitened, info] = noise_whiten(kspace, obj, opts) %#ok<INUSD>
 %   opts.robust_clip   = true    % MAD clip per channel
 %   opts.clip_k        = 6       % MAD multiplier
 %   opts.lambda        = 1e-6    % regularisation
-%   opts.seed          = 0       % RNG seed for reproducibility (0 = don't set)
 %
 % info:
 %   .psi, .L, .p, .nSamples, .method
 
-    if nargin < 3 || isempty(opts), opts = struct(); end
+    if nargin < 2 || isempty(opts), opts = struct(); end
     opts = set_defaults(opts);
 
     origSize = size(kspace);
@@ -106,7 +105,6 @@ function opts = set_defaults(opts)
     def.robust_clip = true;
     def.clip_k      = 6;
     def.lambda      = 1e-6;
-    def.seed        = 0;
 
     f = fieldnames(def);
     for i = 1:numel(f)
@@ -120,11 +118,7 @@ function eta = collect_noise_samples(k4, opts)
 % k4: [Nx Ny Npages Nc]
     [Nx, Ny, Npages, Nc] = size(k4);
 
-    if opts.seed ~= 0
-        rng(opts.seed);
-    end
-
-    % Choose pages to sample (spread out; random is fine too)
+    % Choose pages spread across the acquisition.
     np = min(opts.max_pages, Npages);
     if np == Npages
         pages = 1:Npages;
@@ -166,12 +160,13 @@ function eta = collect_noise_samples(k4, opts)
                 page = reshape(k4(:,:,p,:), [], Nc);     % [Nx*Ny x Nc]
                 samp = page(maskv, :);                   % [nMasked x Nc]
 
-                % Optional random subsample to cap size
+                % Deterministic subsampling makes repeated reconstructions
+                % bitwise reproducible and does not alter MATLAB's global RNG.
                 if nTot > opts.max_samples
                     % take a fair share from each page
                     take = max(1, floor(opts.max_samples / numel(pages)));
                     if size(samp,1) > take
-                        idx = randperm(size(samp,1), take);
+                        idx = unique(round(linspace(1, size(samp,1), take)));
                         samp = samp(idx, :);
                     end
                 end

@@ -1,68 +1,110 @@
-function [windowed_kspace] = windowkspace(kspace,window_size,windowtype)
-%Windows kspace with a window_size point window with function windowtype
-%   Detailed explanation goes here
+function windowed_kspace = windowkspace(kspace, window_size, windowtype)
+%WINDOWKSPACE Apply a centred 2D window to k-space.
+%
+%   windowed_kspace = windowkspace(kspace, window_size, windowtype)
+%
+%   kspace      : k-space array. First two dimensions are read/phase.
+%                 Any trailing dimensions are preserved.
+%   window_size : Fractional window size, e.g. 1.0 = full matrix,
+%                 0.8 = 80% of matrix.
+%   windowtype  : 'None', 'Hann', 'Blackman', 'Hamming',
+%                 'Kaiser-Bessel', or 'Tukey'.
+%
+%   The function is robust to odd/even matrix sizes such as 175 x 174.
 
-dims = size(kspace); %we can reshape back to this dimensionality later
-kspace = reshape(kspace, dims(1), dims(2),[]); %reshape to a 3D matrix for easier processing
+dims = size(kspace);
+n1 = dims(1);
+n2 = dims(2);
 
-windowdim1 = round(window_size*dims(1)); %ensure the window is integer sized
-if mod(windowdim1,2)
-    windowdim1 = windowdim1 + 1; %ensure window is symmetric
+kspace_reshaped = reshape(kspace, n1, n2, []);
+
+% Ensure sensible window size
+if nargin < 2 || isempty(window_size)
+    window_size = 1;
 end
-windowdim2 = round(window_size*dims(2));
-if mod(windowdim2,2)
-    windowdim2 = windowdim2 + 1;
+
+if nargin < 3 || isempty(windowtype)
+    windowtype = 'None';
 end
 
-switch windowtype %handle the string for user choice of windowing function
+window_size = max(window_size, 0);
+
+% Calculate requested window dimensions.
+% Do NOT force even sizes. Odd-sized matrices need odd-sized windows.
+windowdim1 = max(1, round(window_size * n1));
+windowdim2 = max(1, round(window_size * n2));
+
+% Choose window function
+switch windowtype
     case 'None'
-        windowtype = 'rectwin';
+        matlab_window = 'rectwin';
         opts = [];
     case 'Hann'
-        windowtype = 'hann';
+        matlab_window = 'hann';
         opts = [];
     case 'Blackman'
-        windowtype = 'blackman';
+        matlab_window = 'blackman';
         opts = [];
     case 'Hamming'
-        windowtype = 'hamming';
+        matlab_window = 'hamming';
         opts = [];
     case 'Kaiser-Bessel'
-        windowtype = 'kaiser';
+        matlab_window = 'kaiser';
         opts = 3;
     case 'Tukey'
-        windowtype = 'tukeywin';
+        matlab_window = 'tukeywin';
         opts = 0.5;
     otherwise
-        windowtype = 'rectwin';
+        matlab_window = 'rectwin';
         opts = [];
 end
 
-if isempty(opts)    %deal with windows that need additional inputs eg kaiser
-    window1 = window(windowtype,windowdim1);
-    window2 = window(windowtype,windowdim2);
+% Generate 1D windows
+if isempty(opts)
+    window1 = window(matlab_window, windowdim1);
+    window2 = window(matlab_window, windowdim2);
 else
-    window1 = window(windowtype,windowdim1,opts); 
-    window2 = window(windowtype,windowdim2,opts);
+    window1 = window(matlab_window, windowdim1, opts);
+    window2 = window(matlab_window, windowdim2, opts);
 end
 
-windowfull = window1*window2';  %create a 2D window
+% Outer product to create 2D window
+windowfull = window1 * window2.';
 
-%deal with cases where the window is set to be larger or smaller than the kspace matrix
-if length(windowfull)>size(kspace,1)    
-    windowfull =  windowfull(round((size(windowfull,1) - size(kspace,1))/2)+1:end - round((size(windowfull,1) - size(kspace,1))/2),round((size(windowfull,2) - size(kspace,2))/2)+1:end - round((size(windowfull,2) - size(kspace,2))/2));
-end
+% Centre crop or centre pad to exactly match k-space size
+windowfull = centre_crop_or_pad_2d(windowfull, n1, n2);
 
-if length(windowfull)<size(kspace,1)
-    windowfull = padarray(windowfull,[fix((size(kspace,1)-size(windowfull,1))/2), fix((size(kspace,2)-size(windowfull,2))/2)]);
-end
-
-if length(windowfull)<size(kspace,1)
-   
-    windowfull = padarray(windowfull,[1, 1],'post');
-end
-
-windowed_kspace = reshape(kspace.*windowfull,dims); %reshape back to the original matrix size
+% Apply window, preserving trailing dimensions
+windowed_kspace = reshape(kspace_reshaped .* windowfull, dims);
 
 end
 
+
+function out = centre_crop_or_pad_2d(in, target_n1, target_n2)
+%CENTRE_CROP_OR_PAD_2D Centre crop or zero-pad a 2D array to requested size.
+
+[in_n1, in_n2] = size(in);
+
+% First crop if needed
+crop_start_1 = floor((in_n1 - min(in_n1, target_n1)) / 2) + 1;
+crop_start_2 = floor((in_n2 - min(in_n2, target_n2)) / 2) + 1;
+
+crop_end_1 = crop_start_1 + min(in_n1, target_n1) - 1;
+crop_end_2 = crop_start_2 + min(in_n2, target_n2) - 1;
+
+cropped = in(crop_start_1:crop_end_1, crop_start_2:crop_end_2);
+
+% Then pad if needed
+out = zeros(target_n1, target_n2, class(in));
+
+[crop_n1, crop_n2] = size(cropped);
+
+insert_start_1 = floor((target_n1 - crop_n1) / 2) + 1;
+insert_start_2 = floor((target_n2 - crop_n2) / 2) + 1;
+
+insert_end_1 = insert_start_1 + crop_n1 - 1;
+insert_end_2 = insert_start_2 + crop_n2 - 1;
+
+out(insert_start_1:insert_end_1, insert_start_2:insert_end_2) = cropped;
+
+end

@@ -5,14 +5,16 @@ function res = ifft2c(x, n1, n2)
 if nargin < 2 || isempty(n1), n1 = size(x,1); end
 if nargin < 3 || isempty(n2), n2 = size(x,2); end
 
-% Shift only dims 1 and 2
-x = fftshift(x, 1);
-x = fftshift(x, 2);
+% Convert centred k-space to MATLAB's unshifted FFT ordering. Using
+% ifftshift here is important for odd matrix sizes; fftshift is only
+% interchangeable with it for even dimensions.
+x = ifftshift(x, 1);
+x = ifftshift(x, 2);
 
 res = ifft2(x, n1, n2);
 
-res = ifftshift(res, 1);
-res = ifftshift(res, 2);
+res = fftshift(res, 1);
+res = fftshift(res, 2);
 
 % Orthonormal scaling for the 2D plane only
 res = sqrt(n1*n2) .* res;

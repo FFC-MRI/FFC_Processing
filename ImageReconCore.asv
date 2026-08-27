@@ -1,0 +1,2679 @@
+classdef ImageReconCore
+    %UNTITLED Summary of this class goes here
+    %   Detailed explanation goes here
+
+    properties (SetAccess = public)
+        sequence %the pulse sequence ppl name (eg gechoa, fse etc)
+        displayname %user friendly sequence name eg Spin-Echo
+        name %filename
+        filelocation %fileID
+        fileindex %which file is this in the savelist?
+        rawdata
+        originalcomplexkspace
+        complexkspace %raw MRI data before reconstruction
+        compleximage %complex images
+        complexcombined
+        magimage
+        magkspace
+        scaledimages
+        phaseimage
+        psirrealimage    % <-- use this for fitting (signed)
+        psirimagimage                 % residuals (diagnostic)
+        psirphi_ref                  % saved for QC
+        psirweights
+        nfids %number of nmr excitations used to generate the file
+        nmrdatatype %data type
+        echoes %number of echoes. Defaults to 1 for sequences if unused.
+        experiments %number of experiments
+        samples %number of samples in the frequency encoding direction
+        slices %number of slices
+        views %number of phase encoding steps (2D)
+        views2 %number of phase encoding steps (3D)
+        bladeangles %propellor blade angles
+        twopointT1 %two pt acquisition strategy
+        n_timepoints %number of evolution times
+        n_fieldpoints %number of evolution fields
+        timepoints %list of evolution times in seconds
+        fieldpoints %list of evolution fields in mT
+        thk %slice thickness
+        fov %fov in mm
+        TE %Echo time
+        FlipAngle %indegrees
+        averages %signal averages
+        orientation %scan orientation
+        phase_direction %0 vertical or 1 horizontal
+        resolution_inplane %in plane resolution in mm
+        resolution_throughplane %through plane resolution in mm
+        bandwidth %acquisition bandwidth
+        partialkspace %is this a half Fourier acquisition?
+        T1Maps %Put processed T1/R1 maps here
+        R1Maps %Put processed T1/R1 maps here
+        window_function %windowing function
+        window_size     %size of window
+        fft_size        %size of 2dfft (symmetrical)
+        fft_size_3d
+        denoise_filter  %denoising filter
+        denoise_params  %filter kernel
+        mask
+        dispersioncurve
+        R1T1 %R1 or T1
+        fid %file ID
+        backgroundselect %should the user define the background?
+        reprocess %should the file be reprocessed?
+        checkfit %should the user check the t1 fit?
+        n_receivers %number of receivers
+        multichannel_recon %what channels are selected
+        rot_theta %describes rotation applied using GUI
+        flipH %mirror horizontally
+        flipV %mirror vertically
+        param = struct %other sequence parameters go here
+        SENSE %undersampled
+        registration_tform %transformation used for image registration
+        TwoDimensional
+        recon2d
+        geomT
+        selected_coils_original
+        biascorrect
+        combination
+        probe %the RF coil used
+    end
+
+
+    methods
+        function obj = ImageReconCore(fid,filetype,varargin) %Constructor function. Takes file ID (fid) and fills properties with the appropriate data from the file.
+            % patch for full path argument (LB 25/06/12, 3 lines)
+            switch filetype
+                %%
+                case '.mat'
+                    filename = fopen(fid);
+                    obj.filelocation = filename;
+                    file = load(filename);
+                    if size(varargin)>0
+                        index =varargin{1};
+                    else
+                        index = length(file.saveList);
+                    end
+                    file = file.saveList{index};
+                    obj.fileindex = index;
+                    obj.samples = cell2mat(file.pprParamList(strcmp('NO_SAMPLES', file.pprParamList(:,1)),3));
+                    obj.views = cell2mat(file.pprParamList(strcmp('NO_VIEWS', file.pprParamList(:,1)),3));
+                    if isempty(cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3)))
+                        obj.views2 = 1;
+                    else
+                        obj.views2 = cell2mat(file.pprParamList(strcmp('NO_VIEWS_2', file.pprParamList(:,1)),3));
+                    end
+
+                    obj.slices = cell2mat(file.pprParamList(strcmp('NO_SLICES', file.pprParamList(:,1)),3));
+
+                    if isempty(cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3)))
+                        obj.echoes = 1;
+                    else
+                        obj.echoes = cell2mat(file.pprParamList(strcmp('NO_ECHOES', file.pprParamList(:,1)),3));
+                    end
+
+
+
+                    obj.experiments = size(file.data,6)*size(file.data,7);
+                    obj.averages = size(file.data,8);
+                    obj.n_receivers = size(file.data,9);
+                    obj.recon2d = obj.samples;
+
+                    truedim1 = size(file.data,1); %try to deal with aborted or corrupted scans by looking at what we have vs what we expected
+                    truedim2 = size(file.data,2);
+
+                    %                     if truedim1 > obj.samples
+                    %                         file.data = file.data(1:obj.samples,:,:,:,:,:,:,:); %deal with that strange 4x 0 padding issue the new evo produces.
+                    %                     end
+                    %
+                    if truedim1 <  obj.samples
+                        file.data = padarray(file.data,abs(obj.samples-truedim1),0,'post');
+                    end
+                    if truedim2 <  obj.views
+                        file.data = padarray(file.data,[0,abs(obj.views-truedim2)],0,'post');
+                    end
+
+                    obj.rawdata = reshape(file.data,obj.samples,obj.views,[]); %reshaping to the correct dimensions will happen later, for now stick with [2D,everything else] for preprocessing
+                    obj.n_timepoints = size(file.data,6);
+                    obj.n_fieldpoints = size(file.data,7);
+
+                    obj.timepoints = file.waveformProfile.generator.Tevo.*1000;
+                    obj.fieldpoints = file.waveformProfile.generator.Bevo.*1000;
+                    obj.fov = cell2mat(file.pprParamList(strcmp('FOV', file.pprParamList(:,1)),2));
+                    obj.TE = cell2mat(file.pprParamList(strcmp('te', file.pprParamList(:,2)),3));
+                    obj.FlipAngle = cell2mat(file.pprParamList(strcmp('alpha', file.pprParamList(:,2)),3));
+                    temp1 = cell2mat(file.pprParamList(strcmp('SLICE_THICKNESS', file.pprParamList(:,1)),3));
+                    obj.thk = temp1(2);
+                    temp1 = file.pprParamList(strcmp('SAMPLE_PERIOD', file.pprParamList(:,1)),3);
+                    temp1 = temp1{1,1}{1,1};
+                    obj.bandwidth = 10000/temp1;
+                    phaseoverundersample = cell2mat(file.pprParamList(strcmp('oversample2', file.pprParamList(:,2)),3));
+                    obj.SENSE = 0;
+                    try
+                        obj.SENSE = cell2mat(file.pprParamList(strcmp('sense_onoff', file.pprParamList(:,2)),3));
+                    catch
+                    end
+                    if obj.views ~= obj.samples && phaseoverundersample == 0
+                        obj.partialkspace = 1;
+                    else
+                        obj.partialkspace = 0;
+                    end
+                    try
+                        obj.bladeangles = cell2mat(file.pprParamList(strcmp('prop_angle', file.pprParamList(:,2)),3));
+                    catch
+                    end
+                    temp1 = cell2mat(file.pprParamList(strcmp('X_ANGLE', file.pprParamList(:,1)),3));
+                    xangle = temp1(2:obj.slices+1)./10;
+                    temp1 = cell2mat(file.pprParamList(strcmp('Y_ANGLE', file.pprParamList(:,1)),3));
+                    yangle = temp1(2:obj.slices+1)./10;
+                    temp1 = cell2mat(file.pprParamList(strcmp('Z_ANGLE', file.pprParamList(:,1)),3));
+                    zangle = temp1(2:obj.slices+1)./10;
+                    obj.orientation = [xangle;yangle;zangle];
+                    obj.phase_direction = cell2mat(file.pprParamList(strcmp('PHASE_ORIENTATION', file.pprParamList(:,1)),3));
+                    obj.resolution_inplane = obj.fov./obj.samples;
+                    obj.resolution_throughplane = obj.thk;
+                    obj.twopointT1 = 0;
+                    obj.window_function = 'none';
+                    obj.window_size = 1;
+                    obj.fft_size = obj.samples;
+                    obj.denoise_filter = 'none';
+                    obj.denoise_params = []; %filter kernel
+                    obj.param = file.pprParamList;
+                    obj.TwoDimensional =1;
+                    [~,obj.sequence] = bst_fileparts(cell2mat(file.pprParamList(strcmp('PPL', file.pprParamList(:,1)),2)));
+                    switch obj.sequence
+                        case 'H9_ir_se_nav_v2'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_ir_se_nav_v3'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_ir_se_nav_v4'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_se_multislice'
+                        case 'H9_ge_looklocker_nav'
+                            obj.sequence = 'H9_ge_looklocker';
+
+                    end
+                    fclose(fid);
+                    %%
+                case '.MRD'
+                    %%
+                    if ischar(fid)
+                        fid = fopen(fid);
+                    end
+                    % Read file into variables
+                    obj.fid = fid;
+                    % First, the header.
+                    obj.samples = single(fread(fid, 1, '*int32'));
+                    obj.views = single(fread(fid, 1, '*int32'));
+                    obj.views2 = single(fread(fid, 1, '*int32'));
+                    obj.slices = single(fread(fid, 1, '*int32'));
+                    fseek(fid, 2, 'cof');
+                    obj.nmrdatatype = fread(fid, 1, '*int32'); % Yes, but assume complex floats.
+                    fseek(fid, hex2dec('98'), 'bof');
+                    obj.echoes = single(fread(fid, 1, '*int32'));
+                    obj.experiments = single(fread(fid, 1, '*int32'));%%-8;%%%%%%%%%%%%%%%%%%%%%%
+                    obj.nfids = single(obj.views*obj.views2*obj.slices*obj.echoes*obj.experiments);
+
+                    % Next, the data.
+                    fseek(fid, hex2dec('200'), 'bof');
+                    [AR, ~] = fread(fid, [obj.samples,obj.nfids], '*float32', 4);
+                    fseek(fid, -8*obj.samples*obj.nfids + 4, 'cof');
+                    [AI, ~] = fread(fid, [obj.samples,obj.nfids], '*float32', 4);
+                    %            if countr ~= counti, error('Data length mismatch during read'), end
+                    %            if countr ~= obj.samples*obj.nfids, error('Data length mismatch during read'), end
+                    AR = single(AR);
+                    AI = single(AI);
+                    obj.rawdata = (AR) + (AI)*1i;
+
+                    % Finally, the parameters, and close the file.
+                    pb = fread(fid)';
+                    ps = char(pb);
+                    ps((pb==44)|(pb==10)|(pb==13)|(pb==0)) = 32;    % erase special characters
+                    ps = strtrim(regexp(ps,' :','split'));  % clean up whitespace
+                    P = regexp(ps,'\s+','split');
+                    for j=2:size(P,2)-1
+                        if isequal(P{1,j}{1},'VAR') || isequal(P{1,j}{1},'VAR_ARRAY'), P{1,j}(1) = []; end %builds a params structure
+                        %                 eval(['params.' genvarname(P{1,j}{1}) ' = P{1,j}(2:end);']);
+                        eval(['params.' matlab.lang.makeValidName(P{1,j}{1}) ' = P{1,j}(2:end);']);
+                    end
+                    obj.param =  params; %fills param property with the sequence parameters
+
+                    if isfield(obj.param,'two_pt_switch')
+                        obj.twopointT1 = str2double(obj.param.two_pt_switch{1});
+                    else
+                        obj.twopointT1 =0;
+                    end
+
+                    switch obj.twopointT1
+                        case 1
+                            if isfield(obj.param,'b_evol')
+                                obj.fieldpoints = (nonzeros(cellfun(@str2num, obj.param.b_evol(2:end))));
+                                obj.fieldpoints =  obj.fieldpoints(1:obj.experiments);
+                            else
+                                obj.fieldpoints = 200;
+                            end
+                            if isfield(obj.param,'t_evol')
+                                obj.timepoints = (nonzeros(cellfun(@str2num, obj.param.t_evol(2:end))));
+                                obj.timepoints =  obj.timepoints(1:obj.experiments)';
+                                if isempty(obj.timepoints)
+                                    obj.timepoints = 0;
+                                else
+
+                                end
+                            else
+                                obj.timepoints = 0;
+                            end
+                        otherwise
+                            if isfield(obj.param,'b_evol')
+                                obj.fieldpoints = unique(nonzeros(cellfun(@str2num, obj.param.b_evol(2:end))));
+                                temp =length(obj.fieldpoints);
+                                obj.fieldpoints = cellfun(@str2num, obj.param.b_evol(2:temp+1));
+                            else
+                                obj.fieldpoints = 200;
+                            end
+                            if isfield(obj.param,'t_evol')
+                                obj.timepoints = flipud(unique(nonzeros(cellfun(@str2num, obj.param.t_evol(2:end)))));
+                                if isempty(obj.timepoints)
+                                    obj.timepoints = 0;
+                                end
+                            else
+                                obj.timepoints = 0;
+                            end
+                    end
+                    obj.n_fieldpoints = length(obj.fieldpoints);
+                    obj.n_timepoints = obj.experiments./obj.n_fieldpoints;
+                    %              obj.timepoints = [0.252840000000000,0.165969000000000,0.108945000000000,0.0715140000000000,0.0469430000000000,0.0308140000000000,0.0202270000000000,0.161758000000000,0.106181000000000,0.0696990000000000,0.0457520000000000,0.0300320000000000,0.0197140000000000,0.0129410000000000,0.138245000000000,0.0907470000000000,0.0595680000000000,0.0391020000000000,0.0256670000000000,0.0168480000000000,0.0110600000000000,0.127527000000000,0.0837120000000000,0.0549500000000000,0.0360700000000000,0.0236770000000000,0.0155420000000000,0.0102020000000000,0.0957850000000000,0.0628750000000000,0.0412730000000000,0.0270920000000000,0.0177840000000000,0.0116740000000000,0.00766300000000000,0.0657500000000000,0.0431600000000000,0.0283310000000000,0.0185970000000000,0.0122070000000000,0.00801300000000000,0.00526000000000000,0.0567000000000000,0.0372190000000000,0.0244310000000000,0.0160370000000000,0.0105270000000000,0.00691000000000000,0.00453600000000000,0.0541100000000000,0.0355190000000000,0.0233150000000000,0.0153050000000000,0.0100460000000000,0.00659500000000000,0.00432900000000000,0.166870000000000,0.109537000000000,0.0719020000000000,0.0471980000000000,0.0309820000000000,0.0203370000000000,0.0133500000000000,0.161053000000000,0.105718000000000,0.0693950000000000,0.0455530000000000,0.0299020000000000,0.0196280000000000,0.0128840000000000,0.156797000000000,0.102925000000000,0.0675620000000000,0.0443490000000000,0.0291120000000000,0.0191090000000000,0.0125440000000000,0.153473000000000,0.100742000000000,0.0661290000000000,0.0434090000000000,0.0284940000000000,0.0187040000000000,0.0122780000000000,0.150690000000000,0.0989160000000000,0.0649300000000000,0.0426220000000000,0.0279780000000000,0.0183650000000000,0.0120550000000000,0.148222000000000,0.0972960000000000,0.0638670000000000,0.0419240000000000,0.0275200000000000,0.0180640000000000,0.0118580000000000,0.146005000000000,0.0958410000000000,0.0629120000000000,0.0412960000000000,0.0271080000000000,0.0177940000000000,0.0116800000000000,0.144090000000000,0.0945840000000000,0.0620860000000000,0.0407550000000000,0.0267520000000000,0.0175610000000000,0.0115270000000000,0.142487000000000,0.0935320000000000,0.0613960000000000,0.0403020000000000,0.0264550000000000,0.0173650000000000,0.0113990000000000,0.141193000000000,0.0926820000000000,0.0608380000000000,0.0399350000000000,0.0262140000000000,0.0172080000000000,0.0112950000000000]'.*1000;
+                    obj.thk = str2double(obj.param.SLICE_THICKNESS{3});
+                    obj.fov = str2double(obj.param.FOV{1});
+                    obj.resolution_inplane = obj.fov./obj.samples;
+                    obj.resolution_throughplane = obj.thk;
+                    obj.fieldpoints = flipud(obj.fieldpoints);
+                    obj.timepoints = reshape(obj.timepoints,obj.n_timepoints,[])';
+                    clear obj.timepoints;
+                    %  obj.timepoints=[0.454940000000000,0.196028000000000,0.0844660000000000,0.0363950000000000;0.359515000000000,0.154910000000000,0.0667490000000000,0.0287610000000000;0.243638000000000,0.104980000000000,0.0452350000000000,0.0194910000000000;0.157710000000000,0.0679550000000000,0.0292810000000000,0.0126170000000000;0.102085000000000,0.0439870000000000,0.0189530000000000,0.00816700000000000;0.0660800000000000,0.0284730000000000,0.0122690000000000,0.00528600000000000].*1000;
+                    fclose(fid);
+                    [~,file] = bst_fileparts(obj.param.PPL{:}); %decomposes pulse sequence path and file name into parts
+                    obj.sequence = file;
+
+                    %default recon params
+                    obj.window_function = 'None';
+                    obj.window_size = 1;
+                    obj.fft_size = obj.samples;
+                    obj.denoise_filter = 'None';
+                    obj.denoise_params = []; %filter kernel
+
+                    switch obj.sequence
+                        case 'H9_ir_se_nav_v2'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_ir_se_nav_v3'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_ir_se_nav_v4'
+                            obj.sequence = 'H9_ir_se';
+                        case 'H9_se_multislice'
+                        case 'H9_ge_looklocker_nav'
+                            obj.sequence = 'H9_ge_looklocker';
+                    end
+
+                case '.dat'
+                    obj.rawdata = fid.data;
+                    obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
+                    obj.samples = fid.par.md1d;
+                    obj.views = fid.par.md2d;
+                    obj.slices = fid.par.md3d;
+                    obj.experiments =fid.par.md4d;
+                    obj.n_receivers = fid.par.ncoils;
+                    obj.echoes = 1;
+                    obj.TE = fid.par.te*1000;
+                    obj.FlipAngle = fid.par.fa;
+                    obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
+                    obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
+                    obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
+                    obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
+                    obj.resolution_throughplane = obj.thk;
+                    obj.sequence = fid.par.serieName;
+                    obj.partialkspace =0;
+                    if fid.par.cameleon.USER_ZERO_FILLING_2D ~=0
+                        obj.partialkspace =1;
+                    end
+                    obj.geomT = eye(3);
+
+                    obj.recon2d = fid.par.cameleon.USER_MATRIX_DIMENSION_2D;
+
+                    obj.averages =1;
+                    obj.twopointT1 = 0;
+                    obj.window_function = 'none';
+                    obj.window_size = 1;
+                    obj.fft_size = obj.samples;
+                    obj.fft_size_3d = obj.slices;
+                    obj.denoise_filter = 'none';
+                    obj.denoise_params = []; %filter kernel
+                    obj.param = fid.par.cameleon;
+
+                    if fid.par.cameleon.MULTI_PLANAR_EXCITATION ==1
+                        obj.TwoDimensional = 1;
+                    else
+                        obj.TwoDimensional = 0; %ie 3d
+                    end
+
+
+
+                    switch obj.param.TRANSFORM_PLUGIN
+
+                        case 'Sequential4DCine'
+                            obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
+                            obj.timepoints = obj.param.ACQUISITION_TIME_OFFSET;
+                            obj.n_fieldpoints =1;
+                            obj.fieldpoints = 200;
+
+                        otherwise
+                            obj.n_timepoints=1;
+                            obj.n_fieldpoints =1;
+                            obj.timepoints = 1;
+                            obj.fieldpoints = 200;    
+                    end
+
+                    if isfield(obj.param,'SE_TYPE')
+                        if strcmp(obj.param.SE_TYPE,'MultiEcho')
+                            obj.n_timepoints = obj.param.ECHO_TRAIN_LENGTH;
+                            obj.timepoints = obj.param.ECHO_TIME;
+                        end
+                    end
+
+                    if isfield(obj.param,'FCI_LIST_OF_BEVO')
+                        obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
+                        obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
+                        obj.timepoints = [];
+                        obj.fieldpoints = []; 
+                        if obj.param.FCI_T1_LOG_DIST ==1
+                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                                obj.timepoints(n,:) = logspace(log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER),log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER),obj.param.FCI_NUMBER_OF_TEVO);
+                            end
+                        else
+                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
+                                obj.timepoints(n,:) = linspace(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER,obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER,obj.param.FCI_NUMBER_OF_TEVO);
+                            end
+                        end
+                        obj.timepoints = obj.timepoints.*1000;
+                        obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
+                      
+                    end
+                obj.probe = obj.param.PROBES;
+      
+     
+                  
+
+
+            end
+            %%
+        end %function
+
+        function obj = rename_sequence(obj)
+            switch lower(strcat(char(regexp(obj.sequence,'[a-zA-Z]','match'))'))
+                case 'hsenavv'
+                    obj.displayname = 'Field-Cycling Spin-Echo';
+                case 'hsemultislice'
+                    obj.displayname = 'Multislice Spin-Echo';
+                case 'hflash'
+                    obj.displayname = 'Turbo Flash';
+                otherwise
+                    obj.displayname = obj.sequence; %for sequences we don't recognise
+            end
+        end
+
+        function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set
+            if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
+                try
+                    temp1 = load(obj.filelocation);
+                    matfile = temp1.saveList{obj.fileindex};
+                catch
+                end
+                obj.views = size(obj.rawdata,2);
+                A = single(obj.rawdata);
+                A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
+                A = mean(A,7);
+                if 1 ==1
+                    A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
+
+                    if obj.echoes>1
+                        A(:,:,2,:,:,:) = []; %throw out the navigator data
+                    else
+                        A = squeeze(A);
+
+                    end
+
+                    if obj.recon2d == 0
+                    end
+
+                    %   A = removespikes(A);
+                    A = reshape(A,obj.samples,obj.views,[]);
+
+                    % if obj.samples ~= obj.views && obj.partialkspace ==1
+                    %     try
+                    %         A = padarray(single(A),[0,single(obj.recon2d-obj.views)],0,'post');
+                    %         obj.views = obj.recon2d;
+                    %     catch
+                    %         A = padarray(single(A),[0,single(obj.samples-obj.views)],0,'post');
+                    %         obj.views = obj.samples;
+                    %     end
+                    %
+                    %     if mean(A(:,1,1))==0
+                    %         A(:,1,:) = A(:,2,:); %for some reason the console occasionally fills the first line of kspace with 0s which messes pocs up. This fixes it.
+                    %     end
+                    %     %             AA = centre_kspace(AA);
+                    %
+                    %     %PF recon if we need to
+                    %     % try
+                    %     %     for n=1:size(A,3)
+                    %     %         [~, A(:,:,n)] = pocs(A(:,:,n),10,0);
+                    %     %     end
+                    %     % catch
+                    %     end
+
+                    % --- Symmetric undersampling about k0 (NOT partial Fourier) ---
+                    % Phase-encode dimension is dim 2
+
+                    fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);        % nominal
+                    acqViews  = double(obj.param.ACQUISITION_MATRIX_DIMENSION_2D); % collected
+
+                    % If you trust obj.views more than the header, you can cross-check:
+                    % acqViews = double(obj.views);
+
+                    % Optional sanity check against USER_PARTIAL_PHASE (doesn't drive padding)
+                    if isfield(obj.param,'USER_PARTIAL_PHASE')
+                        pct = double(obj.param.USER_PARTIAL_PHASE);
+                        % expectedAcq = round(fullViews * pct/100);
+                        % (don't enforce; some consoles round differently)
+                    end
+
+                    curViews = size(A,2);
+
+                    % If the array doesn't match the header, prefer the actual array size.
+                    % (This avoids padding the wrong amount if obj.views/header got stale.)
+                    if curViews ~= acqViews
+                        acqViews = curViews;
+                    end
+
+                    targetViews = fullViews;
+
+                    if acqViews < targetViews
+                        miss = targetViews - acqViews;
+
+                        pre  = floor(miss/2);
+                        post = miss - pre;   % handles odd miss cleanly
+
+                        A = single(A); % ensure consistent type
+                        if pre > 0
+                            A = padarray(A, [0 pre],  0, 'pre');
+                        end
+                        if post > 0
+                            A = padarray(A, [0 post], 0, 'post');
+                        end
+
+                        obj.views = targetViews;
+
+                    elseif acqViews > targetViews
+                        % Rare case: acquired more than nominal; crop symmetrically about k0
+                        extra = acqViews - targetViews;
+                        pre  = floor(extra/2);
+                        post = extra - pre;
+
+                        A = A(:, (1+pre):(end-post), :, :, :, :);  % keeps all higher dims
+                        obj.views = targetViews;
+
+                    else
+                        % already the right size
+                        obj.views = acqViews;
+                    end
+
+           
+
+                    A = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                    %  [correctedkspace] = correct_phase(A,obj.backgroundselect,obj.n_receivers);
+                    correctedkspace = A;
+                    % fprintf("kspace delta: %.3g\n", norm(correctedkspace(:)-A(:)) / norm(A(:)));
+                else
+                    correctedkspace = reshape(A,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                end
+                obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
+                %so we can undo windowing etc keep an untouched version of kspace prior to FFT
+            if strcmp(string(obj.probe), "Body Coil 4Rx Coil")
+            obj.originalcomplexkspace = noise_whiten(obj.complexkspace);
+                else
+             obj.originalcomplexkspace = obj.complexkspace;
+            end
+               
+            else
+                obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
+                if strcmp(string(obj.probe), "Body Coil 4Rx Coil")
+            obj.originalcomplexkspace = noise_whiten(obj.complexkspace);
+                else
+             obj.originalcomplexkspace = obj.complexkspace;
+            end
+            end
+
+        end
+
+
+        function obj = buildimages(obj)
+
+            %BUILDIMAGES  Convert k-space to image space, perform coil combination, optional bias correction, filtering.
+            %
+            
+            obj.compleximage =[];
+            obj.complexkspace = obj.originalcomplexkspace;
+            
+            obj = correct_orientation(obj);
+              %  obj.complexkspace = noise_whiten(obj.complexkspace);
+
+for f = 1:size(obj.complexkspace,5);
+
+[ obj.complexkspace, editInfo] = editer( obj.complexkspace, edopts);
+%                 opts = struct;
+%         opts.scope = 'global';
+%         opts.method = 'outer';
+% opts.robust_clip = false;
+% opts.clip_k = 6;
+%         opts.max_pages = 32;
+%         opts.max_samples = 20000;
+%                 opts.lambda = 1e-5;   % usually needs stronger regularisation
+%             [obj.complexkspace] = correctCoherentRF_nd(obj.complexkspace,obj,opts);
+% obj.complexkspace(:,:,:,:,:,1:7)=0;
+            % ----------- Precompute padding -----------
+        % ----------- Precompute padding -----------
+
+% Current acquired matrix sizes
+nPhase = size(obj.complexkspace, 2);
+nRead  = size(obj.complexkspace, 1);
+nPart  = size(obj.complexkspace, 3);   % slice/partition dimension
+
+% Existing in-plane target sizes
+targetRead  = round(double(obj.fft_size));
+targetPhase = round(double(obj.fft_size) * double(obj.views) / double(obj.samples));
+
+% Default: no through-plane zero filling
+targetPart = nPart;
+
+% Optional through-plane zero filling for 3D scans only
+if obj.TwoDimensional ~= 1
+    if isprop(obj, 'fft_size_3d') && ~isempty(obj.fft_size_3d)
+        targetPart = round(double(obj.fft_size_3d));
+        %%  targetPart = 150;
+    end
+end
+
+% Do not allow accidental cropping here
+if targetRead < nRead
+    error('buildimages:fftSizeTooSmall', ...
+        'obj.fft_size=%d is smaller than acquired readout size %d.', ...
+        targetRead, nRead);
+end
+
+if targetPhase < nPhase
+    error('buildimages:phaseFftSizeTooSmall', ...
+        'Target phase FFT size %d is smaller than acquired phase size %d.', ...
+        targetPhase, nPhase);
+end
+
+if targetPart < nPart
+    error('buildimages:partitionFftSizeTooSmall', ...
+        'obj.fft_size_3d=%d is smaller than acquired partition size %d.', ...
+        targetPart, nPart);
+end
+
+% Exact centred zero-fill padding.
+% This avoids off-by-one errors when target - acquired is odd.
+padPhaseTotal = targetPhase - nPhase;
+padReadTotal  = targetRead  - nRead;
+padPartTotal  = targetPart  - nPart;
+
+padPre  = [floor(padPhaseTotal/2), floor(padReadTotal/2), floor(padPartTotal/2)];
+padPost = [ceil( padPhaseTotal/2), ceil( padReadTotal/2), ceil( padPartTotal/2)];
+            
+            % ----------- Window k-space first -----------
+            obj.complexkspace = windowkspace(obj.complexkspace, obj.window_size, obj.window_function);
+
+            % ----------- Pad k-space -----------
+% dims are: phase/read/partition/time/field/coil
+kpad_full = padarray(obj.complexkspace, padPre,  0, 'pre');
+kpad_full = padarray(kpad_full,          padPost, 0, 'post');
+
+            % ----------- Coil selection (trim once and renumber) -----------
+            % obj.multichannel_recon may be:
+            %   - scalar 1 (meaning "all coils")
+            %   - logical mask over the ORIGINAL coil dimension
+            %   - numeric index list into the ORIGINAL coil dimension (e.g. [2 3 4 5 6 7])
+            opts_orig   = obj.multichannel_recon;      % numeric index list (e.g. [2 3 4 5 6 7])
+            nCoils_orig = size(kpad_full, 6);
+            probeIsQBC = false;
+            try
+                probeIsQBC = isfield(obj.probe) && strcmp(string(obj.probe), "Quadrature BirdCage");
+            catch
+                probeIsQBC = false;
+            end
+
+            opts_orig = obj.multichannel_recon;
+
+            userDidNotSelect = 0;
+
+            if probeIsQBC && userDidNotSelect
+                if nCoils_orig >= 8
+                    obj.multichannel_recon = 8;   % use only channel 8
+                else
+                    obj.multichannel_recon = 1;   % fallback to channel 1
+                end
+                opts_orig = obj.multichannel_recon; % update local copy
+            end
+            if isempty(opts_orig)
+                sel_orig = 1:nCoils_orig;
+            else
+                if ~isnumeric(opts_orig)
+                    error('buildimages:coilSelNotNumeric', ...
+                        'multichannel_recon must be a numeric index list. Got %s.', class(opts_orig));
+                end
+
+                sel_orig = unique(round(opts_orig(:).'));   % row vector, unique
+                sel_orig(isnan(sel_orig)) = [];
+
+                if isempty(sel_orig)
+                    error('buildimages:coilSelEmptyAfterParse', ...
+                        'multichannel_recon became empty after parsing.');
+                end
+
+                if any(sel_orig < 1) || any(sel_orig > nCoils_orig)
+                    error('buildimages:coilIndexOutOfRange', ...
+                        'Selected coil indices [%s] exceed available coils 1..%d.', num2str(sel_orig), nCoils_orig);
+                end
+            end
+
+            obj.selected_coils_original = sel_orig;
+
+            % Trim padded k-space to the selected coils; from here on coils are renumbered 1..nSel
+            kpad = kpad_full(:,:,:,:,:,sel_orig);
+            opts = 1:size(kpad,6);   % local coil index space (1..nSel)
+            nSel = numel(opts);
+
+            % ----------- FFT to image space (per coil) -----------
+            if obj.TwoDimensional == 1
+                obj.compleximage = ifft2c(kpad);
+            else
+                % centered ifft over first 3 spatial dims, keeps all other dims intact
+                for t =1:size(kpad,4)
+                    for f=1:size(kpad,5)
+                        obj.compleximage(:,:,:,t,f,:) = ifft3c(kpad(:,:,:,t,f,:));
+                    end
+                end
+            end
+
+
+            % ----------- Magnitude k-space (for QC / debugging) -----------
+            % Keep in ORIGINAL coil index space for consistency with saved raw k-space
+            obj.magkspace = rssq(obj.complexkspace(:,:,:,:,:,sel_orig), 6);
+
+            % ----------- Receiver combination mode (from GUI dropdown) -----------
+            combineMode = "ACS/Walsh"; % default
+            if isprop(obj,'combination') && ~isempty(obj.combination)
+                combineMode = string(obj.combination);
+            end
+
+            % ----------- Bias correction mode (from GUI dropdown) -----------
+            biasMode = "Off"; % default
+            if isprop(obj,'biascorrect') && ~isempty(obj.biascorrect)
+                biasMode = string(obj.biascorrect);
+            end
+
+            % Initialise outputs
+            obj.complexcombined = [];
+            obj.magimage = [];
+            obj.phaseimage = [];
+
+            % ----------- Combine -----------
+            if nSel <= 1
+                % Single-coil path: selected coil becomes coil 1 after trimming
+                obj.complexcombined = obj.compleximage(:,:,:,:,:,1);
+                obj.magimage = abs(obj.complexcombined);
+
+            else
+                switch combineMode
+                    case "RSSQ"
+                        % Magnitude-only
+                        obj.complexcombined = [];
+                        obj.magimage = rssq(obj.compleximage, 6);
+
+                    case "Adaptive"
+                        % Smoothed self-calibrated adaptive complex combine
+                        ccopts = struct();
+ccopts.coils = 1:size(obj.compleximage,6);
+ccopts.sigma = 4;
+ccopts.maskFrac = 0.1;
+ccopts.referenceMode = 'signalcoil';
+                        obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, ccopts);
+                        obj.magimage = abs(obj.complexcombined);
+                        obj.compleximage = obj.complexcombined;
+                    case "ACS/Walsh"
+                        % ACS/Walsh sensitivity maps + Roemer combine
+                        maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
+                        obj.complexcombined = combine_with_maps(obj.compleximage, maps, opts, obj);
+                        obj.magimage = abs(obj.complexcombined);
+                        obj.compleximage = obj.complexcombined;
+
+                    otherwise
+                        
+                        obj.complexcombined = [];
+                        obj.magimage = rssq(obj.compleximage, 6);
+                end
+
+                % ----------- Optional bias-field correction -----------
+                switch biasMode
+                    case "Off"
+                        % no-op
+
+                    case "ACS"
+                        [bias, mask3] = bias_field_from_acs(kpad, opts, obj);
+                        if exist('apply_bias_field_safe','file') == 2
+                            obj.magimage = apply_bias_field_safe(obj.magimage, bias, mask3, obj);
+                        else
+                            % obj.magimage = apply_bias_field(obj.magimage, bias, mask3, obj);
+                            [obj.magimage] = map_guided_bias_correct(obj.magimage, maps, obj);
+                        end
+
+                    otherwise
+                        % no-op
+                end
+            end
+
+            % Safety: ensure magimage exists
+            if isempty(obj.magimage)
+                if ~isempty(obj.complexcombined)
+                    obj.magimage = abs(obj.complexcombined);
+                else
+                    obj.magimage = rssq(obj.compleximage, 6);
+                end
+            end
+
+            % ----------- Denoise / post-filter -----------
+         %  obj.magimage = ffc_mri_filter(obj.magimage, obj.denoise_filter, obj.denoise_params);
+
+            % ----------- Phase image (only meaningful for complex combined) -----------
+            if ~isempty(obj.complexcombined)
+                obj.phaseimage = angle(obj.complexcombined);
+            else
+                obj.complexcombined = sum(1.*obj.compleximage,6);
+                obj.phaseimage = angle(obj.complexcombined);
+            end
+        end
+
+
+     function obj = MapRelaxation(obj)
+%MAPRELAXATION Pixelwise FCI T1 mapping, parfor-safe class wrapper.
+%
+% This wrapper intentionally contains NO parfor loop.  The parallel work is
+% done in the standalone function ffc_t1map_phase_signed_run_parallel.m so
+% MATLAB workers do not need to execute ImageReconCore.m or any local helper
+% functions inside the class file.
+%
+% Required files on the MATLAB path:
+%   ffc_t1map_phase_signed_run_parallel.m
+%   ffc_t1map_phase_signed_magnitude_worker_v2.m
+%
+% Model per pixel/field/slice:
+%   y(t) = B - C*exp(-R1*t), B>=0, C>=0, R1>=0
+%
+% If compleximage is available, phase is used only to assign sign while
+% preserving magnitude:
+%   y = sign(real(z*exp(-1i*phi_ref))) .* abs(z)
+
+    opts = struct();
+    opts.MaskFactor = 0.02;
+    opts.UseExistingMask = false;
+    opts.PhaseReferenceMode = 'last2';
+    opts.SignAssignmentMode = 'phase_then_prefix_if_bad';
+    opts.MaxPrefixSignCandidates = 4;
+    opts.T1AcceptedRangeMs = [50 3000];
+    opts.RsqBadThreshold = 0.85;
+    opts.R1Min = 0.2;
+    opts.R1Max = 40;
+    opts.R1GridPoints = 80;
+    opts.R1GridLogSpaced = true;
+    opts.MinValidTimepoints = 4;
+    opts.UseParallel = true;
+
+    % Optional overrides can be placed in obj.param.T1MapOptions as a struct.
+    try
+        if isstruct(obj.param) && isfield(obj.param, 'T1MapOptions') && isstruct(obj.param.T1MapOptions)
+            userOpts = obj.param.T1MapOptions;
+            fn = fieldnames(userOpts);
+            for k = 1:numel(fn)
+                opts.(fn{k}) = userOpts.(fn{k});
+            end
+        end
+    catch
+    end
+
+    if isempty(obj.magimage)
+        error('MapRelaxation:NoMagnitudeImage', 'obj.magimage is empty. Rebuild images before T1 mapping.');
+    end
+
+    magData = obj.magimage;
+
+    useComplex = false;
+    complexData = [];
+    try
+        if ~isempty(obj.compleximage) && ndims(obj.compleximage) >= 4 && ...
+                size(obj.compleximage,1) == size(magData,1) && size(obj.compleximage,2) == size(magData,2)
+            complexData = obj.compleximage;
+            useComplex = true;
+        end
+    catch
+        useComplex = false;
+        complexData = [];
+    end
+
+    times = double(obj.timepoints);
+    fields = double(obj.fieldpoints(:)); %#ok<NASGU>
+
+    if isscalar(obj.n_fieldpoints)
+        nFields = double(obj.n_fieldpoints);
+    else
+        nFields = double(obj.n_fieldpoints(1));
+    end
+
+    nSlices = double(obj.slices);
+
+    userMask = [];
+    try
+        if ~isempty(obj.mask)
+            userMask = logical(obj.mask);
+        end
+    catch
+        userMask = [];
+    end
+
+    out = ffc_t1map_phase_signed_run_parallel( ...
+        magData, complexData, useComplex, times, nFields, nSlices, userMask, opts);
+
+    obj.T1Maps = out.T1;
+    obj.R1Maps = out.R1;
+
+    % Store extra QC outputs in obj.param so you do not have to add new class
+    % properties.  Add real properties later if you want direct dot access.
+    try
+        obj.param.T1Map_Rsq = out.Rsq;
+        obj.param.T1Map_RMSE = out.RMSE;
+        obj.param.T1Map_SSE = out.SSE;
+        obj.param.T1Map_QC = out.QC;
+        obj.param.T1Map_SignMode = out.SignMode;
+        obj.param.T1Map_Mask = out.Mask;
+        obj.param.T1MapOptionsUsed = opts;
+    catch
+    end
+
+    fprintf('Pixelwise T1 mapping complete: %d x %d x %d slices x %d fields. Complex phase-signing: %d\n', ...
+        size(out.T1,1), size(out.T1,2), size(out.T1,3), size(out.T1,4), useComplex);
+end
+
+
+
+ function obj = T1dispersion(obj, slice)
+%T1DISPERSION Fast phase-signed-magnitude empirical T1-dispersion fit with QA dashboard.
+%
+% This version is intended as a safer update to the old working empirical
+% model. It avoids the brittle M200/q physical constraint, but it also avoids
+% fitting the raw complex mean with too much phase freedom.
+%
+% Default model:
+%
+%   1) Average complex image values in the ROI for each evolution time.
+%   2) Estimate one fixed phase reference per evolution field, using the
+%      final/long-TEvol points.
+%   3) Project complex signal onto that phase:
+%
+%          y(t) = real( z(t) * exp(-1i*phi_ref) )
+%
+%   4) Fit a signed inversion-recovery-like empirical model:
+%
+%          y(t) = B - C*exp(-R1*t)
+%
+%      with B >= 0, C >= 0, R1 >= 0.
+%
+% This is equivalent to y = A*exp(-R1*t) + B with A <= 0, but uses B and C
+% to keep the intended sign convention clear.
+%
+% Rationale:
+%   - Keeps the robust old free exponential recovery shape.
+%   - Does not force M0e/M200 = Be/200.
+%   - Preserves signed recovery information from complex data.
+%   - Reduces sensitivity to arbitrary through-time phase compared with a
+%     fully complex fit with free phase drift.
+%   - Keeps manual point polarity flipping in checkfit mode.
+%
+% Expected compleximage layout:
+%       [X Y slice time field]
+% or    [X Y slice time] for a single field.
+%
+% If compleximage is unavailable, the function falls back to the old signed
+% magnitude preparation.
+
+    % ==========================================================
+    % User-adjustable settings
+    % ==========================================================
+
+    % Options:
+    %   'phase_signed_magnitude'   Recommended default. Complex ROI mean;
+    %                              fixed phase reference assigns sign only;
+    %                              fitted amplitudes are exactly abs(z).
+    %   'phase_projected_empirical' Legacy projected-real mode name; treated
+    %                              the same as phase_signed_magnitude here.
+    %   'signed_magnitude_old'     Old magnitude/sign heuristic.
+    FIT_SIGNAL_MODE = 'phase_signed_magnitude';
+
+    % Phase reference options for phase-signed-magnitude mode:
+    %   'last'       use final TEvol point
+    %   'last2'      use mean of last two TEvol points
+    %   'last3'      use mean of last three TEvol points
+    %   'mean'       use mean of all points
+    PHASE_REFERENCE_MODE = 'last2';
+
+    % Known-negative point override. Applied before fitting and before QA.
+    % This preserves abs(signal) but forces selected time points to be negative.
+    % Use this when sequence logic/data inspection shows known inverted early points.
+    ENABLE_KNOWN_NEGATIVE_POINTS = false;
+    KNOWN_NEGATIVE_FIELD_START = 9;       % fields >= this index use the override
+    KNOWN_NEGATIVE_FIELDS = [];           % optional explicit field indices; [] uses start/end rule
+    KNOWN_NEGATIVE_POINT_INDICES = [1 2]; % time-sorted point indices forced negative
+
+    % Sign-assignment options for complex data:
+    %   'phase'           phase reference decides the sign only.
+    %   'prefix_search'   preserve abs(z), but try IR-like sign patterns where
+    %                     the first k points are negative and later points positive.
+    %   'phase_or_prefix' try both phase-derived signs and prefix-search signs,
+    %                     then choose the best constrained IR fit.
+    %   'phase_then_prefix_if_bad' fast default: fit phase-derived signs first;
+    %                     only try prefix patterns if T1/QC is poor.
+    %
+    % The prefix search is useful when the complex phase is not reliably 180 deg
+    % different for inverted points, but the data are time-sorted IR recoveries.
+    SIGN_ASSIGNMENT_MODE = 'phase_then_prefix_if_bad';
+
+    % Fast default: try the supplied phase branch first. Prefix candidates are
+    % only tried if the phase fit is poor/out of range.
+    TRY_BOTH_PHASE_BRANCHES = false;
+
+    % Bounds and starts for R1.
+    R1_LOWER_LIMIT = 0;       % s^-1
+    R1_UPPER_LIMIT = 50;      % s^-1; T1 minimum 20 ms
+    BASE_R1_STARTS = [0.3 0.5 0.8 1 1.5 2 3 5 8 12 18 25];
+    USE_PREVIOUS_FIELD_START = true;
+
+    % Old signed-magnitude behaviour: duplicate the minimum point with
+    % opposite sign to help anchor the zero-crossing, as in your old code.
+    OLD_DUPLICATE_ZERO_CROSSING_POINT = true;
+
+    % QA behaviour in checkfit mode.
+    % If ENABLE_QA_DASHBOARD is true, all fields are fitted first and then
+    % a multi-subplot QA screen is shown. Click any subplot to open the
+    % existing mask/flip/refit editor for that field. Close or right-click
+    % the QA screen when finished.
+    ENABLE_QA_DASHBOARD = true;
+
+    % Ask before closing/accepting the whole QA dashboard with Enter/right-click.
+    CONFIRM_QA_DASHBOARD_EXIT = true;
+
+    % Parallelise the initial independent field-wise fits. The QA dashboard
+    % and all manual edits remain serial/interative. For parallel fitting the
+    % previous-field R1 start is disabled because field order is not guaranteed
+    % on workers.
+    USE_PARALLEL_INITIAL_FIT = true;
+
+    % Manual point correction in checkfit mode.
+    % Left-clicking a point opens a menu with both options:
+    %   - Mask/exclude the point and refit
+    %   - Flip/invert the point and refit
+    ENABLE_MANUAL_POINT_CORRECTION = true;
+    MIN_POINTS_AFTER_MASKING = 4;
+
+    % Optional automatic point-polarity permutation search. This only runs if
+    % the fitted T1 lies outside the accepted range below. It is disabled by
+    % default because manual masking is usually safer for QC.
+    ENABLE_AUTOMATIC_RANGE_POLARITY_SEARCH = false;
+    T1_ACCEPTED_RANGE_MS = [100 3000];
+    MAX_AUTO_FLIPPED_POINTS = 2;
+    MAX_AUTO_POLARITY_CANDIDATES = 5;
+    AUTO_ACCEPT_RMSE_RATIO = 1.10;
+    AUTO_ACCEPT_RSQ_DROP = 0.05;
+    AUTO_PREFER_FEWER_FLIPS = true;
+    AUTO_PERMUTE_EARLY_POINTS_FIRST = true;
+
+    % Speed settings for the initial fit. The worker uses a fast grid +
+    % one-refinement fit instead of many lsqcurvefit starts.
+    FAST_PHASE_ACCEPT_RSQ = 0.90;
+    FAST_PREFIX_IF_T1_OUT_OF_RANGE = true;
+    MAX_PREFIX_SIGN_CANDIDATES = 4;
+    FAST_R1_GRID_POINTS = 60;
+    REFINE_FAST_GRID_FIT = true;
+    CALCULATE_INITIAL_CI = false;
+
+    PRINT_FIT_SUMMARY = true;
+
+    % ==========================================================
+    % Basic setup
+    % ==========================================================
+    fields = double(obj.fieldpoints(:));
+    times  = double(obj.timepoints);       % expected ms
+
+    if isscalar(obj.n_fieldpoints)
+        n_fields = double(obj.n_fieldpoints);
+    else
+        n_fields = double(obj.n_fieldpoints(1));
+    end
+    n_fields = min(n_fields, numel(fields));
+
+    gammaH_Hz_per_T = 42.57747892e6;
+    fieldsT  = fields ./ 1e3;
+    fieldMHz = fieldsT .* gammaH_Hz_per_T ./ 1e6;
+
+    R1dispersion = nan(1, n_fields);
+    R1error      = nan(1, n_fields);
+    T1dispersion = nan(1, n_fields);
+    T1error      = nan(1, n_fields);
+
+    fit_sse    = nan(1, n_fields);
+    fit_rsq    = nan(1, n_fields);
+    fit_rmse   = nan(1, n_fields);
+    fit_dfe    = nan(1, n_fields);
+    fit_params = cell(1, n_fields);
+    fit_qc     = cell(1, n_fields);
+    manual_polarity_flips = cell(1, n_fields);
+    manual_point_masks    = cell(1, n_fields);
+    manual_point_actions  = cell(1, n_fields);
+    auto_polarity_flips   = cell(1, n_fields);
+
+    % Per-field data cached for the post-fit QA dashboard. These are used only
+    % when obj.checkfit == 1 and ENABLE_QA_DASHBOARD is true.
+    qa_xs       = cell(1, n_fields);
+    qa_z        = cell(1, n_fields);
+    qa_y        = cell(1, n_fields);
+    qa_phi      = nan(1, n_fields);
+    qa_residual = cell(1, n_fields);
+    qa_iscomplex = false(1, n_fields);
+    qa_r1starts = cell(1, n_fields);
+    qa_ci       = cell(1, n_fields);
+    phase_reference_rad   = nan(1, n_fields);
+
+    for ii = 1:n_fields
+        fit_qc{ii} = 'not fitted';
+    end
+
+    % ==========================================================
+    % Mask
+    % ==========================================================
+    if ndims(obj.mask) == 3
+        mask2d = obj.mask(:,:,slice);
+    else
+        mask2d = obj.mask;
+    end
+    mask2d = logical(mask2d);
+
+    if ~any(mask2d(:))
+        warning('T1dispersion:EmptyMask', 'Mask is empty for slice %d.', slice);
+        return
+    end
+
+    % ==========================================================
+    % Image availability / dimensions
+    % ==========================================================
+    useComplex = any(strcmpi(FIT_SIGNAL_MODE, {'phase_signed_magnitude','phase_projected_empirical'}));
+
+    if useComplex && (~hasProp(obj, 'compleximage') || isempty(obj.compleximage))
+        warning('T1dispersion:NoComplexImage', ...
+            'compleximage unavailable. Falling back to signed_magnitude_old.');
+        useComplex = false;
+        FIT_SIGNAL_MODE = 'signed_magnitude_old';
+    end
+
+    if useComplex
+        ndc = ndims(obj.compleximage);
+        csz = size(obj.compleximage);
+        img_nx     = size(obj.compleximage, 1);
+        img_ny     = size(obj.compleximage, 2);
+        img_ns     = size(obj.compleximage, 3);
+        img_nt     = size(obj.compleximage, 4); %#ok<NASGU>
+        img_nfield = size(obj.compleximage, 5);
+
+        if ndc == 6
+            error(['T1dispersion: obj.compleximage appears to still have a coil ', ...
+                   'dimension [X Y slice time field coil]. Perform complex coil ', ...
+                   'combination before T1 fitting.']);
+        elseif ndc == 5
+            if img_nfield < n_fields
+                error('T1dispersion:FieldDimensionMismatch', ...
+                    'compleximage size = %s, n_fields = %d.', mat2str(csz), n_fields);
+            end
+        elseif ndc == 4
+            if n_fields ~= 1
+                error('T1dispersion:UnexpectedComplexImageDims', ...
+                    ['compleximage size %s looks like [X Y slice time]. ', ...
+                     'This is only valid when n_fields == 1.'], mat2str(csz));
+            end
+            img_nfield = 1;
+        else
+            error('T1dispersion:UnexpectedComplexImageDims', ...
+                'compleximage has unexpected dimensions: %s', mat2str(csz));
+        end
+
+        if slice < 1 || slice > img_ns
+            error('T1dispersion:SliceOutOfRange', ...
+                'Requested slice %d, but compleximage only has %d slice(s).', slice, img_ns);
+        end
+    else
+        if ~hasProp(obj, 'magimage') || isempty(obj.magimage)
+            error('T1dispersion:NoMagnitudeImage', ...
+                'magimage is unavailable for signed_magnitude_old mode.');
+        end
+
+        img_nx     = size(obj.magimage, 1);
+        img_ny     = size(obj.magimage, 2);
+        img_ns     = size(obj.magimage, 3);
+        img_nt     = size(obj.magimage, 4); %#ok<NASGU>
+        img_nfield = size(obj.magimage, 5);
+
+        if slice < 1 || slice > img_ns
+            error('T1dispersion:SliceOutOfRange', ...
+                'Requested slice %d, but magimage only has %d slice(s).', slice, img_ns);
+        end
+    end
+
+    % ==========================================================
+    % Optimisation setup
+    % ==========================================================
+    lsqOpts = optimoptions('lsqcurvefit', ...
+        'Display', 'off', ...
+        'Algorithm', 'trust-region-reflective', ...
+        'FunctionTolerance', 1e-5, ...
+        'StepTolerance', 1e-5, ...
+        'OptimalityTolerance', 1e-5, ...
+        'MaxIterations', 50, ...
+        'MaxFunctionEvaluations', 200, ...
+        'FiniteDifferenceType', 'forward');
+
+    last_good_R1 = [];
+
+    if USE_PARALLEL_INITIAL_FIT
+        USE_PREVIOUS_FIELD_START = false;
+    end
+
+    % ==========================================================
+    % Main field loop
+    % ==========================================================
+    if USE_PARALLEL_INITIAL_FIT
+        fitLoopType = 'parallel parfor';
+    else
+        fitLoopType = 'serial for';
+    end
+
+    % ==========================================================
+    % Precompute per-field ROI signals serially.
+    %
+    % MATLAB parfor does not allow calling nested functions from inside the
+    % loop body. Therefore ROI extraction and time-vector alignment are done
+    % here in the client process. The parfor workers receive only numeric
+    % vectors and call a separate top-level helper function:
+    %
+    %       ffc_t1dispersion_fit_one_field_worker.m
+    %
+    % Keep that helper file on the MATLAB path beside this method.
+    % ==========================================================
+    field_x_ms = cell(1, n_fields);
+    field_z    = cell(1, n_fields);
+
+    for n = 1:n_fields
+        if size(times,1) >= n
+            invtimes_ms = double(times(n,:)).';
+        else
+            invtimes_ms = double(times(:));
+        end
+        invtimes_ms = invtimes_ms(:);
+
+        if useComplex
+            if img_nfield == 1
+                img_c = obj.compleximage(:,:,slice,:);
+            else
+                img_c = obj.compleximage(:,:,slice,:,n);
+            end
+            img_c = reshape(img_c, img_nx, img_ny, []);
+            z_roi = complexRoiMean(img_c, mask2d);
+        else
+            if img_nfield == 1
+                img_m = obj.magimage(:,:,slice,:);
+            else
+                img_m = obj.magimage(:,:,slice,:,n);
+            end
+            img_m = reshape(img_m, img_nx, img_ny, []);
+            z_roi = magnitudeRoiSignal(img_m, mask2d);
+        end
+
+        nT_img = numel(z_roi);
+        if numel(invtimes_ms) ~= nT_img
+            nT = min(numel(invtimes_ms), nT_img);
+            warning('T1dispersion:TimeImageMismatch', ...
+                'Field %d: time vector length does not match image time dimension. Using first %d points.', n, nT);
+            invtimes_ms = invtimes_ms(1:nT);
+            z_roi = z_roi(1:nT);
+        end
+
+        field_x_ms{n} = invtimes_ms(:);
+        field_z{n}    = z_roi(:);
+    end
+
+    workerSettings = struct();
+    workerSettings.PHASE_REFERENCE_MODE = PHASE_REFERENCE_MODE;
+    workerSettings.SIGN_ASSIGNMENT_MODE = SIGN_ASSIGNMENT_MODE;
+    workerSettings.TRY_BOTH_PHASE_BRANCHES = TRY_BOTH_PHASE_BRANCHES;
+    workerSettings.R1_LOWER_LIMIT = R1_LOWER_LIMIT;
+    workerSettings.R1_UPPER_LIMIT = R1_UPPER_LIMIT;
+    workerSettings.BASE_R1_STARTS = BASE_R1_STARTS;
+    workerSettings.OLD_DUPLICATE_ZERO_CROSSING_POINT = OLD_DUPLICATE_ZERO_CROSSING_POINT;
+    workerSettings.ENABLE_AUTOMATIC_RANGE_POLARITY_SEARCH = ENABLE_AUTOMATIC_RANGE_POLARITY_SEARCH;
+    workerSettings.T1_ACCEPTED_RANGE_MS = T1_ACCEPTED_RANGE_MS;
+    workerSettings.MAX_AUTO_FLIPPED_POINTS = MAX_AUTO_FLIPPED_POINTS;
+    workerSettings.MAX_AUTO_POLARITY_CANDIDATES = MAX_AUTO_POLARITY_CANDIDATES;
+    workerSettings.AUTO_ACCEPT_RMSE_RATIO = AUTO_ACCEPT_RMSE_RATIO;
+    workerSettings.AUTO_ACCEPT_RSQ_DROP = AUTO_ACCEPT_RSQ_DROP;
+    workerSettings.AUTO_PREFER_FEWER_FLIPS = AUTO_PREFER_FEWER_FLIPS;
+    workerSettings.AUTO_PERMUTE_EARLY_POINTS_FIRST = AUTO_PERMUTE_EARLY_POINTS_FIRST;
+    workerSettings.FAST_PHASE_ACCEPT_RSQ = FAST_PHASE_ACCEPT_RSQ;
+    workerSettings.FAST_PREFIX_IF_T1_OUT_OF_RANGE = FAST_PREFIX_IF_T1_OUT_OF_RANGE;
+    workerSettings.MAX_PREFIX_SIGN_CANDIDATES = MAX_PREFIX_SIGN_CANDIDATES;
+    workerSettings.FAST_R1_GRID_POINTS = FAST_R1_GRID_POINTS;
+    workerSettings.REFINE_FAST_GRID_FIT = REFINE_FAST_GRID_FIT;
+    workerSettings.CALCULATE_INITIAL_CI = CALCULATE_INITIAL_CI;
+    workerSettings.FunctionTolerance = 1e-5;
+    workerSettings.StepTolerance = 1e-5;
+    workerSettings.OptimalityTolerance = 1e-5;
+    workerSettings.MaxIterations = 50;
+    workerSettings.MaxFunctionEvaluations = 200;
+    workerSettings.FiniteDifferenceType = 'forward';
+    workerSettings.ENABLE_KNOWN_NEGATIVE_POINTS = ENABLE_KNOWN_NEGATIVE_POINTS;
+    workerSettings.KNOWN_NEGATIVE_FIELD_START = KNOWN_NEGATIVE_FIELD_START;
+    workerSettings.KNOWN_NEGATIVE_FIELDS = KNOWN_NEGATIVE_FIELDS;
+    workerSettings.KNOWN_NEGATIVE_POINT_INDICES = KNOWN_NEGATIVE_POINT_INDICES;
+
+
+    fitResults = cell(1, n_fields);
+
+    if USE_PARALLEL_INITIAL_FIT
+        parfor n = 1:n_fields
+            fitResults{n} = ffc_t1dispersion_fit_one_field_worker_v6(field_x_ms{n}, field_z{n}, useComplex, workerSettings, n);
+        end
+    else
+        for n = 1:n_fields
+            fitResults{n} = ffc_t1dispersion_fit_one_field_worker_v6(field_x_ms{n}, field_z{n}, useComplex, workerSettings, n);
+        end
+    end
+
+    for n = 1:n_fields
+        r = fitResults{n};
+        if isempty(r)
+            fit_qc{n} = 'fit failed';
+            continue
+        end
+
+        R1dispersion(n) = r.R1;
+        R1error(n)      = r.R1error;
+        fit_params{n}   = r.fit_params;
+        fit_sse(n)      = r.fit_sse;
+        fit_rsq(n)      = r.fit_rsq;
+        fit_rmse(n)     = r.fit_rmse;
+        fit_dfe(n)      = r.fit_dfe;
+        fit_qc{n}       = r.fit_qc;
+        auto_polarity_flips{n} = r.auto_polarity_flips;
+        phase_reference_rad(n) = r.qa_phi;
+
+        qa_xs{n}        = r.qa_xs;
+        qa_z{n}         = r.qa_z;
+        qa_y{n}         = r.qa_y;
+        qa_phi(n)       = r.qa_phi;
+        qa_residual{n}  = r.qa_residual;
+        qa_iscomplex(n) = r.qa_iscomplex;
+        qa_r1starts{n}  = r.qa_r1starts;
+        qa_ci{n}        = r.qa_ci;
+    end
+
+    % ==========================================================
+    % Optional post-fit QA dashboard
+    % ==========================================================
+    if hasProp(obj, 'checkfit') && obj.checkfit == 1 && ENABLE_QA_DASHBOARD && ENABLE_MANUAL_POINT_CORRECTION
+        [R1dispersion, R1error, fit_params, fit_sse, fit_rsq, fit_rmse, fit_dfe, fit_qc, ...
+            manual_polarity_flips, manual_point_masks, manual_point_actions, qa_y, qa_residual, qa_ci] = ...
+            runQaDashboard(R1dispersion, R1error, fit_params, fit_sse, fit_rsq, fit_rmse, fit_dfe, fit_qc, ...
+            manual_polarity_flips, manual_point_masks, manual_point_actions, qa_xs, qa_z, qa_y, qa_phi, qa_residual, qa_iscomplex, qa_r1starts, qa_ci);
+    end
+
+    % ==========================================================
+    % Convert R1 to T1
+    % ==========================================================
+    valid_R1 = isfinite(R1dispersion) & R1dispersion > 0;
+    T1dispersion(valid_R1) = 1000 ./ R1dispersion(valid_R1);
+    T1error(valid_R1) = 1000 .* R1error(valid_R1) ./ (R1dispersion(valid_R1).^2);
+
+    % ==========================================================
+    % Display and plot
+    % ==========================================================
+    if PRINT_FIT_SUMMARY
+        fprintf('\nT1dispersion mode: %s (%s)\n', FIT_SIGNAL_MODE, fitLoopType);
+        disp(['Fields (T): ' num2str(fieldsT(1:n_fields).')])
+        disp(['T1 (ms): ' num2str(T1dispersion)])
+        disp(['T1 error (ms): ' num2str(T1error)])
+        disp(['R1 (s^-1): ' num2str(R1dispersion)])
+        disp(['Fit QC: ' strjoin(fit_qc, ', ')])
+    end
+
+    if hasProp(obj, 'R1T1') && obj.R1T1 == 1
+        [xplot, yplot, valid_plot] = makeMatchedPlotVectors(fieldMHz, R1dispersion, n_fields);
+        figure;
+        scatter(xplot(valid_plot), yplot(valid_plot), 'o');
+        set(gca, 'xscale', 'log', 'yscale', 'log');
+        xlabel('Evolution Field (MHz)');
+        ylabel('R_1 (s^{-1})');
+        title(['Phase-signed-magnitude empirical T1 dispersion fit: ' FIT_SIGNAL_MODE], 'Interpreter', 'none');
+        grid on;
+    else
+        [xplot, yplot, valid_plot] = makeMatchedPlotVectors(fieldsT, T1dispersion, n_fields);
+        figure;
+        plot(xplot(valid_plot), yplot(valid_plot), 'o');
+        set(gca, 'xscale', 'log', 'yscale', 'log');
+        xlabel('Evolution Field (T)');
+        ylabel('T_1 (ms)');
+        title(['Phase-signed-magnitude empirical T1 dispersion fit: ' FIT_SIGNAL_MODE], 'Interpreter', 'none');
+        grid on;
+    end
+
+    % ==========================================================
+    % Store results
+    % ==========================================================
+    obj = safeSet(obj, 'dispersioncurve', R1dispersion);
+    obj = safeSet(obj, 'R1dispersion', R1dispersion);
+    obj = safeSet(obj, 'R1error', R1error);
+    obj = safeSet(obj, 'T1dispersion', T1dispersion);
+    obj = safeSet(obj, 'T1error', T1error);
+    obj = safeSet(obj, 'fit_params', fit_params);
+    obj = safeSet(obj, 'fit_sse', fit_sse);
+    obj = safeSet(obj, 'fit_rsq', fit_rsq);
+    obj = safeSet(obj, 'fit_rmse', fit_rmse);
+    obj = safeSet(obj, 'fit_dfe', fit_dfe);
+    obj = safeSet(obj, 'fit_qc', fit_qc);
+    obj = safeSet(obj, 'fit_model_name', FIT_SIGNAL_MODE);
+    obj = safeSet(obj, 'manual_polarity_flips', manual_polarity_flips);
+    obj = safeSet(obj, 'manual_point_masks', manual_point_masks);
+    obj = safeSet(obj, 'manual_point_actions', manual_point_actions);
+    obj = safeSet(obj, 'auto_polarity_flips', auto_polarity_flips);
+    obj = safeSet(obj, 'phase_reference_rad', phase_reference_rad);
+
+    % ==========================================================
+    % Nested helpers
+    % ==========================================================
+
+
+    function [R1out, R1errOut, fitParamsOut, sseOut, rsqOut, rmseOut, dfeOut, qcOut, manFlipOut, manMaskOut, manActionsOut, qaYOut, qaResidualOut, qaCiOut] = ...
+            runQaDashboard(R1in, R1errIn, fitParamsIn, sseIn, rsqIn, rmseIn, dfeIn, qcIn, manFlipIn, manMaskIn, manActionsIn, qaXsIn, qaZIn, qaYIn, qaPhiIn, qaResidualIn, qaIsComplexIn, qaR1StartsIn, qaCiIn)
+        % Show all field fits in one dashboard, then let the user choose fields
+        % for detailed mask/flip/refit editing. Edits update the dashboard.
+        R1out = R1in; R1errOut = R1errIn; fitParamsOut = fitParamsIn;
+        sseOut = sseIn; rsqOut = rsqIn; rmseOut = rmseIn; dfeOut = dfeIn;
+        qcOut = qcIn; manFlipOut = manFlipIn; manMaskOut = manMaskIn; manActionsOut = manActionsIn;
+        qaYOut = qaYIn; qaResidualOut = qaResidualIn; qaCiOut = qaCiIn;
+
+        validFields = find(~cellfun(@isempty, qaXsIn) & isfinite(R1out(:).'));
+        if isempty(validFields)
+            return
+        end
+
+        hQa = figure('Name', 'T1 dispersion QA dashboard: click a field subplot to edit; right-click/Enter asks to finish', ...
+            'NumberTitle', 'off');
+
+        while isgraphics(hQa)
+            drawQaDashboard(hQa, validFields, qaXsIn, qaYOut, R1out, fitParamsOut, rsqOut, rmseOut, qcOut, manFlipOut, manMaskOut);
+
+            fprintf('\nT1 QA dashboard:\n');
+            fprintf('  Left-click a subplot to edit that field.\n');
+            fprintf('  Press Enter or right-click anywhere in the dashboard to finish; confirmation will be requested.\n');
+            figure(hQa);
+
+            try
+                [~, ~, button] = ginput(1);
+            catch
+                break
+            end
+            if isempty(button) || button == 3
+                if CONFIRM_QA_DASHBOARD_EXIT
+                    choice = questdlg( ...
+                        ['Accept all current T1 fits and close the QA dashboard?\n\n', ...
+                         'Choose Continue QA to return to the dashboard.'], ...
+                        'Finish T1 QA?', ...
+                        'Accept and close', 'Continue QA', 'Continue QA');
+
+                    if strcmp(choice, 'Accept and close')
+                        break
+                    else
+                        continue
+                    end
+                else
+                    break
+                end
+            end
+            if button ~= 1
+                continue
+            end
+
+            ax = gca;
+            if ~isgraphics(ax, 'axes')
+                continue
+            end
+            ud = get(ax, 'UserData');
+            if ~isstruct(ud) || ~isfield(ud, 'fieldIndex')
+                continue
+            end
+            nEdit = ud.fieldIndex;
+            if isempty(nEdit) || nEdit < 1 || nEdit > numel(qaXsIn)
+                continue
+            end
+
+            p0 = fitParamsOut{nEdit};
+            if isempty(p0) || any(~isfinite(p0))
+                continue
+            end
+            ci0 = qaCiOut{nEdit};
+            if isempty(ci0)
+                ci0 = nan(2, numel(p0));
+            end
+            gof0 = struct('sse', sseOut(nEdit), 'rsquare', rsqOut(nEdit), 'adjrsquare', NaN, ...
+                'dfe', dfeOut(nEdit), 'rmse', rmseOut(nEdit), 'exitflag', NaN);
+
+            if qaIsComplexIn(nEdit)
+                [p2, ci2, gof2, ~, y2, residual2, phi2, manual_idx, manual_mask_idx, manual_actions] = ...
+                    manualProjectedPointCorrectionLoop(nEdit, qaXsIn{nEdit}, qaZIn{nEdit}, qaYOut{nEdit}, p0, ci0, gof0, qaResidualOut{nEdit}, qaPhiIn(nEdit), qaR1StartsIn{nEdit}, lsqOpts);
+                qaYOut{nEdit} = y2(:);
+                qaResidualOut{nEdit} = residual2(:);
+                qaPhiIn(nEdit) = phi2;
+            else
+                [p2, ci2, gof2, y2, manual_idx, manual_mask_idx, manual_actions] = ...
+                    manualRealPointCorrectionLoop(nEdit, qaXsIn{nEdit}, qaYOut{nEdit}, p0, ci0, gof0, qaR1StartsIn{nEdit}, lsqOpts);
+                qaYOut{nEdit} = y2(:);
+            end
+
+            fitParamsOut{nEdit} = p2;
+            qaCiOut{nEdit} = ci2;
+            R1out(nEdit) = p2(3);
+            sseOut(nEdit) = gof2.sse;
+            rsqOut(nEdit) = gof2.rsquare;
+            rmseOut(nEdit) = gof2.rmse;
+            dfeOut(nEdit) = gof2.dfe;
+            manFlipOut{nEdit} = manual_idx;
+            manMaskOut{nEdit} = manual_mask_idx;
+            manActionsOut{nEdit} = manual_actions;
+
+            if all(isfinite(ci2(:))) && size(ci2,2) >= 3
+                R1errOut(nEdit) = diff(ci2(:,3)) ./ 2;
+            else
+                R1errOut(nEdit) = NaN;
+            end
+
+            qcOut{nEdit} = qualityString(gof2);
+            if ~isempty(manual_idx) || ~isempty(manual_mask_idx)
+                qcOut{nEdit} = [qcOut{nEdit} ' / manually corrected'];
+                if ~isempty(manual_mask_idx)
+                    qcOut{nEdit} = [qcOut{nEdit} ' / masked'];
+                end
+                if ~isempty(manual_idx)
+                    qcOut{nEdit} = [qcOut{nEdit} ' / flipped'];
+                end
+            end
+        end
+
+        if isgraphics(hQa)
+            close(hQa);
+        end
+    end
+
+   function drawQaDashboard(hQa, validFields, qaXsIn, qaYIn, R1vals, fitParamsIn, rsqVals, rmseVals, qcVals, manFlipIn, manMaskIn)
+    figure(hQa);
+    clf(hQa);
+
+    nPanels = numel(validFields);
+
+    % Use tiledlayout so the dispersion plot can span multiple tiles.
+    nCols = max(2, ceil(sqrt(nPanels)));
+    nFitRows = ceil(nPanels ./ nCols);
+
+    % Make the dispersion plot larger than a normal field subplot.
+    nOverviewRows = 2;
+    nRows = nOverviewRows + nFitRows;
+
+    tlo = tiledlayout(hQa, nRows, nCols, ...
+        'TileSpacing', 'compact', ...
+        'Padding', 'compact');
+
+    % ==========================================================
+    % Large dispersion overview plot
+    % ==========================================================
+    axDisp = nexttile(tlo, 1, [nOverviewRows nCols]);
+    set(axDisp, 'UserData', struct('fieldIndex', [], 'isDispersionOverview', true));
+
+    hold(axDisp, 'on');
+
+    if hasProp(obj, 'R1T1') && obj.R1T1 == 1
+        [xDisp, yDisp, validDisp] = makeMatchedPlotVectors(fieldMHz, R1vals, n_fields);
+        xLabelTxt = 'Evolution Field (MHz)';
+        yLabelTxt = 'R_1 (s^{-1})';
+        plotTitleTxt = 'Current fitted R_1 dispersion';
+    else
+        T1vals = nan(size(R1vals));
+        validR1Local = isfinite(R1vals) & R1vals > 0;
+        T1vals(validR1Local) = 1000 ./ R1vals(validR1Local);
+
+        [xDisp, yDisp, validDisp] = makeMatchedPlotVectors(fieldsT, T1vals, n_fields);
+        xLabelTxt = 'Evolution Field (T)';
+        yLabelTxt = 'T_1 (ms)';
+        plotTitleTxt = 'Current fitted T_1 dispersion';
+    end
+
+    if any(validDisp)
+        plot(axDisp, xDisp(validDisp), yDisp(validDisp), '-o', ...
+            'LineWidth', 1.5, ...
+            'MarkerSize', 6, ...
+            'DisplayName', 'current dispersion');
+
+        % Mark manually corrected fields, if any.
+        corrected = false(size(validDisp));
+        for jj = 1:min(numel(corrected), numel(manFlipIn))
+            if (~isempty(manFlipIn{jj})) || (~isempty(manMaskIn{jj}))
+                corrected(jj) = true;
+            end
+        end
+        corrected = corrected(:) & validDisp(:);
+
+        if any(corrected)
+            plot(axDisp, xDisp(corrected), yDisp(corrected), 's', ...
+                'MarkerSize', 8, ...
+                'LineWidth', 1.5, ...
+                'DisplayName', 'manually corrected');
+        end
+
+        for jj = 1:numel(xDisp)
+            if validDisp(jj)
+                text(axDisp, xDisp(jj), yDisp(jj), sprintf('  %d', jj), ...
+                    'FontSize', 8, ...
+                    'VerticalAlignment', 'middle');
+            end
+        end
+    else
+        text(axDisp, 0.5, 0.5, 'No valid dispersion points to plot', ...
+            'Units', 'normalized', ...
+            'HorizontalAlignment', 'center');
+    end
+
+    set(axDisp, 'XScale', 'log', 'YScale', 'log');
+    grid(axDisp, 'on');
+    xlabel(axDisp, xLabelTxt);
+    ylabel(axDisp, yLabelTxt);
+    title(axDisp, plotTitleTxt, 'Interpreter', 'none');
+    legend(axDisp, 'Location', 'best');
+
+    hold(axDisp, 'off');
+
+    % ==========================================================
+    % Individual field fit panels
+    % ==========================================================
+    firstFitTile = nOverviewRows * nCols + 1;
+
+    for kk = 1:nPanels
+        n = validFields(kk);
+
+        ax = nexttile(tlo, firstFitTile + kk - 1);
+        set(ax, 'UserData', struct('fieldIndex', n, 'isDispersionOverview', false));
+
+        xs = qaXsIn{n}(:);
+        y = qaYIn{n}(:);
+        p = fitParamsIn{n};
+
+        keep = true(size(y));
+        if n <= numel(manMaskIn) && ~isempty(manMaskIn{n})
+            maskIdx = manMaskIn{n};
+            maskIdx = maskIdx(maskIdx >= 1 & maskIdx <= numel(keep));
+            keep(maskIdx) = false;
+        end
+
+        hold(ax, 'on');
+
+        plot(ax, xs(keep), y(keep), 'o', ...
+            'MarkerSize', 5, ...
+            'DisplayName', 'used');
+
+        if any(~keep)
+            plot(ax, xs(~keep), y(~keep), 'x', ...
+                'MarkerSize', 7, ...
+                'LineWidth', 1.2, ...
+                'DisplayName', 'masked');
+        end
+
+        if n <= numel(manFlipIn) && ~isempty(manFlipIn{n})
+            flipIdx = manFlipIn{n};
+            flipIdx = flipIdx(flipIdx >= 1 & flipIdx <= numel(y));
+            if ~isempty(flipIdx)
+                plot(ax, xs(flipIdx), y(flipIdx), 's', ...
+                    'MarkerSize', 7, ...
+                    'LineWidth', 1.2, ...
+                    'DisplayName', 'flipped');
+            end
+        end
+
+        if ~isempty(p) && numel(p) >= 3 && all(isfinite(p(1:3))) && any(keep)
+            xfit = linspace(min(xs(keep)), max(xs(keep)), 200).';
+            yfit = p(1) - p(2).*exp(-p(3).*xfit);
+            plot(ax, xfit, yfit, '-', ...
+                'LineWidth', 1.2, ...
+                'DisplayName', 'fit');
+
+            if p(3) > 0
+                t1ms = 1000 ./ p(3);
+            else
+                t1ms = NaN;
+            end
+        else
+            t1ms = NaN;
+        end
+
+        yline(ax, 0, '--');
+
+        grid(ax, 'on');
+        xlabel(ax, 't_e_v_o_l (s)');
+        ylabel(ax, 'signal');
+
+        try
+            fieldLabel = sprintf('%.4g T', fieldsT(n));
+        catch
+            fieldLabel = sprintf('field %d', n);
+        end
+
+        title(ax, sprintf('%d: %s | T1 %.4g ms | R^2 %.3g', ...
+            n, fieldLabel, t1ms, rsqVals(n)), ...
+            'Interpreter', 'none');
+
+        if isfinite(rmseVals(n))
+            text(ax, 0.02, 0.02, sprintf('RMSE %.3g\n%s', rmseVals(n), qcVals{n}), ...
+                'Units', 'normalized', ...
+                'FontSize', 8, ...
+                'Interpreter', 'none', ...
+                'VerticalAlignment', 'bottom');
+        end
+
+        hold(ax, 'off');
+    end
+
+    sgtitle(hQa, 'T1 fit QA dashboard: left-click a field subplot to edit; right-click/Enter asks to finish');
+    drawnow;
+end
+
+
+
+    function z_roi = complexRoiMean(img_c, mask)
+        nT = size(img_c, 3);
+        z_roi = nan(nT, 1);
+        for tt = 1:nT
+            tmp = img_c(:,:,tt);
+            vals = tmp(mask);
+            good = isfinite(real(vals)) & isfinite(imag(vals));
+            vals = vals(good);
+            if ~isempty(vals)
+                z_roi(tt) = mean(vals);
+            end
+        end
+    end
+
+    function y_roi = magnitudeRoiSignal(img_m, mask)
+        nT = size(img_m, 3);
+        y_roi = nan(nT, 1);
+        nMask = sum(mask(:));
+        for tt = 1:nT
+            tmp = img_m(:,:,tt);
+            vals = tmp(mask);
+            vals = vals(isfinite(vals));
+            if ~isempty(vals)
+                if nMask > 0
+                    y_roi(tt) = sum(vals) ./ nMask;
+                else
+                    y_roi(tt) = mean(vals);
+                end
+            end
+        end
+    end
+
+    function [x_out_ms, y_out] = oldSignedMagnitudePreparation(x_in_ms, y_in)
+        x_out_ms = x_in_ms(:);
+        y_out = y_in(:);
+        [~, index] = min(y_out);
+        if OLD_DUPLICATE_ZERO_CROSSING_POINT && index ~= 1 && index ~= numel(y_out)
+            y_out(1:index-1) = -1 .* y_out(1:index-1);
+            y_out = [y_out; -y_out(index)]; %#ok<AGROW>
+            x_out_ms = [x_out_ms; x_out_ms(index)]; %#ok<AGROW>
+        elseif index ~= 1 && index ~= numel(y_out)
+            y_out(1:index-1) = -1 .* y_out(1:index-1);
+        end
+    end
+
+    function R1starts = buildR1Starts(previous_R1)
+        R1starts = BASE_R1_STARTS(:).';
+        if USE_PREVIOUS_FIELD_START && ~isempty(previous_R1) && isfinite(previous_R1) && previous_R1 > 0
+            R1starts = [previous_R1, previous_R1/2, previous_R1*2, R1starts];
+        end
+        R1starts = R1starts(isfinite(R1starts) & R1starts > R1_LOWER_LIMIT & R1starts < R1_UPPER_LIMIT);
+        R1starts = unique(round(R1starts, 10), 'stable');
+    end
+
+    function [bestP, bestCi, bestGof, ok, z_used, bestY, bestResidual, bestPhi] = ...
+            fitPhaseProjectedEmpirical(xs, z, R1starts, opts)
+
+        xs = xs(:);
+        z = z(:);
+        z_used = z;
+
+        bestP = nan(1, 3);       % [B C R1], model y = B - C exp(-R1 t)
+        bestCi = nan(2, 3);
+        bestGof = emptyGof(Inf);
+        bestY = nan(size(z));
+        bestResidual = nan(size(z));
+        bestPhi = NaN;
+        ok = false;
+
+        phiStarts = makeProjectionPhaseStarts(z);
+
+        lb = [0, 0, R1_LOWER_LIMIT];
+        ub = [Inf, Inf, R1_UPPER_LIMIT];
+
+        yCandidates = makeSignedMagnitudeCandidates(z, phiStarts);
+
+        for yy = 1:size(yCandidates, 2)
+            y = yCandidates(:,yy);
+            phi = phiStarts(1);
+            if yy <= numel(phiStarts)
+                phi = phiStarts(yy);
+            end
+
+            p0_list = [];
+            for rr = 1:numel(R1starts)
+                R1 = R1starts(rr);
+                [B0, C0] = linearBCEstimate(xs, y, R1);
+                p0 = [B0, C0, R1];
+                p0 = min(max(p0, lb), ub);
+                p0_list = [p0_list; p0]; %#ok<AGROW>
+            end
+            p0_list = unique(round(p0_list, 8), 'rows', 'stable');
+
+            modelFun = @(p, x) p(1) - p(2).*exp(-p(3).*x(:));
+
+            for ii = 1:size(p0_list,1)
+                p0 = p0_list(ii,:);
+                try
+                    [pfit, resnorm, residual, exitflag, ~, ~, J] = ...
+                        lsqcurvefit(modelFun, p0, xs, y, lb, ub, opts);
+
+                    if isfinite(resnorm) && resnorm < bestGof.sse
+                        bestP = pfit(:).';
+                        ok = true;
+                        nObs = numel(y);
+                        dfe = max(nObs - numel(bestP), 0);
+                        sst = sum((y - mean(y)).^2);
+                        if sst > 0
+                            rsq = 1 - resnorm ./ sst;
+                        else
+                            rsq = NaN;
+                        end
+                        if dfe > 0
+                            rmse = sqrt(resnorm ./ dfe);
+                        else
+                            rmse = NaN;
+                        end
+                        bestGof = struct('sse', resnorm, 'rsquare', rsq, ...
+                            'dfe', dfe, 'rmse', rmse, 'exitflag', exitflag);
+                        bestCi = approximateParameterCi(bestP, resnorm, J, dfe);
+                        bestY = y;
+                        bestResidual = residual;
+                        bestPhi = phi;
+                    end
+                catch
+                    % Try next start.
+                end
+            end
+        end
+    end
+
+    function yCandidates = makeSignedMagnitudeCandidates(z, phiStarts)
+        % Build candidate signed-magnitude vectors. All candidates preserve
+        % abs(y)==abs(z); only the signs differ.
+        z = z(:);
+        mag = abs(z);
+        yCandidates = [];
+
+        mode = lower(strtrim(SIGN_ASSIGNMENT_MODE));
+
+        if any(strcmp(mode, {'phase','phase_or_prefix','phase_then_prefix_if_bad'}))
+            for pp = 1:numel(phiStarts)
+                yCandidates(:,end+1) = phaseSignedMagnitude(z, phiStarts(pp)); %#ok<AGROW>
+            end
+        end
+
+        if any(strcmp(mode, {'prefix_search','phase_or_prefix'}))
+            n = numel(mag);
+            % IR-like recovery assumption: early points may be negative,
+            % later points positive. Limit the prefix candidates for speed.
+            maxPrefix = min(max(0,n-1), MAX_PREFIX_SIGN_CANDIDATES-1);
+            for k = 0:maxPrefix
+                y = mag;
+                if k > 0
+                    y(1:k) = -y(1:k);
+                end
+                yCandidates(:,end+1) = y; %#ok<AGROW>
+            end
+        end
+
+        if isempty(yCandidates)
+            yCandidates = mag;
+        end
+
+        % Remove duplicate sign patterns.
+        try
+            yCandidates = unique(round(yCandidates.', 10), 'rows', 'stable').';
+        catch
+            % Leave as-is if unique fails for any reason.
+        end
+    end
+
+    function y = phaseSignedMagnitude(z, phi)
+        % Use phase only to choose the sign; preserve original complex magnitude.
+        % This guarantees abs(y) == abs(z) for every valid point.
+        z = z(:);
+        z_rot = z .* exp(-1i .* phi);
+        sgn = sign(real(z_rot));
+        sgn(sgn == 0 | ~isfinite(sgn)) = 1;
+        y = sgn .* abs(z);
+    end
+
+    function phiStarts = makeProjectionPhaseStarts(z)
+        z = z(:);
+        good = isfinite(real(z)) & isfinite(imag(z)) & abs(z) > 0;
+        zg = z(good);
+        if isempty(zg)
+            phiStarts = 0;
+            return
+        end
+
+        switch lower(strtrim(PHASE_REFERENCE_MODE))
+            case 'last'
+                refs = zg(end);
+            case 'last3'
+                refs = mean(zg(max(1,end-2):end));
+            case 'mean'
+                refs = mean(zg);
+            otherwise  % 'last2'
+                refs = mean(zg(max(1,end-1):end));
+        end
+
+        phiStarts = angle(refs);
+        phiStarts = [phiStarts, angle(zg(end)), angle(mean(zg)), angle(zg(1))]; %#ok<AGROW>
+
+        if TRY_BOTH_PHASE_BRANCHES
+            phiStarts = [phiStarts, phiStarts + pi]; %#ok<AGROW>
+        end
+
+        offsets = [-pi/18, 0, pi/18];
+        phiStarts = phiStarts(:) + offsets;
+        phiStarts = wrapPiLocal(phiStarts(:).');
+        phiStarts = unique(round(phiStarts, 10), 'stable');
+    end
+
+    function [B0, C0] = linearBCEstimate(xs, y, R1)
+        xs = xs(:); y = y(:);
+        % y = B - C*exp(-R1*t) = [1, -exp] * [B; C]
+        X = [ones(size(xs)), -exp(-R1 .* xs)];
+        beta = X \ y;
+        B0 = beta(1);
+        C0 = beta(2);
+        scale = max(abs(y));
+        if ~isfinite(scale) || scale == 0, scale = 1; end
+        if ~isfinite(B0) || B0 < 0, B0 = max(y(end), 0); end
+        if ~isfinite(C0) || C0 < 0, C0 = max(B0 - y(1), 0.1*scale); end
+        B0 = max(B0, eps);
+        C0 = max(C0, eps);
+    end
+
+    function [bestP, bestCi, bestGof, ok] = fitRealEmpiricalUnconstrained(xs, y, R1starts, opts)
+        xs = xs(:); y = y(:);
+        bestP = nan(1, 3);       % [A B R1], y = A exp(-R1t)+B
+        bestCi = nan(2, 3);
+        bestGof = emptyGof(Inf);
+        ok = false;
+        lb = [-Inf, -Inf, R1_LOWER_LIMIT];
+        ub = [ Inf,  Inf, R1_UPPER_LIMIT];
+        p0_list = [];
+        for rr = 1:numel(R1starts)
+            R1 = R1starts(rr);
+            [A0, B0] = linearABEstimate(xs, y, R1);
+            p0 = [A0, B0, R1];
+            p0 = min(max(p0, lb), ub);
+            p0_list = [p0_list; p0]; %#ok<AGROW>
+        end
+        p0_list = unique(round(p0_list, 8), 'rows', 'stable');
+        modelFun = @(p, x) p(1).*exp(-p(3).*x(:)) + p(2);
+        for ii = 1:size(p0_list,1)
+            p0 = p0_list(ii,:);
+            try
+                [pfit, resnorm, ~, exitflag, ~, ~, J] = lsqcurvefit(modelFun, p0, xs, y, lb, ub, opts);
+                if isfinite(resnorm) && resnorm < bestGof.sse
+                    bestP = pfit(:).'; ok = true;
+                    nObs = numel(y); dfe = max(nObs - numel(bestP), 0);
+                    sst = sum((y - mean(y)).^2);
+                    if sst > 0, rsq = 1 - resnorm ./ sst; else, rsq = NaN; end
+                    if dfe > 0, rmse = sqrt(resnorm ./ dfe); else, rmse = NaN; end
+                    bestGof = struct('sse', resnorm, 'rsquare', rsq, 'dfe', dfe, 'rmse', rmse, 'exitflag', exitflag);
+                    bestCi = approximateParameterCi(bestP, resnorm, J, dfe);
+                end
+            catch
+            end
+        end
+    end
+
+    function [A0, B0] = linearABEstimate(xs, y, R1)
+        xs = xs(:); y = y(:);
+        X = [exp(-R1 .* xs), ones(size(xs))];
+        beta = X \ y;
+        A0 = beta(1); B0 = beta(2);
+        if ~isfinite(A0), A0 = y(1) - y(end); end
+        if ~isfinite(B0), B0 = y(end); end
+        if ~isfinite(A0), A0 = 1; end
+        if ~isfinite(B0), B0 = 0; end
+    end
+
+    function ci = approximateParameterCi(p, resnorm, J, dfe)
+        ci = nan(2, numel(p));
+        if isempty(J) || dfe <= 0 || ~all(isfinite(p))
+            return
+        end
+        try
+            mse = resnorm ./ dfe;
+            JTJ = full(J.' * J);
+            covp = mse .* pinv(JTJ);
+            se = sqrt(max(diag(covp), 0)).';
+            ci(1,:) = p(:).' - 1.96 .* se;
+            ci(2,:) = p(:).' + 1.96 .* se;
+        catch
+            ci = nan(2, numel(p));
+        end
+    end
+
+    function gof = emptyGof(sseValue)
+        gof = struct('sse', sseValue, 'rsquare', NaN, ...
+            'dfe', NaN, 'rmse', NaN, 'exitflag', NaN);
+    end
+
+    function [xplot, yplot, valid_plot] = makeMatchedPlotVectors(xin, yin, nMax)
+        xin = xin(:); yin = yin(:);
+        nPlotLocal = min([numel(xin), numel(yin), nMax]);
+        if isempty(nPlotLocal) || nPlotLocal < 1
+            xplot = []; yplot = []; valid_plot = false(0,1); return
+        end
+        xplot = xin(1:nPlotLocal);
+        yplot = yin(1:nPlotLocal);
+        valid_plot = isfinite(xplot) & xplot > 0 & isfinite(yplot) & yplot > 0;
+        valid_plot = valid_plot(:);
+    end
+
+    function qs = qualityString(gof)
+        if ~isfinite(gof.rsquare)
+            qs = 'unknown';
+        elseif gof.rsquare < 0.70
+            qs = 'poor';
+        elseif gof.rsquare < 0.90
+            qs = 'questionable';
+        else
+            qs = 'good';
+        end
+    end
+
+    function tf = t1OutsideAcceptedRange(R1)
+        tf = true;
+        if ~isfinite(R1) || R1 <= 0, return, end
+        T1ms = 1000 ./ R1;
+        lo = min(T1_ACCEPTED_RANGE_MS);
+        hi = max(T1_ACCEPTED_RANGE_MS);
+        tf = ~(isfinite(T1ms) && T1ms >= lo && T1ms <= hi);
+    end
+
+    function tf = autoCandidateAcceptable(gof0, gof1, R1)
+        tf = false;
+        if t1OutsideAcceptedRange(R1), return, end
+        if isempty(gof1) || ~isfinite(gof1.rmse), return, end
+        if isfinite(gof0.rmse) && gof1.rmse > AUTO_ACCEPT_RMSE_RATIO .* gof0.rmse, return, end
+        if isfinite(gof0.rsquare) && isfinite(gof1.rsquare) && gof1.rsquare < gof0.rsquare - AUTO_ACCEPT_RSQ_DROP, return, end
+        tf = true;
+    end
+
+    function score = autoCandidateScore(gof, nFlips)
+        score = Inf;
+        if isempty(gof) || ~isfinite(gof.rmse), return, end
+        score = gof.rmse;
+        if AUTO_PREFER_FEWER_FLIPS
+            score = score .* (1 + 0.20 .* nFlips);
+        end
+    end
+
+    function candidateIdx = rankProjectedFlipCandidates(xs, y_used, p)
+        xs = xs(:); y_used = y_used(:);
+        nPts = numel(y_used); candidateIdx = [];
+        if nPts < 4 || numel(p) < 3, return, end
+        yfit = p(1) - p(2).*exp(-p(3).*xs);
+        scale = median(abs([y_used(:); yfit(:)]), 'omitnan');
+        if ~isfinite(scale) || scale == 0, scale = max(abs(y_used)); end
+        if ~isfinite(scale) || scale == 0, scale = 1; end
+        score = abs(y_used - yfit)./scale;
+        wrongSign = sign(y_used) ~= sign(yfit) & abs(y_used) > 0.10.*scale & abs(yfit) > 0.10.*scale;
+        score = score + 0.75.*double(wrongSign);
+        score(~isfinite(score)) = -Inf;
+        [~, order] = sort(score, 'descend');
+        order = order(:).';
+        if AUTO_PERMUTE_EARLY_POINTS_FIRST
+            nEarly = min(3, nPts);
+            order = unique([1:nEarly, order], 'stable');
+        end
+        nTake = min(MAX_AUTO_POLARITY_CANDIDATES, numel(order));
+        candidateIdx = order(1:nTake);
+    end
+
+    function [bestP, bestCi, bestGof, okBest, bestZ, bestY, bestResidual, bestPhi, bestFlipIdx] = ...
+            automaticProjectedPolarityPermutationSearch(xs, z_used, p0, ci0, gof0, phi_ref0, R1starts, opts)
+        bestP = p0; bestCi = ci0; bestGof = gof0;
+        bestZ = z_used; bestY = phaseSignedMagnitude(z_used, phi_ref0); bestResidual = []; bestPhi = phi_ref0;
+        bestFlipIdx = []; okBest = false; bestScore = Inf;
+        candidateIdx = rankProjectedFlipCandidates(xs, bestY, p0);
+        if isempty(candidateIdx)
+            candidateIdx = 1:min(MAX_AUTO_POLARITY_CANDIDATES, numel(z_used));
+        end
+        candidateIdx = unique([1:min(3,numel(z_used)), candidateIdx(:).'], 'stable');
+        candidateIdx = candidateIdx(1:min(MAX_AUTO_POLARITY_CANDIDATES, numel(candidateIdx)));
+
+        maxFlips = min([MAX_AUTO_FLIPPED_POINTS, numel(candidateIdx), numel(z_used)]);
+        for nFlip = 1:maxFlips
+            combos = nchoosek(candidateIdx(:).', nFlip);
+            for cc = 1:size(combos,1)
+                flipIdx = combos(cc,:);
+                z_try = z_used;
+                z_try(flipIdx) = -z_try(flipIdx);
+                [p_try, ci_try, gof_try, ok_try, z_fit, y_fitdata, residual_try, phi_try] = ...
+                    fitPhaseProjectedEmpirical(xs, z_try, R1starts, opts);
+                if ~ok_try || ~autoCandidateAcceptable(gof0, gof_try, p_try(3)), continue, end
+                thisScore = autoCandidateScore(gof_try, nFlip);
+                if thisScore < bestScore
+                    bestP = p_try; bestCi = ci_try; bestGof = gof_try;
+                    bestZ = z_fit; bestY = y_fitdata; bestResidual = residual_try; bestPhi = phi_try;
+                    bestFlipIdx = sort(flipIdx); bestScore = thisScore; okBest = true;
+                end
+            end
+        end
+    end
+
+    function [p, ci, gof, z_used, y_used, residual, phi_ref, manual_flip_idx, manual_mask_idx, action_log] = ...
+            manualProjectedPointCorrectionLoop(field_index, xs, z_used, y_initial, p, ci, gof, residual, phi_ref, R1starts, opts)
+        % Manual QC loop for complex/phase-projected data.
+        %
+        % IMPORTANT: this loop freezes the phase reference at entry and then
+        % operates on a fixed signed-magnitude scalar vector. This means unedited
+        % point amplitudes do not move when another point is masked/flipped.
+        %
+        %   z_fixed      = original complex ROI values entering manual QC
+        %   phi_ref      = fixed unit-magnitude phase rotation
+        %   y_original   = sign(real(z_fixed*exp(-1i*phi_ref))) .* abs(z_fixed)
+        %   y_all        = editable copy of y_original
+        %
+        % Masking changes only the keep vector.
+        % Flipping changes only the sign of the selected y_all point.
+        % The phase reference is not recomputed during manual editing.
+        z_all = z_used(:);
+        xs_all = xs(:);
+        keep = true(size(z_all));
+        manual_flip_idx = [];
+        action_log = struct('action', {}, 'idx', {});
+
+        % Freeze signed magnitudes once. Phase chooses only sign; magnitude
+        % is exactly abs(z_all) for every point.
+        if nargin >= 4 && ~isempty(y_initial) && numel(y_initial) == numel(z_all)
+            y_original = y_initial(:);
+        else
+            y_original = phaseSignedMagnitude(z_all, phi_ref);
+        end
+        y_all = y_original;
+
+        h = figure('Name', sprintf('Manual phase-signed-magnitude empirical T1 fit: field %d', field_index));
+
+        while true
+            manual_mask_idx = find(~keep).';
+            drawProjectedManualFigure(h, field_index, xs_all, y_all, keep, p, gof, phi_ref, residual, manual_flip_idx, manual_mask_idx);
+            fprintf('\nField %d manual correction, phase-signed magnitude:\n', field_index);
+            fprintf('  Left-click a point to choose Mask/exclude or Flip/invert, then refit.\n');
+            fprintf('  Flip changes only that point sign in the fixed projected data.\n');
+            fprintf('  Press Enter or right-click to accept and continue.\n');
+            fprintf('  Press u to undo the most recent manual action.\n');
+            figure(h);
+
+            try
+                [xclick, yclick, button] = ginput(1);
+            catch
+                break
+            end
+
+            if isempty(button) || button == 3
+                break
+            end
+
+            if button == double('u') || button == double('U')
+                if ~isempty(action_log)
+                    old_y = y_all; old_keep = keep; old_p = p; old_ci = ci; old_gof = gof; old_res = residual;
+                    last = action_log(end);
+                    action_log(end) = [];
+
+                    switch lower(last.action)
+                        case 'flip'
+                            y_all(last.idx) = -y_all(last.idx);
+                            manual_flip_idx(manual_flip_idx == last.idx) = [];
+                        case 'mask'
+                            keep(last.idx) = true;
+                        case 'unmask'
+                            keep(last.idx) = false;
+                    end
+
+                    [okRefit, p, ci, gof, residual] = refitFixedProjectedCurrent(xs_all, y_all, keep, R1starts, opts, old_p, old_ci, old_gof, old_res);
+                    if ~okRefit
+                        y_all = old_y; keep = old_keep; p = old_p; ci = old_ci; gof = old_gof; residual = old_res;
+                        action_log(end+1) = last; %#ok<AGROW>
+                        warndlg('Undo caused the refit to fail, so it was reverted.', 'Refit failed');
+                    end
+                end
+                continue
+            end
+
+            if button ~= 1
+                continue
+            end
+
+            idx = nearestRealPoint(xs_all, y_all, xclick, yclick);
+            if isempty(idx) || ~isfinite(idx)
+                continue
+            end
+
+            if keep(idx)
+                choice = questdlg(sprintf(['Point %d, evolution time %.4g s\n\n', ...
+                    'Original signed-magnitude value: %.5g\nCurrent displayed value: %.5g\n\n', ...
+                    'What would you like to do?'], idx, xs_all(idx), y_original(idx), y_all(idx)), ...
+                    'Manual point correction', ...
+                    'Mask/exclude and refit', 'Flip/invert and refit', 'Cancel', ...
+                    'Mask/exclude and refit');
+            else
+                choice = questdlg(sprintf(['Point %d is currently masked.\n\n', ...
+                    'Evolution time = %.4g s\nSigned-magnitude value = %.5g'], idx, xs_all(idx), y_all(idx)), ...
+                    'Manual point correction', ...
+                    'Unmask/include and refit', 'Cancel', 'Cancel');
+            end
+
+            if isempty(choice) || strcmp(choice, 'Cancel')
+                continue
+            end
+
+            old_y = y_all; old_keep = keep; old_p = p; old_ci = ci; old_gof = gof; old_res = residual; old_actions = action_log; old_flips = manual_flip_idx;
+
+            switch choice
+                case 'Mask/exclude and refit'
+                    if sum(keep) - 1 < MIN_POINTS_AFTER_MASKING
+                        warndlg(sprintf('Cannot mask point: at least %d points must remain.', MIN_POINTS_AFTER_MASKING), 'Too few points');
+                        continue
+                    end
+                    keep(idx) = false;
+                    action_log(end+1) = struct('action', 'mask', 'idx', idx); %#ok<AGROW>
+
+                case 'Unmask/include and refit'
+                    keep(idx) = true;
+                    action_log(end+1) = struct('action', 'unmask', 'idx', idx); %#ok<AGROW>
+
+                case 'Flip/invert and refit'
+                    % Only the fixed signed-magnitude scalar point changes sign.
+                    % No complex rephasing and no phi_ref recomputation occurs.
+                    y_all(idx) = -y_all(idx);
+                    if any(manual_flip_idx == idx)
+                        manual_flip_idx(manual_flip_idx == idx) = [];
+                    else
+                        manual_flip_idx(end+1) = idx; %#ok<AGROW>
+                    end
+                    action_log(end+1) = struct('action', 'flip', 'idx', idx); %#ok<AGROW>
+            end
+
+            [okRefit, p, ci, gof, residual] = refitFixedProjectedCurrent(xs_all, y_all, keep, R1starts, opts, old_p, old_ci, old_gof, old_res);
+            if ~okRefit
+                y_all = old_y; keep = old_keep; p = old_p; ci = old_ci; gof = old_gof; residual = old_res; action_log = old_actions; manual_flip_idx = old_flips;
+                warndlg('The requested point correction caused the refit to fail, so it was reverted.', 'Refit failed');
+            end
+        end
+
+        if isgraphics(h), close(h); end
+        z_used = z_all;
+        y_used = y_all;
+        manual_mask_idx = find(~keep).';
+    end
+
+    function [okRefit, p, ci, gof, residual] = refitFixedProjectedCurrent(xs_all, y_all, keep, R1starts, opts, p_old, ci_old, gof_old, residual_old)
+        okRefit = false;
+        p = p_old; ci = ci_old; gof = gof_old; residual = residual_old;
+        if sum(keep) < MIN_POINTS_AFTER_MASKING
+            return
+        end
+        [p2, ci2, gof2, ok2, residual2] = fitFixedProjectedY(xs_all(keep), y_all(keep), R1starts, opts);
+        if ok2
+            p = p2; ci = ci2; gof = gof2; residual = residual2; okRefit = true;
+        end
+    end
+
+    function [bestP, bestCi, bestGof, ok, bestResidual] = fitFixedProjectedY(xs, y, R1starts, opts)
+        % Fit fixed phase-signed magnitudes to y = B - C*exp(-R1*t), preserving
+        % the same [B C R1] parameterisation as fitPhaseProjectedEmpirical.
+        xs = xs(:); y = y(:);
+        bestP = nan(1, 3);
+        bestCi = nan(2, 3);
+        bestGof = emptyGof(Inf);
+        bestResidual = nan(size(y));
+        ok = false;
+
+        lb = [0, 0, R1_LOWER_LIMIT];
+        ub = [Inf, Inf, R1_UPPER_LIMIT];
+        modelFun = @(p, x) p(1) - p(2).*exp(-p(3).*x(:));
+
+        p0_list = [];
+        for rr = 1:numel(R1starts)
+            R1 = R1starts(rr);
+            [B0, C0] = linearBCEstimate(xs, y, R1);
+            p0 = [B0, C0, R1];
+            p0 = min(max(p0, lb), ub);
+            p0_list = [p0_list; p0]; %#ok<AGROW>
+        end
+        p0_list = unique(round(p0_list, 8), 'rows', 'stable');
+
+        for ii = 1:size(p0_list,1)
+            p0 = p0_list(ii,:);
+            try
+                [pfit, resnorm, residual, exitflag, ~, ~, J] = ...
+                    lsqcurvefit(modelFun, p0, xs, y, lb, ub, opts);
+
+                if isfinite(resnorm) && resnorm < bestGof.sse
+                    bestP = pfit(:).';
+                    ok = true;
+                    nObs = numel(y);
+                    dfe = max(nObs - numel(bestP), 0);
+                    sst = sum((y - mean(y)).^2);
+                    if sst > 0
+                        rsq = 1 - resnorm ./ sst;
+                    else
+                        rsq = NaN;
+                    end
+                    if dfe > 0
+                        rmse = sqrt(resnorm ./ dfe);
+                    else
+                        rmse = NaN;
+                    end
+                    bestGof = struct('sse', resnorm, 'rsquare', rsq, ...
+                        'dfe', dfe, 'rmse', rmse, 'exitflag', exitflag);
+                    bestCi = approximateParameterCi(bestP, resnorm, J, dfe);
+                    bestResidual = residual;
+                end
+            catch
+            end
+        end
+    end
+
+
+
+    function drawProjectedManualFigure(h, field_index, xs, y_used, keep, p, gof, phi_ref, residual, manual_flip_idx, manual_mask_idx)
+        % Draw manual-QC figure for phase-signed-magnitude fits.
+        % Model parameterisation is [B C R1], with y = B - C*exp(-R1*t).
+        if ~isgraphics(h), return, end
+        figure(h); clf(h);
+
+        xs = xs(:);
+        y_used = y_used(:);
+        keep = keep(:);
+
+        if isempty(xs) || isempty(y_used) || numel(xs) ~= numel(y_used)
+            title(sprintf('Field %d: no plottable data', field_index));
+            drawnow;
+            return
+        end
+
+        if numel(keep) ~= numel(xs)
+            keep = true(size(xs));
+        end
+
+        if ~any(keep)
+            plot(xs, y_used, 'x', 'DisplayName', 'All points masked');
+            grid on;
+            xlabel('Evolution time (s)');
+            ylabel('Phase-signed magnitude signal (AU)');
+            title(sprintf('Field %d: all points masked', field_index));
+            legend('Location', 'best');
+            drawnow;
+            return
+        end
+
+        xfit = linspace(min(xs(keep)), max(xs(keep)), 300).';
+        yfit = p(1) - p(2).*exp(-p(3).*xfit);
+
+        plot(xs(keep), y_used(keep), 'o', 'DisplayName', 'Included phase-signed magnitude');
+        hold on;
+
+        if any(~keep)
+            plot(xs(~keep), y_used(~keep), 'x', ...
+                'MarkerSize', 10, 'LineWidth', 1.5, ...
+                'DisplayName', 'Masked/excluded point(s)');
+        end
+
+        plot(xfit, yfit, '-', 'DisplayName', 'B - C exp(-R1 t)');
+        yline(0, '--', 'DisplayName', 'Zero');
+
+        if ~isempty(manual_flip_idx)
+            manual_flip_idx = manual_flip_idx(manual_flip_idx >= 1 & manual_flip_idx <= numel(xs));
+            if ~isempty(manual_flip_idx)
+                manual_flip_idx = manual_flip_idx(keep(manual_flip_idx));
+            end
+            if ~isempty(manual_flip_idx)
+                plot(xs(manual_flip_idx), y_used(manual_flip_idx), 's', ...
+                    'MarkerSize', 10, 'LineWidth', 1.5, ...
+                    'DisplayName', 'Flipped/inverted point(s)');
+            end
+        end
+
+        hold off;
+        grid on;
+        xlabel('Evolution time (s)');
+        ylabel('Phase-signed magnitude signal (AU)');
+
+        if isfinite(p(3)) && p(3) > 0
+            t1ms = 1000 ./ p(3);
+        else
+            t1ms = NaN;
+        end
+
+        if nargin < 9 || isempty(manual_mask_idx)
+            manual_mask_idx = [];
+        end
+
+        if isfield(gof, 'rsquare') && isfinite(gof.rsquare)
+            r2txt = sprintf('%.4f', gof.rsquare);
+        else
+            r2txt = 'NaN';
+        end
+
+        title(sprintf(['Field %d phase-signed-magnitude fit: R1 = %.4g s^{-1}, T1 = %.4g ms, R^2 = %s\n', ...
+                       'phi_{ref} = %.3f rad. Left-click: mask or flip; Enter/right-click: accept; u: undo. Masked = %s'], ...
+            field_index, p(3), t1ms, r2txt, phi_ref, mat2str(manual_mask_idx)));
+
+        legend('Location', 'best');
+        drawnow;
+    end
+
+    function showProjectedFitFigure(field_index, xs, y_used, p, gof, phi_ref, residual, manual_idx)
+        h = figure('Name', sprintf('Phase-signed-magnitude empirical T1 fit: field %d', field_index));
+        drawProjectedManualFigure(h, field_index, xs, y_used, true(size(xs(:))), p, gof, phi_ref, residual, manual_idx, []);
+        try
+            waitforbuttonpress;
+            close(h);
+        catch
+        end
+    end
+
+    function [p, ci, gof, y_used, manual_flip_idx, manual_mask_idx, action_log] = manualRealPointCorrectionLoop(field_index, xs, y_used, p, ci, gof, R1starts, opts)
+        y_all = y_used(:);
+        xs_all = xs(:);
+        keep = true(size(y_all));
+        manual_flip_idx = [];
+        action_log = struct('action', {}, 'idx', {});
+        h = figure('Name', sprintf('Manual empirical signed-magnitude T1 fit: field %d', field_index));
+
+        while true
+            manual_mask_idx = find(~keep).';
+            drawRealManualFigure(h, field_index, xs_all, y_all, keep, p, gof, manual_flip_idx, manual_mask_idx);
+            fprintf('\nField %d manual correction:\n', field_index);
+            fprintf('  Left-click a point to choose Mask/exclude or Flip/invert, then refit.\n');
+            fprintf('  Press Enter or right-click to accept and continue.\n');
+            fprintf('  Press u to undo the most recent manual action.\n');
+            figure(h);
+
+            try
+                [xclick, yclick, button] = ginput(1);
+            catch
+                break
+            end
+            if isempty(button) || button == 3, break, end
+
+            if button == double('u') || button == double('U')
+                if ~isempty(action_log)
+                    old_y = y_all; old_keep = keep; old_p = p; old_ci = ci; old_gof = gof;
+                    last = action_log(end); action_log(end) = [];
+                    switch lower(last.action)
+                        case 'flip'
+                            y_all(last.idx) = -y_all(last.idx);
+                            manual_flip_idx(manual_flip_idx == last.idx) = [];
+                        case 'mask'
+                            keep(last.idx) = true;
+                        case 'unmask'
+                            keep(last.idx) = false;
+                    end
+                    [okRefit, p, ci, gof] = refitRealCurrent(xs_all, y_all, keep, R1starts, opts, old_p, old_ci, old_gof);
+                    if ~okRefit
+                        y_all = old_y; keep = old_keep; p = old_p; ci = old_ci; gof = old_gof;
+                        action_log(end+1) = last; %#ok<AGROW>
+                        warndlg('Undo caused the refit to fail, so it was reverted.', 'Refit failed');
+                    end
+                end
+                continue
+            end
+
+            if button ~= 1, continue, end
+            idx = nearestRealPoint(xs_all, y_all, xclick, yclick);
+            if isempty(idx) || ~isfinite(idx), continue, end
+
+            if keep(idx)
+                choice = questdlg(sprintf(['Point %d, evolution time %.4g s\n\n', ...
+                    'What would you like to do?'], idx, xs_all(idx)), ...
+                    'Manual point correction', ...
+                    'Mask/exclude and refit', 'Flip/invert and refit', 'Cancel', ...
+                    'Mask/exclude and refit');
+            else
+                choice = questdlg(sprintf(['Point %d is currently masked.\n\n', ...
+                    'Evolution time = %.4g s'], idx, xs_all(idx)), ...
+                    'Manual point correction', ...
+                    'Unmask/include and refit', 'Cancel', 'Cancel');
+            end
+
+            if isempty(choice) || strcmp(choice, 'Cancel'), continue, end
+
+            old_y = y_all; old_keep = keep; old_p = p; old_ci = ci; old_gof = gof; old_actions = action_log; old_flips = manual_flip_idx;
+            switch choice
+                case 'Mask/exclude and refit'
+                    if sum(keep) - 1 < MIN_POINTS_AFTER_MASKING
+                        warndlg(sprintf('Cannot mask point: at least %d points must remain.', MIN_POINTS_AFTER_MASKING), 'Too few points');
+                        continue
+                    end
+                    keep(idx) = false;
+                    action_log(end+1) = struct('action', 'mask', 'idx', idx); %#ok<AGROW>
+                case 'Unmask/include and refit'
+                    keep(idx) = true;
+                    action_log(end+1) = struct('action', 'unmask', 'idx', idx); %#ok<AGROW>
+                case 'Flip/invert and refit'
+                    y_all(idx) = -y_all(idx);
+                    if any(manual_flip_idx == idx)
+                        manual_flip_idx(manual_flip_idx == idx) = [];
+                    else
+                        manual_flip_idx(end+1) = idx; %#ok<AGROW>
+                    end
+                    action_log(end+1) = struct('action', 'flip', 'idx', idx); %#ok<AGROW>
+            end
+
+            [okRefit, p, ci, gof] = refitRealCurrent(xs_all, y_all, keep, R1starts, opts, old_p, old_ci, old_gof);
+            if ~okRefit
+                y_all = old_y; keep = old_keep; p = old_p; ci = old_ci; gof = old_gof; action_log = old_actions; manual_flip_idx = old_flips;
+                warndlg('The requested point correction caused the refit to fail, so it was reverted.', 'Refit failed');
+            end
+        end
+
+        if isgraphics(h), close(h); end
+        y_used = y_all;
+        manual_mask_idx = find(~keep).';
+    end
+
+    function [okRefit, p, ci, gof] = refitRealCurrent(xs_all, y_all, keep, R1starts, opts, p_old, ci_old, gof_old)
+        okRefit = false;
+        p = p_old; ci = ci_old; gof = gof_old;
+        if sum(keep) < MIN_POINTS_AFTER_MASKING
+            return
+        end
+        [p2, ci2, gof2, ok2] = fitRealEmpiricalUnconstrained(xs_all(keep), y_all(keep), R1starts, opts);
+        if ok2
+            p = p2; ci = ci2; gof = gof2; okRefit = true;
+        end
+    end
+
+    function drawRealManualFigure(h, field_index, xs, y_used, keep, p, gof, manual_flip_idx, manual_mask_idx)
+        if ~isgraphics(h), return, end
+        figure(h); clf(h);
+        xs = xs(:); y_used = y_used(:); keep = keep(:);
+        xfit = linspace(min(xs(keep)), max(xs(keep)), 300).';
+        yfit = p(1).*exp(-p(3).*xfit) + p(2);
+        plot(xs(keep), y_used(keep), 'o', 'DisplayName', 'Included signed data'); hold on;
+        if any(~keep)
+            plot(xs(~keep), y_used(~keep), 'x', 'MarkerSize', 10, 'LineWidth', 1.5, 'DisplayName', 'Masked/excluded point(s)');
+        end
+        plot(xfit, yfit, '-', 'DisplayName', 'A exp(-R1 t) + B');
+        yline(0, '--', 'DisplayName', 'Zero');
+        if ~isempty(manual_flip_idx)
+            manual_flip_idx = manual_flip_idx(manual_flip_idx >= 1 & manual_flip_idx <= numel(xs));
+            manual_flip_idx = manual_flip_idx(keep(manual_flip_idx));
+            if ~isempty(manual_flip_idx)
+                plot(xs(manual_flip_idx), y_used(manual_flip_idx), 's', 'MarkerSize', 10, 'LineWidth', 1.5, 'DisplayName', 'Flipped/inverted point(s)');
+            end
+        end
+        hold off; grid on;
+        xlabel('Evolution time (s)'); ylabel('Signal (AU)');
+        title(sprintf(['Field %d empirical signed-magnitude fit: R1 = %.4g s^{-1}, T1 = %.4g ms, R^2 = %.4f\n', ...
+                       'Left-click: mask or flip; Enter/right-click: accept; u: undo. Masked = %s'], ...
+            field_index, p(3), 1000./p(3), gof.rsquare, mat2str(manual_mask_idx)));
+        legend('Location', 'best'); drawnow;
+    end
+
+    function idx = nearestRealPoint(xs, y_used, xclick, yclick)
+        idx = [];
+        if isempty(xs) || isempty(y_used), return, end
+        ax = gca; xl = xlim(ax); yl = ylim(ax);
+        xrange = diff(xl); yrange = diff(yl);
+        if ~isfinite(xrange) || xrange == 0, xrange = max(range(xs), eps); end
+        if ~isfinite(yrange) || yrange == 0, yrange = max(range(y_used), eps); end
+        d2 = ((xs(:) - xclick) ./ xrange).^2 + ((y_used(:) - yclick) ./ yrange).^2;
+        [~, idx] = min(d2);
+    end
+
+
+    function showRealFitFigure(field_index, xs, y, p, gof)
+        h = figure('Name', sprintf('Empirical signed-magnitude T1 fit: field %d', field_index));
+        xfit = linspace(min(xs), max(xs), 300).';
+        yfit = p(1).*exp(-p(3).*xfit) + p(2);
+        plot(xs, y, 'o', 'DisplayName', 'Signed magnitude data'); hold on;
+        plot(xfit, yfit, '-', 'DisplayName', 'A exp(-R1 t) + B');
+        yline(0, '--', 'DisplayName', 'Zero');
+        hold off; grid on;
+        xlabel('Evolution time (s)'); ylabel('Signal (AU)');
+        title(sprintf('Field %d empirical signed-magnitude fit: R1 = %.4g s^{-1}, T1 = %.4g ms, R^2 = %.4f', ...
+            field_index, p(3), 1000./p(3), gof.rsquare));
+        legend('Location', 'best');
+        try
+            waitforbuttonpress;
+            close(h);
+        catch
+        end
+    end
+
+    function candidateIdx = rankRealFlipCandidates(xs, y_used, p)
+        xs = xs(:); y_used = y_used(:); nPts = numel(y_used); candidateIdx = [];
+        if nPts < 4 || numel(p) < 3, return, end
+        yfit = p(1).*exp(-p(3).*xs) + p(2);
+        scale = median(abs([y_used(:); yfit(:)]), 'omitnan');
+        if ~isfinite(scale) || scale == 0, scale = max(abs(y_used)); end
+        if ~isfinite(scale) || scale == 0, scale = 1; end
+        score = abs(y_used - yfit)./scale;
+        wrongSign = sign(y_used) ~= sign(yfit) & abs(y_used) > 0.10.*scale & abs(yfit) > 0.10.*scale;
+        score = score + 0.75.*double(wrongSign);
+        score(~isfinite(score)) = -Inf;
+        [~, order] = sort(score, 'descend'); order = order(:).';
+        if AUTO_PERMUTE_EARLY_POINTS_FIRST
+            nEarly = min(3, nPts); order = unique([1:nEarly, order], 'stable');
+        end
+        nTake = min(MAX_AUTO_POLARITY_CANDIDATES, numel(order));
+        candidateIdx = order(1:nTake);
+    end
+
+    function [bestP, bestCi, bestGof, okBest, bestY, bestFlipIdx] = ...
+            automaticRealPolarityPermutationSearch(xs, y_used, p0, ci0, gof0, R1starts, opts)
+        bestP = p0; bestCi = ci0; bestGof = gof0; bestY = y_used; bestFlipIdx = []; okBest = false; bestScore = Inf;
+        candidateIdx = rankRealFlipCandidates(xs, y_used, p0);
+        if isempty(candidateIdx), return, end
+        maxFlips = min([MAX_AUTO_FLIPPED_POINTS, numel(candidateIdx), numel(y_used)]);
+        for nFlip = 1:maxFlips
+            combos = nchoosek(candidateIdx(:).', nFlip);
+            for cc = 1:size(combos,1)
+                flipIdx = combos(cc,:);
+                y_try = y_used; y_try(flipIdx) = -y_try(flipIdx);
+                [p_try, ci_try, gof_try, ok_try] = fitRealEmpiricalUnconstrained(xs, y_try, R1starts, opts);
+                if ~ok_try || ~autoCandidateAcceptable(gof0, gof_try, p_try(3)), continue, end
+                thisScore = autoCandidateScore(gof_try, nFlip);
+                if thisScore < bestScore
+                    bestP = p_try; bestCi = ci_try; bestGof = gof_try; bestY = y_try; bestFlipIdx = sort(flipIdx); bestScore = thisScore; okBest = true;
+                end
+            end
+        end
+    end
+
+    function phi = wrapPiLocal(phi)
+        phi = mod(phi + pi, 2*pi) - pi;
+    end
+
+    function tf = hasProp(s, name)
+        if isobject(s)
+            tf = isprop(s, name);
+        else
+            tf = isfield(s, name);
+        end
+    end
+
+    function s = safeSet(s, name, value)
+        try
+            if isobject(s)
+                if isprop(s, name), s.(name) = value; end
+            else
+                s.(name) = value;
+            end
+        catch
+            % Convenience assignment should not fail the fit.
+        end
+    end
+end
+
+
+
+
+
+
+    end
+
+
+end
+
+

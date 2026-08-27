@@ -42,12 +42,19 @@ function combined_images = combine_with_maps(images, maps, opts, obj)
     images = images(:,:,:,:,:,sel);
     maps   = maps(:,:,:,:,:,sel);
 
-    lambda = 0;
-    if isfield(obj,'coil_sens_lambda') && ~isempty(obj.coil_sens_lambda)
-        lambda = obj.coil_sens_lambda;
-    end
+    lambda = get_setting(obj, 'coil_sens_lambda', 0);
 
     num = sum(conj(maps) .* images, 6);
     den = sum(abs(maps).^2, 6) + lambda + eps(class(num));
     combined_images = num ./ den;
+end
+
+
+function value = get_setting(obj, name, defaultValue)
+    value = defaultValue;
+    if isstruct(obj) && isfield(obj, name) && ~isempty(obj.(name))
+        value = obj.(name);
+    elseif isobject(obj) && isprop(obj, name) && ~isempty(obj.(name))
+        value = obj.(name);
+    end
 end
