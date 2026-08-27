@@ -578,13 +578,8 @@ classdef ImageReconCore
                 end
                 obj.complexkspace = reshape(correctedkspace,[obj.samples,obj.views,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]);
                 % Keep an untouched, unwhitened copy. Whitening is a user-selectable
-<<<<<<< HEAD
                 % reconstruction operation and must be applied exactly once to
                 % the full receiver array in buildimages(), before selection.
-=======
-                % reconstruction operation and must be applied exactly once, after
-                % receiver selection, in buildimages().
->>>>>>> ab3c741283ada40bce191eb9b97fc9b684810912
                 obj.originalcomplexkspace = obj.complexkspace;
                
             else
@@ -604,19 +599,12 @@ classdef ImageReconCore
             obj.complexkspace = obj.originalcomplexkspace;
             obj = correct_orientation(obj);
 
-<<<<<<< HEAD
             % ----------- Receiver selection and optional prewhitening -----------
             % obj.multichannel_recon may be:
             %   - logical mask over the ORIGINAL coil dimension
             %   - numeric MATLAB index list into the ORIGINAL coil dimension
             %     (the GUI displays scanner receiver IDs 0..N-1, with
             %     ItemsData 1..N)
-=======
-            % ----------- Coil selection (trim once and renumber) -----------
-            % obj.multichannel_recon may be:
-            %   - logical mask over the ORIGINAL coil dimension
-            %   - numeric index list into the ORIGINAL coil dimension (e.g. [2 3 4 5 6 7])
->>>>>>> ab3c741283ada40bce191eb9b97fc9b684810912
             opts_orig = obj.multichannel_recon;
             nCoils_orig = size(obj.complexkspace, 6);
 
@@ -653,7 +641,6 @@ classdef ImageReconCore
             obj.selected_coils_original = sel_orig;
             nSel = numel(sel_orig);
 
-<<<<<<< HEAD
             % Estimate and apply one whitening transform across the complete
             % acquired receiver array.  Selection is deliberately applied
             % afterwards: for example, selecting displayed receiver 7 retains
@@ -666,82 +653,6 @@ classdef ImageReconCore
             [kspace_selected, obj.whitening_info] = prewhiten_and_select( ...
                 obj.complexkspace, sel_orig, whiteningEnabled);
             opts = 1:nSel;
-
-            % Magnitude k-space is kept at the acquired matrix size for QC.
-            obj.magkspace = rssq(kspace_selected, 6);
-
-            % ----------- Precompute centred zero filling -----------
-            % Spatial dimension order is read / phase / partition.
-            nRead  = size(kspace_selected, 1);
-            nPhase = size(kspace_selected, 2);
-            nPart  = size(kspace_selected, 3);
-
-            targetRead = round(double(obj.fft_size));
-            if ~isfinite(targetRead) || targetRead < 1
-                error('buildimages:invalidFftSize', ...
-                    'obj.fft_size must be a positive finite integer.');
-            end
-
-            % Apply the same zero-fill factor to read and phase. Deriving this
-            % from the actual array sizes avoids stale header values and works
-            % for rectangular matrices/non-square FOV acquisitions.
-            targetPhase = round(double(nPhase) * targetRead / double(nRead));
-            targetPart = nPart;
-            if obj.TwoDimensional ~= 1 && ~isempty(obj.fft_size_3d)
-                targetPart = round(double(obj.fft_size_3d));
-            end
-
-            if targetRead < nRead
-                error('buildimages:fftSizeTooSmall', ...
-                    'obj.fft_size=%d is smaller than acquired readout size %d.', ...
-                    targetRead, nRead);
-            end
-            if targetPhase < nPhase
-                error('buildimages:phaseFftSizeTooSmall', ...
-                    'Target phase FFT size %d is smaller than acquired phase size %d.', ...
-                    targetPhase, nPhase);
-            end
-            if ~isfinite(targetPart) || targetPart < nPart
-                error('buildimages:partitionFftSizeTooSmall', ...
-                    'obj.fft_size_3d=%g is smaller than acquired partition size %d.', ...
-                    double(targetPart), nPart);
-            end
-
-            padReadTotal  = targetRead  - nRead;
-            padPhaseTotal = targetPhase - nPhase;
-            padPartTotal  = targetPart  - nPart;
-
-            % padarray entries follow the real array order: read, phase, part.
-            % The previous phase/read reversal only went unnoticed for square data.
-            padPre = [floor(padReadTotal/2), ...
-                floor(padPhaseTotal/2), floor(padPartTotal/2)];
-            padPost = [ceil(padReadTotal/2), ...
-                ceil(padPhaseTotal/2), ceil(padPartTotal/2)];
-
-            kspace_selected = windowkspace(kspace_selected, ...
-                obj.window_size, obj.window_function);
-            kpad = padarray(kspace_selected, padPre, 0, 'pre');
-            kpad = padarray(kpad, padPost, 0, 'post');
-=======
-            % Select physical receivers before whitening. Prewhitening mixes
-            % channels, so selecting after whitening would make a requested
-            % "receiver 2" a virtual mixture of every physical receiver.
-            kspace_selected = obj.complexkspace(:,:,:,:,:,sel_orig);
-            opts = 1:size(kspace_selected, 6);
-            nSel = numel(opts);
->>>>>>> ab3c741283ada40bce191eb9b97fc9b684810912
-
-            whiteningEnabled = ~isempty(obj.noise_whitening) && ...
-                isscalar(obj.noise_whitening) && logical(obj.noise_whitening) && ...
-                nSel > 1;
-            if whiteningEnabled
-                [kspace_selected, obj.whitening_info] = noise_whiten(kspace_selected);
-            elseif nSel <= 1
-                obj.whitening_info = struct('method', 'singleSelectedChannel', ...
-                    'nSamples', 0);
-            else
-                obj.whitening_info = struct('method', 'disabled', 'nSamples', 0);
-            end
 
             % Magnitude k-space is kept at the acquired matrix size for QC.
             obj.magkspace = rssq(kspace_selected, 6);

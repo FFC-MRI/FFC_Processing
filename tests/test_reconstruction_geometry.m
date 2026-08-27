@@ -66,7 +66,6 @@ function testWhiteningDecorrelatesSelectedChannels(testCase)
         'AbsTol', 0.08);
     verifyLessThan(testCase, abs(covariance(1, 2)), 0.08);
 end
-<<<<<<< HEAD
 
 
 function testAllReceiversWhitenedBeforeSingleReceiverSelection(testCase)
@@ -95,5 +94,3 @@ function testAllReceiversWhitenedBeforeSingleReceiverSelection(testCase)
     verifyEqual(testCase, info.selectedReceiverIds, 7);
     verifyLessThan(testCase, max(abs(selected(:) - expected(:))), 1e-6);
 end
-=======
->>>>>>> ab3c741283ada40bce191eb9b97fc9b684810912
