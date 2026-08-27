@@ -22,6 +22,10 @@ Parallel Computing Toolbox
 - The read, phase and partition dimensions are reconstructed independently;
   rectangular matrices and non-square FOVs are retained rather than forced to
   a square grid.
+- Prescribed FOV offsets are applied once to a fresh working copy of the
+  immutable preprocessed k-space on every rebuild. GUI rotations and flips are
+  exact image-plane operations applied after reconstruction; they never warp
+  or overwrite acquisition k-space.
 
 Run the reconstruction regression tests in MATLAB with:
 

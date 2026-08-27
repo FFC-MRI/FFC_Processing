@@ -75,6 +75,8 @@ classdef ImageReconCore
         TwoDimensional
         recon2d
         geomT
+        fov_offsets_applied %true only for the current working k-space copy
+        fov_offset_info %offset/FOV diagnostics for the most recent reconstruction
         selected_coils_original
         noise_whitening %apply receive-noise prewhitening during reconstruction
         whitening_info %diagnostics returned by noise_whiten
@@ -446,6 +448,10 @@ classdef ImageReconCore
                 obj.noise_whitening = logical(obj.noise_whitening) && hasMultipleReceivers;
             end
             obj.whitening_info = struct('method', 'notRun', 'nSamples', 0);
+            obj.fov_offsets_applied = false;
+            obj.fov_offset_info = struct('applied', false, ...
+                'offsets_m', [0 0 0], 'fov_m', [NaN NaN NaN], ...
+                'is3D', false);
             %%
         end %function
 
@@ -587,6 +593,11 @@ classdef ImageReconCore
                 obj.originalcomplexkspace = obj.complexkspace;
             end
 
+            % originalcomplexkspace is always the immutable, unshifted source.
+            % FOV offsets are applied only to a fresh working copy in
+            % buildimages().
+            obj.fov_offsets_applied = false;
+
         end
 
 
@@ -596,7 +607,11 @@ classdef ImageReconCore
             %
             
             obj.compleximage = [];
+            % Always restart from immutable preprocessed acquisition data.
+            % This makes FOV-offset correction independent of the number of
+            % rebuilds and of any accumulated display rotation/flip.
             obj.complexkspace = obj.originalcomplexkspace;
+            obj.fov_offsets_applied = false;
             obj = correct_orientation(obj);
 
             % ----------- Receiver selection and optional prewhitening -----------
@@ -814,6 +829,13 @@ classdef ImageReconCore
             else
                 obj.complexcombined = sum(1.*obj.compleximage,6);
                 obj.phaseimage = angle(obj.complexcombined);
+            end
+
+            % Apply the accumulated lossless display orientation only after
+            % offset correction, FFT and receiver combination. Raw k-space is
+            % never rotated or interpolated.
+            if ~isempty(obj.geomT)
+                obj = apply_reconstruction_geometry(obj, obj.geomT, false);
             end
         end
 

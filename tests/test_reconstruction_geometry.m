@@ -10,6 +10,7 @@ function setupOnce(testCase)
     testCase.TestData.originalPath = path;
     addpath(fullfile(projectRoot, 'misc_functions'));
     addpath(fullfile(projectRoot, 'kspace_handling'));
+    addpath(fullfile(projectRoot, 'image_handling'));
 end
 
 
@@ -93,4 +94,87 @@ function testAllReceiversWhitenedBeforeSingleReceiverSelection(testCase)
     verifyEqual(testCase, info.nOutputChannels, 1);
     verifyEqual(testCase, info.selectedReceiverIds, 7);
     verifyLessThan(testCase, max(abs(selected(:) - expected(:))), 1e-6);
+end
+
+
+function testFovOffsetsAreIdempotentAndRebuildFromRaw(testCase)
+    raw = complex(ones([8, 6, 1, 1, 1, 1], 'single'));
+    parameters = struct( ...
+        'OFF_CENTER_FIELD_OF_VIEW_1D', 0.010, ...
+        'OFF_CENTER_FIELD_OF_VIEW_2D', -0.020, ...
+        'OFF_CENTER_FIELD_OF_VIEW_3D', 0.030, ...
+        'FIELD_OF_VIEW', 0.080, ...
+        'FIELD_OF_VIEW_PHASE', 0.060, ...
+        'FIELD_OF_VIEW_3D', 0.040);
+    obj = struct( ...
+        'complexkspace', raw, ...
+        'param', parameters, ...
+        'fov', 80, ...
+        'fov_phase', 60, ...
+        'fov_3d', 40, ...
+        'TwoDimensional', 1, ...
+        'fov_offsets_applied', false, ...
+        'fov_offset_info', struct());
+
+    once = correct_orientation(obj);
+    twice = correct_orientation(once);
+
+    verifyEqual(testCase, twice.complexkspace, once.complexkspace);
+    verifyTrue(testCase, once.fov_offsets_applied);
+    verifyEqual(testCase, once.fov_offset_info.offsets_m, ...
+        [0.010, -0.020, 0], 'AbsTol', 1e-12);
+
+    rebuilt = once;
+    rebuilt.complexkspace = raw;
+    rebuilt.fov_offsets_applied = false;
+    rebuilt = correct_orientation(rebuilt);
+    verifyEqual(testCase, rebuilt.complexkspace, once.complexkspace);
+
+    % A non-zero phase ramp must actually move the point-spread peak away
+    % from the unshifted centre, rather than merely changing a global phase.
+    shiftedImage = abs(ifft2c(once.complexkspace));
+    [~, peakLinearIndex] = max(shiftedImage(:));
+    [peakRead, peakPhase] = ind2sub(size(shiftedImage), peakLinearIndex);
+    verifyNotEqual(testCase, [peakRead, peakPhase], [5, 4]);
+end
+
+
+function testGeometryNeverMutatesAcquisitionKspace(testCase)
+    raw = reshape(complex(single(1:30)), [3, 5, 1, 1, 1, 2]);
+    image = reshape(single(1:30), [3, 5, 2]);
+    state = struct( ...
+        'originalcomplexkspace', raw, ...
+        'complexkspace', raw, ...
+        'compleximage', image, ...
+        'complexcombined', image, ...
+        'magimage', image, ...
+        'phaseimage', image, ...
+        'T1Maps', image, ...
+        'R1Maps', image);
+    Rclockwise = [0 1 0; -1 0 0; 0 0 1];
+
+    oriented = apply_reconstruction_geometry(state, Rclockwise, true);
+
+    verifyEqual(testCase, oriented.originalcomplexkspace, raw);
+    verifyEqual(testCase, oriented.complexkspace, raw);
+    verifyEqual(testCase, size(oriented.magimage), [5, 3, 2]);
+    verifyEqual(testCase, oriented.magimage, ...
+        flip(permute(image, [2 1 3]), 2));
+end
+
+
+function testAccumulatedGeometryMatchesIncrementalButtonsAfterRebuild(testCase)
+    image = reshape(single(1:60), [4, 5, 3]);
+    Rclockwise = [0 1 0; -1 0 0; 0 0 1];
+    horizontalFlip = [-1 0 0; 0 1 0; 0 0 1];
+    verticalFlip = [1 0 0; 0 -1 0; 0 0 1];
+
+    incremental = apply_inplane_geometry(image, horizontalFlip);
+    incremental = apply_inplane_geometry(incremental, Rclockwise);
+    incremental = apply_inplane_geometry(incremental, verticalFlip);
+
+    accumulated = verticalFlip * Rclockwise * horizontalFlip;
+    rebuilt = apply_inplane_geometry(image, accumulated);
+
+    verifyEqual(testCase, rebuilt, incremental);
 end

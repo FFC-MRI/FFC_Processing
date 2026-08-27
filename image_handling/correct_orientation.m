@@ -1,11 +1,17 @@
 function obj = correct_orientation(obj)
-%CORRECT_ORIENTATION Apply the prescribed FOV-offset phase ramps.
+%CORRECT_ORIENTATION Apply prescribed FOV-offset phase ramps exactly once.
 %
 % The first three k-space dimensions are read, phase and partition. For a
 % multislice 2D acquisition, dimension 3 indexes independent slices rather
-% than kz and must not receive a through-plane Fourier phase ramp.
+% than kz and must not receive a through-plane Fourier phase ramp. The caller
+% must reset fov_offsets_applied when it installs a fresh, unshifted working
+% copy from originalcomplexkspace.
 
     if isempty(obj.complexkspace)
+        return;
+    end
+
+    if member_is_true(obj, 'fov_offsets_applied')
         return;
     end
 
@@ -59,6 +65,13 @@ function obj = correct_orientation(obj)
     phaseRamp = reshape(phaseRamp, [nRead, nPhase, nPart, 1, 1, 1]);
     obj.complexkspace = obj.complexkspace .* cast(phaseRamp, ...
         'like', obj.complexkspace);
+
+    obj.fov_offsets_applied = true;
+    obj.fov_offset_info = struct( ...
+        'applied', true, ...
+        'offsets_m', [off1, off2, off3], ...
+        'fov_m', [fov1, fov2, fov3], ...
+        'is3D', is3D);
 end
 
 
@@ -149,4 +162,21 @@ function value = first_numeric_scalar(candidate)
     catch
         value = [];
     end
+end
+
+
+function tf = member_is_true(value, name)
+    if isobject(value)
+        exists = isprop(value, name);
+    else
+        exists = isstruct(value) && isfield(value, name);
+    end
+
+    tf = false;
+    if ~exists
+        return;
+    end
+
+    candidate = value.(name);
+    tf = ~isempty(candidate) && isscalar(candidate) && logical(candidate);
 end
