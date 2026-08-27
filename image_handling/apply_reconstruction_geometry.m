@@ -1,29 +1,10 @@
 function obj = apply_reconstruction_geometry(obj, geomT, includeMaps)
-%APPLY_RECONSTRUCTION_GEOMETRY Orient reconstructed arrays without k-space warp.
-%
-% includeMaps is true for an incremental GUI rotation/flip so existing maps
-% follow the displayed image. It is false during rebuild because any existing
-% maps are already stored in the current display orientation.
+%APPLY_RECONSTRUCTION_GEOMETRY Backwards-compatible wrapper.
+% New code should call apply_post_reconstruction_geometry to make the strict
+% reconstruction-then-display-transform ordering explicit.
 
     if nargin < 3
         includeMaps = false;
     end
-
-    members = {'compleximage', 'complexcombined', 'magimage', 'phaseimage'};
-    if includeMaps
-        members = [members, {'T1Maps', 'R1Maps'}];
-    end
-
-    for memberIndex = 1:numel(members)
-        name = members{memberIndex};
-        if isobject(obj)
-            exists = isprop(obj, name);
-        else
-            exists = isstruct(obj) && isfield(obj, name);
-        end
-        if ~exists || isempty(obj.(name))
-            continue;
-        end
-        obj.(name) = apply_inplane_geometry(obj.(name), geomT);
-    end
+    obj = apply_post_reconstruction_geometry(obj, geomT, includeMaps);
 end

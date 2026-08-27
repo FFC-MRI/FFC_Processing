@@ -26,6 +26,9 @@ Parallel Computing Toolbox
   immutable preprocessed k-space on every rebuild. GUI rotations and flips are
   exact image-plane operations applied after reconstruction; they never warp
   or overwrite acquisition k-space.
+- Image axes use explicit physical FOV edges and pixel-centre coordinates, so
+  rotating a rectangular matrix swaps its read/phase extents without changing
+  its physical aspect ratio.
 
 Run the reconstruction regression tests in MATLAB with:
 

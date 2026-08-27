@@ -612,7 +612,7 @@ classdef ImageReconCore
             % rebuilds and of any accumulated display rotation/flip.
             obj.complexkspace = obj.originalcomplexkspace;
             obj.fov_offsets_applied = false;
-            obj = correct_orientation(obj);
+            obj = apply_fov_offset_phase_ramp(obj);
 
             % ----------- Receiver selection and optional prewhitening -----------
             % obj.multichannel_recon may be:
@@ -831,12 +831,6 @@ classdef ImageReconCore
                 obj.phaseimage = angle(obj.complexcombined);
             end
 
-            % Apply the accumulated lossless display orientation only after
-            % offset correction, FFT and receiver combination. Raw k-space is
-            % never rotated or interpolated.
-            if ~isempty(obj.geomT)
-                obj = apply_reconstruction_geometry(obj, obj.geomT, false);
-            end
         end
 
 
