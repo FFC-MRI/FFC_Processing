@@ -28,6 +28,10 @@ if nargin < 3 || isempty(windowtype)
 end
 
 window_size = max(window_size, 0);
+if strcmpi(windowtype, 'None') && window_size == 1
+    windowed_kspace = kspace;
+    return;
+end
 
 % Calculate requested window dimensions.
 % Do NOT force even sizes. Odd-sized matrices need odd-sized windows.

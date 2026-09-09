@@ -25,17 +25,15 @@ function [kspace_selected, info] = prewhiten_and_select(kspace, selectedIndices,
     doWhiten = isscalar(whiteningEnabled) && logical(whiteningEnabled) && ...
         nAcquired > 1;
     if doWhiten
-        [kspace_prepared, info] = noise_whiten(kspace);
+        info = ffc_noise_calibration(kspace);
     elseif nAcquired <= 1
-        kspace_prepared = kspace;
         info = struct('method', 'singleAcquiredChannel', 'nSamples', 0);
     else
-        kspace_prepared = kspace;
         info = struct('method', 'disabled', 'nSamples', 0);
     end
 
     % Selection occurs only after the full-array whitening transform.
-    kspace_selected = kspace_prepared(:,:,:,:,:,selectedIndices);
+    kspace_selected = ffc_apply_whitening(kspace, info, selectedIndices, nAcquired);
     info.nInputChannels = nAcquired;
     info.nOutputChannels = numel(selectedIndices);
     info.selectedIndices = selectedIndices;

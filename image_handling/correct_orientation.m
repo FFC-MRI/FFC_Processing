@@ -56,15 +56,14 @@ function obj = correct_orientation(obj)
         off3 = 0;
     end
 
-    [KRead, KPhase, KPart] = ndgrid(kRead, kPhase, kPart);
-    phaseArgument = KRead .* off1 + KPhase .* off2 + KPart .* off3;
-    phaseRamp = exp(-1i * 2*pi * phaseArgument);
-
-    % Add singleton trailing dimensions so implicit expansion never touches
-    % time, field or receiver axes.
-    phaseRamp = reshape(phaseRamp, [nRead, nPhase, nPart, 1, 1, 1]);
-    obj.complexkspace = obj.complexkspace .* cast(phaseRamp, ...
-        'like', obj.complexkspace);
+    if off1 ~= 0 || off2 ~= 0 || off3 ~= 0
+        phaseArgument = kRead(:) .* off1 + kPhase .* off2;
+        if is3D && off3 ~= 0
+            phaseArgument = phaseArgument + reshape(kPart .* off3, 1,1,[]);
+        end
+        phaseRamp = exp(-1i * 2*pi * phaseArgument);
+        obj.complexkspace = obj.complexkspace .* cast(phaseRamp, 'like', obj.complexkspace);
+    end
 
     obj.fov_offsets_applied = true;
     obj.fov_offset_info = struct( ...

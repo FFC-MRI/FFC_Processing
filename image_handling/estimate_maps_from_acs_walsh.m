@@ -35,21 +35,15 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
     % Precompute denom smoother for masked smoothing
     filtSz = max(3, 2*ceil(3*covSigma)+1);
 
+    Kavg = zeros(X,Y,S,1,1,C,'like',kspace);
+    Kavg(xr,yr,:,1,1,:) = mean(mean(kspace(xr,yr,:,:,:,:),5,'omitnan'),4,'omitnan');
+    if get_setting(obj, 'TwoDimensional', 1) == 1
+        lowResolution = ifft2c(Kavg);
+    else
+        lowResolution = ifft3c(Kavg);
+    end
     for s = 1:S
-        % ---- Build ACS-only k-space, averaged across (T,F) for stability ----
-        % Kslice: [X Y T F C]
-        Kslice = kspace(:,:,s,:,:,:);
-
-        % Average across T and F *per k-space point* in the ACS region
-        Kavg = zeros(X,Y,1,1,C,'like',kspace);          % keep 5D for ifft2c convenience
-        for c = 1:C
-            block = Kslice(xr,yr,:,:,c);               % [acs acs T F]
-            Kavg(xr,yr,1,1,c) = mean(mean(block,4,'omitnan'),3,'omitnan');
-        end
-
-        % ---- Low-res coil images from ACS ----
-        L = ifft2c(Kavg);                               % [X Y 1 1 C]
-        L = reshape(L, [X Y C]);                        % [X Y C]
+        L = reshape(lowResolution(:,:,s,1,1,:), X,Y,C);
 
         % ---- Object mask from low-res RSS ----
         rss = sqrt(sum(abs(L).^2, 3));
@@ -64,12 +58,13 @@ function maps = estimate_maps_from_acs_walsh(kspace, opts, obj)
         R = zeros(X,Y,C,C,'like',L);
         for i = 1:C
             Li = L(:,:,i);
-            for j = 1:C
+            for j = i:C
                 Rij = Li .* conj(L(:,:,j));
                 num = complex( ...
                     imgaussfilt(real(Rij).*mask_f, covSigma, 'FilterSize', filtSz), ...
                     imgaussfilt(imag(Rij).*mask_f, covSigma, 'FilterSize', filtSz) );
                 R(:,:,i,j) = num ./ denom;
+                if j ~= i, R(:,:,j,i) = conj(R(:,:,i,j)); end
             end
         end
 

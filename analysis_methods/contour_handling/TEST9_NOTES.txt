@@ -1,0 +1,21 @@
+CVI contours TEST 9
+===================
+Adds an explicit handedness/reflection correction to TEST 7.
+
+Why:
+A mirror reflection cannot be corrected with the six rigid registration
+parameters. The TEST 7 screenshot shows the LV scale/tilt are plausible but
+the RV lies on the opposite side of the LV, consistent with a left/right
+reflection.
+
+Changes:
+- Registration dialog has Mirror left/right and Mirror up/down checkboxes.
+- Reflection axes are frozen to the FCI image orientation when
+  "Use current FCI scan as target" is pressed.
+- Reflection occurs about the clinical contour-stack centre before the
+  proper rigid-body rotations, so it does not translate the LV across the FOV.
+- Reset registration clears both mirror flags.
+
+For the supplied SAX test, try Mirror left/right first with all rotations at 0.
+
+Translation sliders: live +/-250 mm R/L, A/P and H/F controls synchronized to numeric fields.

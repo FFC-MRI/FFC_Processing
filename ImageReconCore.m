@@ -41,7 +41,7 @@ classdef ImageReconCore
         fov_3d %through-plane/slab FOV in mm for 3D acquisitions
         TE %Echo time
         FlipAngle %indegrees
-        averages %signal averages
+        averages %stored average dimension (not the scanner accumulation count)
         orientation %scan orientation
         phase_direction %0 vertical or 1 horizontal
         resolution_inplane %in plane resolution in mm
@@ -83,6 +83,19 @@ classdef ImageReconCore
         biascorrect
         combination
         probe %the RF coil used
+        is_svs %true for a localised single-voxel acquisition
+        voxel_size_mm %SVS dimensions in read/phase/slice coordinates
+        svs_signal_method %records how the relaxometry signal was reduced
+        view_orientation %anatomical display plane for 3D data
+        source_generation = uint64(0)
+        reconstruction_generation = uint64(0)
+        magnitude_generation = uint64(0)
+        reconstruction_key = []
+        whitening_cache = [] % small covariance/factor only
+        whitening_cache_key = []
+        filter_source_magimage = [] % copy-on-write baseline, never cumulative
+        processing_history = {}
+        retain_coil_images = true % RSSQ compatibility; false saves final coil cube
     end
 
 
@@ -94,13 +107,15 @@ classdef ImageReconCore
                 case '.mat'
                     filename = fopen(fid);
                     obj.filelocation = filename;
-                    file = load(filename);
-                    if size(varargin)>0
-                        index =varargin{1};
+                    if numel(varargin) >= 2
+                        index = varargin{1};
+                        file = varargin{2};
                     else
-                        index = length(file.saveList);
+                        file = load(filename, 'saveList');
+                        if ~isempty(varargin), index = varargin{1};
+                        else, index = numel(file.saveList); end
+                        file = file.saveList{index};
                     end
-                    file = file.saveList{index};
                     obj.fileindex = index;
                     obj.samples = cell2mat(file.pprParamList(strcmp('NO_SAMPLES', file.pprParamList(:,1)),3));
                     obj.views = cell2mat(file.pprParamList(strcmp('NO_VIEWS', file.pprParamList(:,1)),3));
@@ -322,45 +337,94 @@ classdef ImageReconCore
 
                 case '.dat'
                     obj.rawdata = fid.data;
-                    obj.orientation = fid.par.cameleon.IMAGE_ORIENTATION_SUBJECT;
-                    obj.samples = fid.par.md1d;
-                    obj.views = fid.par.md2d;
-                    obj.slices = fid.par.md3d;
-                    obj.experiments =fid.par.md4d;
-                    obj.n_receivers = fid.par.ncoils;
+                    cameleon = fid.par.cameleon;
+                    obj.param = cameleon;
+                    obj.samples = positiveInteger(obj, getParScalar(obj, fid.par, 'md1d', size(fid.data, 1)), size(fid.data, 1));
+                    obj.views = positiveInteger(obj, getParScalar(obj, fid.par, 'md2d', 1), 1);
+                    obj.slices = positiveInteger(obj, getParScalar(obj, fid.par, 'md3d', 1), 1);
+                    obj.experiments = positiveInteger(obj, getParScalar(obj, fid.par, 'md4d', 1), 1);
+                    obj.n_receivers = positiveInteger(obj, getParScalar(obj, fid.par, 'ncoils', 1), 1);
                     obj.echoes = 1;
-                    obj.TE = fid.par.te*1000;
-                    obj.FlipAngle = fid.par.fa;
-                    obj.fov = fid.par.cameleon.FIELD_OF_VIEW*1000;
-                    if isfield(fid.par.cameleon, 'FIELD_OF_VIEW_PHASE') && ...
-                            isfinite(fid.par.cameleon.FIELD_OF_VIEW_PHASE) && ...
-                            fid.par.cameleon.FIELD_OF_VIEW_PHASE > 0
-                        obj.fov_phase = fid.par.cameleon.FIELD_OF_VIEW_PHASE*1000;
+                    obj.TE = getParScalar(obj, fid.par, 'te', 0)*1000;
+                    obj.FlipAngle = getParScalar(obj, fid.par, 'fa', 0);
+                    obj.orientation = getCameleonVector(obj, cameleon, ...
+                        'IMAGE_ORIENTATION_SUBJECT', [1 0 0 0 1 0]);
+                    fovReadM = getCameleonScalar(obj, cameleon, 'FIELD_OF_VIEW', NaN);
+                    if ~isfinite(fovReadM) || fovReadM <= 0
+                        fovReadM = getCameleonScalar(obj, cameleon, 'VOXEL_SIZE_1D', 0.001);
+                    end
+                    obj.fov = fovReadM*1000;
+                    fovPhaseM = getCameleonScalar(obj, cameleon, 'FIELD_OF_VIEW_PHASE', fovReadM);
+                    if ~isfinite(fovPhaseM) || fovPhaseM <= 0
+                        fovPhaseM = fovReadM;
+                    end
+                    obj.fov_phase = fovPhaseM*1000;
+                    fov3dM = getCameleonScalar(obj, cameleon, 'FIELD_OF_VIEW_3D', NaN);
+                    if isfinite(fov3dM) && fov3dM > 0
+                        obj.fov_3d = fov3dM*1000;
+                    end
+                    sequenceIdentifiers = lower(string({getParText(obj, fid.par, 'serieName', ''), ...
+                        getParText(obj, fid.par, 'seqName', '')}));
+                    obj.is_svs = any(contains(sequenceIdentifiers, 'svs'));
+                    if obj.is_svs
+                        % In SVS the first dimension contains sampled signal,
+                        % not frequency-encoding k-space.  Treat the dataset
+                        % as non-imaging even though it carries spatial voxel
+                        % prescription parameters.
+                        obj.TwoDimensional = 1;
+                    elseif isfield(fid.par.cameleon, 'MULTI_PLANAR_EXCITATION')
+                        obj.TwoDimensional = ...
+                            fid.par.cameleon.MULTI_PLANAR_EXCITATION;
                     else
-                        obj.fov_phase = obj.fov;
+                        obj.TwoDimensional = 1;
                     end
-                    if isfield(fid.par.cameleon, 'FIELD_OF_VIEW_3D') && ...
-                            isfinite(fid.par.cameleon.FIELD_OF_VIEW_3D) && ...
-                            fid.par.cameleon.FIELD_OF_VIEW_3D > 0
-                        obj.fov_3d = fid.par.cameleon.FIELD_OF_VIEW_3D*1000;
+                    sliceThicknessM = getCameleonScalar(obj, cameleon, ...
+                        'SLICE_THICKNESS', NaN);
+                    if ~isfinite(sliceThicknessM) || sliceThicknessM <= 0
+                        sliceThicknessM = getCameleonScalar(obj, cameleon, ...
+                            'VOXEL_SIZE_3D', fov3dM);
                     end
-                    obj.TwoDimensional = fid.par.cameleon.MULTI_PLANAR_EXCITATION;
-                    obj.thk = fid.par.cameleon.SLICE_THICKNESS*1000;
+                    if ~isfinite(sliceThicknessM) || sliceThicknessM <= 0
+                        sliceThicknessM = fovReadM;
+                    end
+                    obj.thk = sliceThicknessM*1000;
+                    if obj.is_svs
+                        obj.voxel_size_mm = [ ...
+                            getCameleonScalar(obj, fid.par.cameleon, 'VOXEL_SIZE_1D', ...
+                                fovReadM), ...
+                            getCameleonScalar(obj, fid.par.cameleon, 'VOXEL_SIZE_2D', ...
+                                getCameleonScalar(obj, fid.par.cameleon, ...
+                                    'FIELD_OF_VIEW_PHASE', ...
+                                    fovPhaseM)), ...
+                            getCameleonScalar(obj, fid.par.cameleon, 'VOXEL_SIZE_3D', ...
+                                sliceThicknessM)] .* 1000;
+                        obj.thk = obj.voxel_size_mm(3);
+                        obj.svs_signal_method = ...
+                            'abs(mean(complex samples,1)) per experiment';
+                    end
                     if isempty(obj.fov_3d)
                         obj.fov_3d = obj.thk*max(double(obj.slices), 1);
                     end
-                    obj.resolution_inplane = fid.par.cameleon.RESOLUTION_FREQUENCY;
+                    obj.resolution_inplane = getCameleonScalar(obj, cameleon, ...
+                        'RESOLUTION_FREQUENCY', obj.fov/max(double(obj.samples), 1));
                     obj.resolution_throughplane = obj.thk;
-                    obj.sequence = fid.par.serieName;
+                    obj.sequence = getParText(obj, fid.par, 'serieName', ...
+                        getParText(obj, fid.par, 'seqName', 'Unknown'));
                     obj.partialkspace =0;
-                    if fid.par.cameleon.USER_ZERO_FILLING_2D ~=0
+                    if getCameleonScalar(obj, cameleon, 'USER_ZERO_FILLING_2D', 0) ~= 0
                         obj.partialkspace =1;
                     end
                     obj.geomT = eye(3);
 
-                    obj.recon2d = fid.par.cameleon.USER_MATRIX_DIMENSION_2D;
+                    obj.recon2d = positiveInteger(obj, getCameleonScalar(obj, cameleon, ...
+                        'USER_MATRIX_DIMENSION_2D', obj.views), obj.views);
 
-                    obj.averages =1;
+                    % The Cameleon reader returns [read phase slice experiment
+                    % receiver], with no separate average dimension. Scanner
+                    % accumulations must not multiply that stored shape or be
+                    % averaged again here. The acquisition count is retained
+                    % unchanged in obj.param.NUMBER_OF_AVERAGES.
+                    obj.averages = 1;
                     obj.twopointT1 = 0;
                     obj.window_function = 'none';
                     obj.window_size = 1;
@@ -368,9 +432,12 @@ classdef ImageReconCore
                     obj.fft_size_3d = obj.slices;
                     obj.denoise_filter = 'none';
                     obj.denoise_params = []; %filter kernel
-                    obj.param = fid.par.cameleon;
-
-                    if fid.par.cameleon.MULTI_PLANAR_EXCITATION ==1
+                    if obj.is_svs
+                        obj.TwoDimensional = 1;
+                        obj.fft_size_3d = 1;
+                    elseif isfield(fid.par.cameleon, ...
+                            'MULTI_PLANAR_EXCITATION') && ...
+                            fid.par.cameleon.MULTI_PLANAR_EXCITATION ==1
                         obj.TwoDimensional = 1;
                     else
                         obj.TwoDimensional = 0; %ie 3d
@@ -386,7 +453,9 @@ classdef ImageReconCore
 
 
 
-                    switch obj.param.TRANSFORM_PLUGIN
+                    transformPlugin = getCameleonText(obj, cameleon, ...
+                        'TRANSFORM_PLUGIN', 'Sequential4D');
+                    switch transformPlugin
 
                         case 'Sequential4DCine'
                             obj.n_timepoints =  obj.param.CARDIAC_NB_OF_PHASE;
@@ -408,28 +477,49 @@ classdef ImageReconCore
                         end
                     end
 
-                    if isfield(obj.param,'FCI_LIST_OF_BEVO')
-                        obj.n_fieldpoints=size(obj.param.FCI_LIST_OF_BEVO,2);
-                        obj.n_timepoints = obj.param.FCI_NUMBER_OF_TEVO;
+                    if isfield(obj.param,'FCI_LIST_OF_BEVO') && ...
+                            ~isempty(obj.param.FCI_LIST_OF_BEVO)
+                        obj.fieldpoints = double(obj.param.FCI_LIST_OF_BEVO(:).');
+                        obj.n_fieldpoints = numel(obj.fieldpoints);
+                        obj.n_timepoints = round(getCameleonScalar(obj, obj.param, ...
+                            'FCI_NUMBER_OF_TEVO', max(1, floor(obj.experiments ./ obj.n_fieldpoints))));
+                        obj.n_timepoints = max(1, min(obj.n_timepoints, ...
+                            floor(obj.experiments ./ obj.n_fieldpoints)));
                         obj.timepoints = [];
-                        obj.fieldpoints = []; 
-                        if obj.param.FCI_T1_LOG_DIST ==1
-                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
-                                obj.timepoints(n,:) = logspace(log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER),log10(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER),obj.param.FCI_NUMBER_OF_TEVO);
+                        logDistribution = getCameleonLogical(obj, obj.param, ...
+                            'FCI_T1_LOG_DIST', true);
+                        estimates = getCameleonVector(obj, obj.param, ...
+                            'FCI_LIST_OF_T1_ESTIMATES', 0.25 .* ones(1, obj.n_fieldpoints));
+                        estimates = padOrTrim(obj, estimates, obj.n_fieldpoints, 0.25);
+                        lowerFactor = getCameleonScalar(obj, obj.param, ...
+                            'FCI_T1_FACTOR_LOWER', 0.05);
+                        upperFactor = getCameleonScalar(obj, obj.param, ...
+                            'FCI_T1_FACTOR_UPPER', 8);
+                        if ~isfinite(lowerFactor) || lowerFactor <= 0
+                            lowerFactor = 0.05;
+                        end
+                        if ~isfinite(upperFactor) || upperFactor <= lowerFactor
+                            upperFactor = max(upperFactor, lowerFactor*2);
+                        end
+                        for n=1:obj.n_fieldpoints
+                            t1Estimate = estimates(n);
+                            if logDistribution
+                                obj.timepoints(n,:) = logspace(log10(t1Estimate.*lowerFactor), ...
+                                    log10(t1Estimate.*upperFactor), obj.n_timepoints);
                             end
-                        else
-                            for n=1:size(obj.param.FCI_LIST_OF_BEVO,2)
-                                obj.timepoints(n,:) = linspace(obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_LOWER,obj.param.FCI_LIST_OF_T1_ESTIMATES(n).*obj.param.FCI_T1_FACTOR_UPPER,obj.param.FCI_NUMBER_OF_TEVO);
+                            if ~logDistribution
+                                obj.timepoints(n,:) = linspace(t1Estimate.*lowerFactor, ...
+                                    t1Estimate.*upperFactor, obj.n_timepoints);
                             end
                         end
                         obj.timepoints = obj.timepoints.*1000;
-                        obj.fieldpoints=obj.param.FCI_LIST_OF_BEVO;
-                      
                     end
-                obj.probe = obj.param.PROBES;
-      
-     
-                  
+
+                    if isfield(obj.param, 'PROBES')
+                        obj.probe = obj.param.PROBES;
+                    else
+                        obj.probe = '';
+                    end
             end
 
             % Backwards-compatible defaults shared by every input format.
@@ -438,6 +528,12 @@ classdef ImageReconCore
             end
             if isempty(obj.fov_3d)
                 obj.fov_3d = obj.thk*max(double(obj.slices), 1);
+            end
+            if isempty(obj.is_svs)
+                obj.is_svs = contains(lower(string(obj.sequence)), 'svs');
+            end
+            if isempty(obj.view_orientation)
+                obj.view_orientation = inferAnatomicalPlane(obj, obj.orientation);
             end
             hasMultipleReceivers = ~isempty(obj.n_receivers) && ...
                 isscalar(obj.n_receivers) && isfinite(double(obj.n_receivers)) && ...
@@ -456,6 +552,10 @@ classdef ImageReconCore
         end %function
 
         function obj = rename_sequence(obj)
+            if ~isempty(obj.is_svs) && logical(obj.is_svs)
+                obj.displayname = 'Field-Cycling SVS';
+                return;
+            end
             switch lower(strcat(char(regexp(obj.sequence,'[a-zA-Z]','match'))'))
                 case 'hsenavv'
                     obj.displayname = 'Field-Cycling Spin-Echo';
@@ -470,14 +570,55 @@ classdef ImageReconCore
 
         function obj = preprocessing(obj) %here we do things like reorder kspace or do phase corrections. This should ideally only be done once per data set
             if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
-                try
-                    temp1 = load(obj.filelocation);
-                    matfile = temp1.saveList{obj.fileindex};
-                catch
+                obj.source_generation = obj.source_generation + 1;
+                obj.reconstruction_key = [];
+                obj.whitening_cache = [];
+                obj = ffc_invalidate_analysis(obj);
+                obj.mask = [];
+                obj.filter_source_magimage = [];
+                obj.registration_tform = [];
+                if ~isempty(obj.is_svs) && logical(obj.is_svs)
+                    % SVS data are already ordered as sampled signal x
+                    % acquisition.  Do not send them through k-space
+                    % reordering, partial-Fourier padding or any imaging-only
+                    % header lookup.  Keep the dimensions expected by the
+                    % downstream field/time fitter.
+                    A = single(obj.rawdata);
+                    nExpected = obj.samples .* obj.views .* obj.slices .* ...
+                        obj.n_timepoints .* obj.n_fieldpoints .* obj.n_receivers;
+                    if numel(A) ~= nExpected
+                        error('ImageReconCore:SVSDataSizeMismatch', ...
+                            ['SVS data contain %d complex samples, but the ', ...
+                             'header describes %d.'], numel(A), nExpected);
+                    end
+                    A = reshape(A, [obj.samples, obj.views, obj.slices, ...
+                        obj.n_timepoints, obj.n_fieldpoints, obj.n_receivers]);
+                    obj.complexkspace = A;
+                    obj.originalcomplexkspace = A;
+                    obj.fov_offsets_applied = false;
+                    return;
                 end
                 obj.views = size(obj.rawdata,2);
                 A = single(obj.rawdata);
-                A = reshape(A,[obj.samples,obj.views,obj.echoes,obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.averages,obj.n_receivers]);
+                rawShape = double([obj.samples, obj.views, obj.echoes, ...
+                    obj.slices, obj.n_timepoints, obj.n_fieldpoints, ...
+                    obj.averages, obj.n_receivers]);
+                if numel(rawShape) ~= 8 || any(~isfinite(rawShape)) || ...
+                        any(rawShape < 1) || any(rawShape ~= round(rawShape))
+                    error('ImageReconCore:InvalidImagingDimensions', ...
+                        ['Expected eight positive integer dimensions ', ...
+                         '[read phase echo slice time field storedAverage receiver]; ', ...
+                         'got [%s].'], num2str(rawShape));
+                end
+                if numel(A) ~= prod(rawShape)
+                    error('ImageReconCore:ImagingDataSizeMismatch', ...
+                        ['Imaging data contain %d complex samples (size [%s]), ', ...
+                         'but [read phase echo slice time field storedAverage receiver] ', ...
+                         '= [%s] requires %d. Check the data/header pairing ', ...
+                         'and stored dimensions before reconstruction.'], ...
+                        numel(A), num2str(size(A)), num2str(rawShape), prod(rawShape));
+                end
+                A = reshape(A, rawShape);
                 A = mean(A,7);
                 if 1 ==1
                     A = kspace_reorder(A,obj);  %if necessary account for non-sequential ordering eg centre out
@@ -520,8 +661,12 @@ classdef ImageReconCore
                     % --- Symmetric undersampling about k0 (NOT partial Fourier) ---
                     % Phase-encode dimension is dim 2
 
-                    fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);        % nominal
-                    acqViews  = double(obj.param.ACQUISITION_MATRIX_DIMENSION_2D); % collected
+                    fullViews = double(obj.recon2d);
+                    if isempty(fullViews) || fullViews < 1, fullViews = obj.views; end
+                    if isstruct(obj.param) && isfield(obj.param, 'USER_MATRIX_DIMENSION_2D')
+                        fullViews = double(obj.param.USER_MATRIX_DIMENSION_2D);
+                    end
+                    acqViews = size(A, 2);
 
                     % If you trust obj.views more than the header, you can cross-check:
                     % acqViews = double(obj.views);
@@ -549,13 +694,7 @@ classdef ImageReconCore
                         pre  = floor(miss/2);
                         post = miss - pre;   % handles odd miss cleanly
 
-                        A = single(A); % ensure consistent type
-                        if pre > 0
-                            A = padarray(A, [0 pre],  0, 'pre');
-                        end
-                        if post > 0
-                            A = padarray(A, [0 post], 0, 'post');
-                        end
+                        A = ffc_center_pad(A, [size(A,1), targetViews, size(A,3)]);
 
                         obj.views = targetViews;
 
@@ -589,8 +728,9 @@ classdef ImageReconCore
                 obj.originalcomplexkspace = obj.complexkspace;
                
             else
-                obj.complexkspace = reshape( obj.complexkspace,[obj.samples,size(obj.complexkspace,2),obj.slices,obj.n_timepoints,obj.n_fieldpoints,obj.n_receivers]); %enforce dimensionality
-                obj.originalcomplexkspace = obj.complexkspace;
+                obj.complexkspace = reshape(obj.originalcomplexkspace, ...
+                    [obj.samples, size(obj.originalcomplexkspace,2), obj.slices, ...
+                    obj.n_timepoints, obj.n_fieldpoints, obj.n_receivers]);
             end
 
             % originalcomplexkspace is always the immutable, unshifted source.
@@ -601,240 +741,43 @@ classdef ImageReconCore
         end
 
 
-        function obj = buildimages(obj)
-
-            %BUILDIMAGES  Convert k-space to image space, perform coil combination, optional bias correction, filtering.
-            %
-            
-            obj.compleximage = [];
-            % Always restart from immutable preprocessed acquisition data.
-            % This makes FOV-offset correction independent of the number of
-            % rebuilds and of any accumulated display rotation/flip.
-            obj.complexkspace = obj.originalcomplexkspace;
-            obj.fov_offsets_applied = false;
-            obj = apply_fov_offset_phase_ramp(obj);
-
-            % ----------- Receiver selection and optional prewhitening -----------
-            % obj.multichannel_recon may be:
-            %   - logical mask over the ORIGINAL coil dimension
-            %   - numeric MATLAB index list into the ORIGINAL coil dimension
-            %     (the GUI displays scanner receiver IDs 0..N-1, with
-            %     ItemsData 1..N)
-            opts_orig = obj.multichannel_recon;
-            nCoils_orig = size(obj.complexkspace, 6);
-
-            if isempty(opts_orig)
-                sel_orig = 1:nCoils_orig;
-            elseif islogical(opts_orig)
-                if numel(opts_orig) ~= nCoils_orig
-                    error('buildimages:coilMaskWrongLength', ...
-                        'Logical receiver mask has %d entries; %d receivers are available.', ...
-                        numel(opts_orig), nCoils_orig);
-                end
-                sel_orig = find(opts_orig(:).');
+        function obj = buildimages(obj, force)
+            % Explicit calls force reconstruction; the UI may request reuse.
+            if nargin < 2, force = true; end
+            if ~force && ffc_reconstruction_valid(obj), return; end
+            obj = ffc_invalidate_analysis(obj);
+            obj.mask = [];
+            obj.registration_tform = [];
+            if ~isempty(obj.is_svs) && logical(obj.is_svs)
+                obj = buildSVSSignal(obj);
             else
-                if ~isnumeric(opts_orig)
-                    error('buildimages:coilSelNotNumeric', ...
-                        'multichannel_recon must be a numeric index list or logical mask. Got %s.', ...
-                        class(opts_orig));
-                end
-
-                sel_orig = unique(round(opts_orig(:).'), 'stable');
-                sel_orig(~isfinite(sel_orig)) = [];
-
-                if isempty(sel_orig)
-                    error('buildimages:coilSelEmptyAfterParse', ...
-                        'multichannel_recon became empty after parsing.');
-                end
-
-                if any(sel_orig < 1) || any(sel_orig > nCoils_orig)
-                    error('buildimages:coilIndexOutOfRange', ...
-                        'Selected coil indices [%s] exceed available coils 1..%d.', num2str(sel_orig), nCoils_orig);
-                end
+                obj = ffc_reconstruct(obj, force);
             end
-
-            obj.selected_coils_original = sel_orig;
-            nSel = numel(sel_orig);
-
-            % Estimate and apply one whitening transform across the complete
-            % acquired receiver array.  Selection is deliberately applied
-            % afterwards: for example, selecting displayed receiver 7 retains
-            % MATLAB channel 8 of the fully prewhitened array.  A retained
-            % channel is therefore a virtual (mixed) prewhitened channel, not
-            % the untouched physical receiver with that number.
-            whiteningEnabled = ~isempty(obj.noise_whitening) && ...
-                isscalar(obj.noise_whitening) && logical(obj.noise_whitening) && ...
-                nCoils_orig > 1;
-            [kspace_selected, obj.whitening_info] = prewhiten_and_select( ...
-                obj.complexkspace, sel_orig, whiteningEnabled);
-            opts = 1:nSel;
-
-            % Magnitude k-space is kept at the acquired matrix size for QC.
-            obj.magkspace = rssq(kspace_selected, 6);
-
-            % ----------- Precompute centred zero filling -----------
-            % Spatial dimension order is read / phase / partition.
-            nRead  = size(kspace_selected, 1);
-            nPhase = size(kspace_selected, 2);
-            nPart  = size(kspace_selected, 3);
-
-            targetRead = round(double(obj.fft_size));
-            if ~isfinite(targetRead) || targetRead < 1
-                error('buildimages:invalidFftSize', ...
-                    'obj.fft_size must be a positive finite integer.');
+            obj.filter_source_magimage = obj.magimage;
+            if ~isempty(obj.denoise_filter) && ~strcmpi(obj.denoise_filter, 'None')
+                obj.magimage = ffc_mri_filter(obj.filter_source_magimage, ...
+                    obj.denoise_filter, obj.denoise_params);
             end
-
-            % Apply the same zero-fill factor to read and phase. Deriving this
-            % from the actual array sizes avoids stale header values and works
-            % for rectangular matrices/non-square FOV acquisitions.
-            targetPhase = round(double(nPhase) * targetRead / double(nRead));
-            targetPart = nPart;
-            if obj.TwoDimensional ~= 1 && ~isempty(obj.fft_size_3d)
-                targetPart = round(double(obj.fft_size_3d));
-            end
-
-            if targetRead < nRead
-                error('buildimages:fftSizeTooSmall', ...
-                    'obj.fft_size=%d is smaller than acquired readout size %d.', ...
-                    targetRead, nRead);
-            end
-            if targetPhase < nPhase
-                error('buildimages:phaseFftSizeTooSmall', ...
-                    'Target phase FFT size %d is smaller than acquired phase size %d.', ...
-                    targetPhase, nPhase);
-            end
-            if ~isfinite(targetPart) || targetPart < nPart
-                error('buildimages:partitionFftSizeTooSmall', ...
-                    'obj.fft_size_3d=%g is smaller than acquired partition size %d.', ...
-                    double(targetPart), nPart);
-            end
-
-            padReadTotal  = targetRead  - nRead;
-            padPhaseTotal = targetPhase - nPhase;
-            padPartTotal  = targetPart  - nPart;
-
-            % padarray entries follow the real array order: read, phase, part.
-            % The previous phase/read reversal only went unnoticed for square data.
-            padPre = [floor(padReadTotal/2), ...
-                floor(padPhaseTotal/2), floor(padPartTotal/2)];
-            padPost = [ceil(padReadTotal/2), ...
-                ceil(padPhaseTotal/2), ceil(padPartTotal/2)];
-
-            kspace_selected = windowkspace(kspace_selected, ...
-                obj.window_size, obj.window_function);
-            kpad = padarray(kspace_selected, padPre, 0, 'pre');
-            kpad = padarray(kpad, padPost, 0, 'post');
-
-            % ----------- FFT to image space (per coil) -----------
-            if obj.TwoDimensional == 1
-                obj.compleximage = ifft2c(kpad);
-            else
-                % Transform only the first three spatial dimensions. The old
-                % ifftn implementation also transformed the receiver dimension.
-                obj.compleximage = ifft3c(kpad);
-            end
-
-            % ----------- Receiver combination mode (from GUI dropdown) -----------
-            combineMode = "ACS/Walsh"; % default
-            if isprop(obj,'combination') && ~isempty(obj.combination)
-                combineMode = string(obj.combination);
-            end
-
-            % ----------- Bias correction mode (from GUI dropdown) -----------
-            biasMode = "Off"; % default
-            if isprop(obj,'biascorrect') && ~isempty(obj.biascorrect)
-                biasMode = string(obj.biascorrect);
-            end
-
-            % Initialise outputs
-            obj.complexcombined = [];
-            obj.magimage = [];
-            obj.phaseimage = [];
-
-            % ----------- Combine -----------
-            if nSel <= 1
-                % Single-coil path: selected coil becomes coil 1 after trimming
-                obj.complexcombined = obj.compleximage(:,:,:,:,:,1);
-                obj.magimage = abs(obj.complexcombined);
-
-            else
-                switch combineMode
-                    case "RSSQ"
-                        % Magnitude-only
-                        obj.complexcombined = [];
-                        obj.magimage = rssq(obj.compleximage, 6);
-
-                    case "Adaptive"
-                        % Smoothed self-calibrated adaptive complex combine
-                        ccopts = struct();
-                        ccopts.coils = 1:size(obj.compleximage, 6);
-                        ccopts.sigma = 4;
-                        ccopts.maskFrac = 0.1;
-                        if whiteningEnabled
-                            % Whitening creates virtual channels; no output
-                            % channel remains the privileged "signal coil".
-                            ccopts.referenceMode = 'rss';
-                        else
-                            ccopts.referenceMode = 'signalcoil';
-                        end
-                        obj.complexcombined = combine_adaptive_smoothed(obj.compleximage, ccopts);
-                        obj.magimage = abs(obj.complexcombined);
-                        obj.compleximage = obj.complexcombined;
-                    case "ACS/Walsh"
-                        % ACS/Walsh sensitivity maps + Roemer combine
-                        maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
-                        obj.complexcombined = combine_with_maps(obj.compleximage, maps, opts, obj);
-                        obj.magimage = abs(obj.complexcombined);
-                        obj.compleximage = obj.complexcombined;
-
-                    otherwise
-                        
-                        obj.complexcombined = [];
-                        obj.magimage = rssq(obj.compleximage, 6);
-                end
-
-                % ----------- Optional bias-field correction -----------
-                switch biasMode
-                    case "Off"
-                        % no-op
-
-                    case "ACS"
-                        % Bias correction previously referenced `maps` even
-                        % when RSSQ or Adaptive combination had not created it.
-                        if ~exist('maps', 'var') || isempty(maps)
-                            maps = estimate_maps_from_acs_walsh(kpad, opts, obj);
-                        end
-                        obj.magimage = map_guided_bias_correct(obj.magimage, maps, obj);
-
-                    otherwise
-                        % no-op
-                end
-            end
-
-            % Safety: ensure magimage exists
-            if isempty(obj.magimage)
-                if ~isempty(obj.complexcombined)
-                    obj.magimage = abs(obj.complexcombined);
-                else
-                    obj.magimage = rssq(obj.compleximage, 6);
-                end
-            end
-
-            % ----------- Denoise / post-filter -----------
-         %  obj.magimage = ffc_mri_filter(obj.magimage, obj.denoise_filter, obj.denoise_params);
-
-            % ----------- Phase image (only meaningful for complex combined) -----------
-            if ~isempty(obj.complexcombined)
-                obj.phaseimage = angle(obj.complexcombined);
-            else
-                obj.complexcombined = sum(1.*obj.compleximage,6);
-                obj.phaseimage = angle(obj.complexcombined);
-            end
-
+            obj.reconstruction_generation = obj.reconstruction_generation + 1;
+            obj.reconstruction_key = ffc_reconstruction_key(obj);
+            obj.processing_history{end+1} = struct('operation', 'reconstruct', ...
+                'generation', obj.reconstruction_generation, 'time', datestr(now,30));
         end
 
 
      function obj = MapRelaxation(obj)
+%MAPRELAXATION Simple magnitude-domain inversion-recovery maps.
+%
+% The GUI uses the same ordinary offset-plus-one-exponential fit for SVS,
+% imaging ROIs and individual image voxels. The previous phase-aware,
+% noise-modelled implementation remains available as MapRelaxationAdvanced
+% for reproducibility, but is no longer the default pipeline.
+
+    obj = ffc_simple_t1map(obj);
+end
+
+
+     function obj = MapRelaxationAdvanced(obj)
 %MAPRELAXATION Pixelwise FCI T1 mapping, parfor-safe class wrapper.
 %
 % This wrapper intentionally contains NO parfor loop.  The parallel work is
@@ -945,8 +888,250 @@ classdef ImageReconCore
 end
 
 
+function obj = buildSVSSignal(obj)
+%BUILDSVSSIGNAL Reduce a localised FCI acquisition without applying an FFT.
+%
+% The SVS readout dimension contains repeated samples of one localised
+% signal, not spatial k-space. The quantitative signal follows the validated
+% direct extraction MEAN(ABS(DATA),1). A complex arithmetic mean is retained
+% only for phase display/QC. Receiver prewhitening/selection still happens in
+% the same order as it does for imaging data.
+
+    source = obj.originalcomplexkspace;
+    if isempty(source)
+        source = obj.complexkspace;
+    end
+    if isempty(source)
+        error('buildSVSSignal:NoData', ...
+            'The SVS acquisition contains no preprocessed complex data.');
+    end
+
+    nCoils = size(source, 6);
+    selected = obj.multichannel_recon;
+    if isempty(selected)
+        selected = 1:nCoils;
+    elseif islogical(selected)
+        if numel(selected) ~= nCoils
+            error('buildSVSSignal:coilMaskWrongLength', ...
+                'The receiver mask has %d entries for %d receivers.', ...
+                numel(selected), nCoils);
+        end
+        selected = find(selected(:).');
+    else
+        selected = unique(round(double(selected(:).')), 'stable');
+        selected = selected(isfinite(selected));
+    end
+    if isempty(selected) || any(selected < 1) || any(selected > nCoils)
+        error('buildSVSSignal:coilIndexOutOfRange', ...
+            'Selected receiver indices must be within 1..%d.', nCoils);
+    end
+
+    whiteningEnabled = nCoils > 1 && ~isempty(obj.noise_whitening) && ...
+        isscalar(obj.noise_whitening) && logical(obj.noise_whitening);
+    [selectedData, obj.whitening_info] = prewhiten_and_select( ...
+        source, selected, whiteningEnabled);
+    obj.selected_coils_original = selected;
+
+    [complexSignal, perReceiverSignal, magnitudeSignal, ...
+        perReceiverMagnitudeSignal] = ...
+        svs_signal_from_kspace(selectedData);
+    obj.compleximage = complexSignal;
+    obj.complexcombined = complexSignal;
+    obj.magimage = magnitudeSignal;
+    obj.phaseimage = angle(complexSignal);
+    % Keep the exact time-by-field curves used by the SVS fitter available
+    % for direct comparison with a manual extraction.
+    obj.param.SVS_PROCESSED_COMPLEX_SIGNAL = reshape(complexSignal, ...
+        [size(complexSignal, 4), size(complexSignal, 5)]);
+    obj.param.SVS_PROCESSED_MAGNITUDE_SIGNAL = reshape(magnitudeSignal, ...
+        [size(magnitudeSignal, 4), size(magnitudeSignal, 5)]);
+    obj.param.SVS_PER_RECEIVER_MAGNITUDE_SIGNAL = ...
+        perReceiverMagnitudeSignal;
+    obj.magkspace = perReceiverMagnitudeSignal;
+    obj.mask = true(1, 1);
+    obj.complexkspace = source;
+    obj.fov_offsets_applied = false;
+    obj.svs_signal_method = ...
+        'mean(abs(complex samples),1) per experiment';
+end
+
+
+function value = getCameleonScalar(~, parameters, name, defaultValue)
+%GETCAMELEONSCALAR Read a finite scalar while tolerating missing metadata.
+
+    value = defaultValue;
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = double(parameters.(name));
+    candidate = candidate(isfinite(candidate));
+    if ~isempty(candidate)
+        value = candidate(1);
+    end
+end
+
+
+function value = getCameleonVector(~, parameters, name, defaultValue)
+%GETCAMELEONVECTOR Read a finite numeric vector with a safe fallback.
+
+    value = defaultValue;
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = parameters.(name);
+    if isnumeric(candidate) || islogical(candidate)
+        candidate = double(candidate(:).');
+    else
+        candidate = str2num(char(string(candidate))); %#ok<ST2NM>
+        candidate = double(candidate(:).');
+    end
+    candidate = candidate(isfinite(candidate));
+    if ~isempty(candidate)
+        value = candidate;
+    end
+end
+
+
+function value = getCameleonLogical(~, parameters, name, defaultValue)
+%GETCAMELEONLOGICAL Read a scalar logical/boolean parameter safely.
+
+    value = logical(defaultValue);
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = parameters.(name);
+    if islogical(candidate) || isnumeric(candidate)
+        if ~isempty(candidate)
+            value = logical(candidate(1));
+        end
+    else
+        value = any(strcmpi(strtrim(string(candidate)), {'true', 'on', 'yes', '1'}));
+    end
+end
+
+
+function value = getCameleonText(~, parameters, name, defaultValue)
+%GETCAMELEONTEXT Read a text parameter while tolerating absent fields.
+
+    value = char(string(defaultValue));
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = parameters.(name);
+    if ischar(candidate) || isstring(candidate)
+        candidate = strtrim(char(string(candidate)));
+        if ~isempty(candidate)
+            value = candidate;
+        end
+    end
+end
+
+
+function value = getParScalar(~, parameters, name, defaultValue)
+%GETPARSCALAR Read a scalar from the convenience fields returned by the reader.
+
+    value = defaultValue;
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = parameters.(name);
+    if isnumeric(candidate) || islogical(candidate)
+        candidate = double(candidate(:));
+        candidate = candidate(isfinite(candidate));
+        if ~isempty(candidate)
+            value = candidate(1);
+        end
+    else
+        parsed = str2double(string(candidate));
+        if isfinite(parsed)
+            value = parsed;
+        end
+    end
+end
+
+
+function value = getParText(~, parameters, name, defaultValue)
+%GETPARTEXT Read a text field from the convenience struct safely.
+
+    value = char(string(defaultValue));
+    if ~isstruct(parameters) || ~isfield(parameters, name)
+        return;
+    end
+    candidate = parameters.(name);
+    if ischar(candidate) || isstring(candidate)
+        candidate = strtrim(char(string(candidate)));
+        if ~isempty(candidate)
+            value = candidate;
+        end
+    end
+end
+
+
+function value = positiveInteger(~, candidate, defaultValue)
+%POSITIVEINTEGER Return a positive integer or the supplied fallback.
+
+    value = round(double(candidate));
+    if ~isscalar(value) || ~isfinite(value) || value < 1
+        value = round(double(defaultValue));
+    end
+    value = max(1, value);
+end
+
+
+function output = padOrTrim(~, input, n, defaultValue)
+%PADORTRIM Make a row vector have exactly n finite entries.
+
+    output = double(input(:).');
+    output = output(isfinite(output));
+    if isempty(output)
+        output = defaultValue .* ones(1, n);
+    elseif numel(output) < n
+        output(end+1:n) = output(end);
+    else
+        output = output(1:n);
+    end
+end
+
+
+function plane = inferAnatomicalPlane(~, orientation)
+%INFERANATOMICALPLANE Name the plane whose normal best matches the volume.
+
+    plane = 'Axial';
+    if isempty(orientation) || numel(orientation) ~= 6
+        return;
+    end
+    rowDirection = double(orientation(1:3));
+    columnDirection = double(orientation(4:6));
+    normalDirection = cross(rowDirection(:), columnDirection(:));
+    if any(~isfinite(normalDirection)) || norm(normalDirection) < eps
+        return;
+    end
+    [~, dominantAxis] = max(abs(normalDirection));
+    names = {'Sagittal', 'Coronal', 'Axial'};
+    plane = names{dominantAxis};
+end
+
+
 
 function [obj, results] = T1dispersion(obj, slice, userOptions)
+%T1DISPERSION Simple magnitude-domain inversion-recovery dispersion fit.
+%
+% This is the default for both imaging ROIs and SVS. It fits the ordinary
+% unweighted model A*exp(-t/T1)+C after automatically selecting one common
+% early-negative/late-positive transition from all fields. The former
+% phase-aware implementation is retained as T1dispersionAdvanced.
+
+    if nargin < 2 || isempty(slice)
+        slice = 1;
+    end
+    if nargin < 3 || isempty(userOptions)
+        userOptions = struct();
+    end
+    [obj, results] = ffc_simple_t1dispersion(obj, slice, userOptions);
+end
+
+
+function [obj, results] = T1dispersionAdvanced(obj, slice, userOptions)
 %T1DISPERSION Phase-aware field-cycling inversion-recovery T1 fit.
 %
 %   OBJ = T1DISPERSION(OBJ, SLICE)

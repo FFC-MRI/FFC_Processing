@@ -32,41 +32,48 @@ p = opts.patch;
 s = opts.step;
 
 Y = X;
+wgt = zeros(H,W,'single');
+for i = 1:s:(H-p+1)
+    for j = 1:s:(W-p+1)
+        wgt(i:i+p-1,j:j+p-1) = wgt(i:i+p-1,j:j+p-1) + 1;
+    end
+end
+covered = wgt(:) > 0;
+thr = opts.tau * sigma * sqrt(max(p*p,N));
 
 for it = 1:opts.niter
     acc = zeros(H,W,N,'single');
-    wgt = zeros(H,W,N,'single');
 
     for i = 1:s:(H-p+1)
         for j = 1:s:(W-p+1)
             patch = Y(i:i+p-1, j:j+p-1, :);          % [p,p,N]
             P = reshape(patch, p*p, N);              % [m,n]
-            P = P - mean(P,1,'omitnan');             % remove per-frame mean (helps)
+            patchMean = mean(P,1,'omitnan');
+            P = P - patchMean;             % remove per-frame mean (helps)
 
             % SVD shrinkage
             [U,Sv,V] = svd(P,'econ');
             sing = diag(Sv);
 
             % Threshold (Gavish-Donoho-ish scaling, simplified)
-            thr = opts.tau * sigma * sqrt(max(p*p, N));
             sing_sh = max(sing - thr, 0);
 
-            Psh = U * (diag(sing_sh) * V');
+            Psh = U * (sing_sh .* V');
 
             % add mean back
-            Psh = Psh + mean(reshape(patch, p*p, N),1,'omitnan');
+            Psh = Psh + patchMean;
 
             patch_out = reshape(Psh, p, p, N);
 
             acc(i:i+p-1, j:j+p-1, :) = acc(i:i+p-1, j:j+p-1, :) + patch_out;
-            wgt(i:i+p-1, j:j+p-1, :) = wgt(i:i+p-1, j:j+p-1, :) + 1;
         end
     end
 
     % Handle borders not covered by the loop by simple copy-through
-    Ynew = Y;
-    idx = (wgt > 0);
-    Ynew(idx) = acc(idx) ./ wgt(idx);
+    Ynew = reshape(Y, H*W, N);
+    acc = reshape(acc, H*W, N);
+    Ynew(covered,:) = acc(covered,:) ./ wgt(covered);
+    Ynew = reshape(Ynew,H,W,N);
 
     % Light stabilisation: keep non-negative
     Ynew = max(Ynew, 0);

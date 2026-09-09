@@ -1,0 +1,116 @@
+{
+  "scope": "Independent algebra checks; MATLAB app and MATLAB tests were not executed.",
+  "checks_passed": 22,
+  "checks": [
+    {
+      "check": "full-channel whitening then output selection",
+      "max_absolute_error": 0.0,
+      "tolerance": 3e-06
+    },
+    {
+      "check": "blocked spatial FFT (14, 11, 3)/(0, 1)",
+      "max_absolute_error": 0.0,
+      "tolerance": 1e-05
+    },
+    {
+      "check": "one-allocation centred padding (14, 11, 3)",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "blocked spatial FFT (14, 11, 5)/(0, 1, 2)",
+      "max_absolute_error": 0.0,
+      "tolerance": 1e-05
+    },
+    {
+      "check": "one-allocation centred padding (14, 11, 5)",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "blocked spatial FFT (9, 7, 3)/(0, 1, 2)",
+      "max_absolute_error": 0.0,
+      "tolerance": 1e-05
+    },
+    {
+      "check": "one-allocation centred padding (9, 7, 3)",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "LLR 2D coverage/diagonal-free shrinkage N=7",
+      "max_absolute_error": 0.0,
+      "tolerance": 3e-06
+    },
+    {
+      "check": "LLR 2D coverage/diagonal-free shrinkage N=72",
+      "max_absolute_error": 0.0,
+      "tolerance": 3e-06
+    },
+    {
+      "check": "slice-before-permute (0, 1, 2)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (0, 1, 2)/2",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (0, 2, 1)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (0, 2, 1)/6",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (1, 0, 2)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (1, 0, 2)/2",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (1, 2, 0)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (1, 2, 0)/4",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (2, 0, 1)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (2, 0, 1)/6",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (2, 1, 0)/0",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "slice-before-permute (2, 1, 0)/4",
+      "max_absolute_error": 0.0,
+      "tolerance": 0
+    },
+    {
+      "check": "streaming field-then-time ACS average",
+      "max_absolute_error": 1.3328003944934608e-07,
+      "tolerance": 3e-06
+    }
+  ]
+}

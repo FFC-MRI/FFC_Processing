@@ -27,7 +27,7 @@ if ~isequal(rootFolder, 0)
     lastFolder = rootFolder;
 
     % Find .dat files recursively
-    datList = dir(fullfile(rootFolder, '**', '*.dat'));
+    datList = dir(fullfile(rootFolder, '**', 'data.dat'));
 
     % Exclude anything under a folder named exactly 'proc'
     if ~isempty(datList)
@@ -50,45 +50,7 @@ if ~isequal(rootFolder, 0)
     ok   = false(1, n);
     errs = cell(1, n);
 
-    % Start pool if needed (optional; comment out if you prefer manual control)
-    if isempty(gcp('nocreate'))
-        try
-            parpool;
-        catch
-            % If Parallel Toolbox not available, fall back to serial loop
-            warning('Parallel pool could not be started. Falling back to serial processing.');
-            for k = 1:n
-                try
-                    thisDatFull   = fullfile(datList(k).folder, datList(k).name);
-                    thisDatFolder = datList(k).folder;
-
-                    [data, par, data_name] = read_raw_data_Cameleon(thisDatFolder, []);
-                    file = struct();
-                    file.data = data;
-                    file.par  = par;
-                    file.data_name = data_name; %#ok<NASGU>
-
-                    obj{k} = ImageReconCore(file, '.dat', 1);
-                    ok(k)  = true;
-                catch ME
-                    ok(k) = false;
-                    errs{k} = sprintf('Failed to reconstruct %s\n  %s', thisDatFull, ME.message);
-                    obj{k} = [];
-                end
-            end
-
-            obj = obj(ok);
-            bad = find(~ok);
-            for i = 1:numel(bad)
-                if ~isempty(errs{bad(i)})
-                    warning('%s', errs{bad(i)});
-                end
-            end
-            return;
-        end
-    end
-
-    % PARALLEL loop
+    % Disk reads are serial. Do not pay for an unused parallel pool.
     for k = 1:n
         thisDatFull   = fullfile(datList(k).folder, datList(k).name);
         thisDatFolder = datList(k).folder;
@@ -133,16 +95,17 @@ bakCD = pwd;
 try
     cd(lastFolder);
 catch
-    cd('C:\');
+    cd(bakCD);
 end
 
+restoreFolder = onCleanup(@() cd(bakCD));
 [nmrfilename, nmrpathname] = uigetfile({ ...
     '*.MRD;*.mat;*.dat','MRI Files'; ...
     '*.*','All Files' }, ...
     'Select MR Data File', ...
     'MultiSelect','on');
 
-cd(bakCD);
+clear restoreFolder
 
 if isequal(nmrfilename,0) || isequal(nmrpathname,0)
     obj = {};
@@ -173,7 +136,7 @@ for n = 1:numel(fileList)
     switch lower(filetype)
 
         case '.mat'
-            file = load(fullpath);
+            file = load(fullpath, 'saveList');
 
             % If saveList contains ImageReconCore already, return it as a cell array
             if isfield(file, 'saveList') && ~isempty(file.saveList)
@@ -190,13 +153,18 @@ for n = 1:numel(fileList)
                         'H9_se_nav_v7','H9_ir_se','H9_ir_se_nav_v4','H9_se_nav_v4','H9_se_nav_longT1', ...
                         'H9_se_nav_v2','H9_ir_se_nav_v2'};
 
-                    toprocess = find(ismember(objects, whitelist));
+                    toprocess = find(ismember(objects, [whitelist {'ImageReconCore'}]));
 
                     for seqIdx = toprocess
                         try
-                            fid = fopen(fullpath);
+                            if isa(file.saveList{seqIdx}, 'ImageReconCore')
+                                scan = file.saveList{seqIdx};
+                            else
+                                fid = fopen(fullpath);
+                                scan = ImageReconCore(fid, filetype, seqIdx, file.saveList{seqIdx});
+                            end
                             outIdx = outIdx + 1;
-                            obj{outIdx} = ImageReconCore(fid, filetype, seqIdx); %#ok<AGROW>
+                            obj{outIdx} = scan; %#ok<AGROW>
                         catch ME
                             warning('Error while processing sequence number %d in %s:\n  %s', seqIdx, fullpath, ME.message);
                         end
@@ -237,5 +205,6 @@ for n = 1:numel(fileList)
             end
     end
 end
+obj = obj(~cellfun(@isempty,obj));
 
 end

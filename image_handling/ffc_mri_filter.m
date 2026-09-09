@@ -51,6 +51,16 @@ function filtered_images = ffc_mri_filter(images, filter_type, params)
 
     params = normalise_filter_params(params, filter_type);
 
+    if isfield(params,'stack_grouping') && strcmpi(params.stack_grouping,'per-slice') && ...
+            contains(lower(filter_type),'llr') && size(images,3) > 1
+        filtered_images = zeros(size(images),'like',real(images(1)));
+        childParams = params; childParams.stack_grouping = 'all';
+        for slice = 1:size(images,3)
+            filtered_images(:,:,slice,:,:) = ffc_mri_filter( ...
+                images(:,:,slice,:,:),filter_type,childParams);
+        end
+        return;
+    end
     dim = size(images);
 
     if numel(dim) < 2
@@ -315,7 +325,7 @@ function temp = apply_wavelet(temp, params)
         return
     end
 
-    temp = wavelet_per_frame(temp, params.wavelet_level);
+    temp = wavelet_per_frame(temp, params.wavelet_level, params);
 
 end
 
@@ -349,9 +359,11 @@ function temp = apply_tv(temp, params)
 
     tmp = zeros(size(temp), 'like', temp);
 
-    if size(temp, 3) == 1
-        tmp(:,:,1) = tvl1_preserve_scale(temp(:,:,1), ...
+    if ~ffc_use_parallel(params,size(temp,3))
+        for n = 1:size(temp,3)
+        tmp(:,:,n) = tvl1_preserve_scale(temp(:,:,n), ...
             params.tv_lambda, params.tv_niter);
+        end
     else
         parfor n = 1:size(temp, 3)
             tmp(:,:,n) = tvl1_preserve_scale(temp(:,:,n), ...
@@ -397,13 +409,15 @@ function temp = apply_tgv(temp, params)
 
     tmp = zeros(size(temp), 'like', temp);
 
-    if size(temp, 3) == 1
-        tmp(:,:,1) = TGV2denoise(temp(:,:,1), ...
+    if ~ffc_use_parallel(params,size(temp,3))
+        for n = 1:size(temp,3)
+        tmp(:,:,n) = TGV2denoise(temp(:,:,n), ...
             params.tgv_alpha0, ...
             params.tgv_alpha1, ...
             params.tgv_lambda, ...
             params.tgv_niter, ...
             optsT);
+        end
     else
         parfor n = 1:size(temp, 3)
             tmp(:,:,n) = TGV2denoise(temp(:,:,n), ...

@@ -1,0 +1,16 @@
+CVI contours TEST 7
+===================
+
+Changes from TEST 6:
+- Fixes the clinical-DICOM -> FCI coordinate convention.  The supplied RS2D
+  IMAGE_ORIENTATION_SUBJECT vectors use the same numerical subject basis as
+  the DICOM direction cosines; DICOM X/Y are therefore no longer sign-flipped.
+- Reads enhanced-DICOM InStackPositionNumber and DimensionIndexValues for each
+  contour frame instead of relying solely on frame-number arithmetic.
+- Builds contour surfaces in explicit DICOM stack order when available.
+- Registration dialog reports the unsigned clinical/FCI plane-normal angle.
+
+With the supplied Duncan Roy clinical/FCI data the unregistered SAX plane
+normal mismatch is about 6.3 degrees when the common coordinate basis is used.
+TEST 6's sign-flip made the apparent mismatch much larger and led to artificial
+90/180-degree manual rotations.

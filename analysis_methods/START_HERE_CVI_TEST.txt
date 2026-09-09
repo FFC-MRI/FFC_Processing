@@ -1,0 +1,30 @@
+FFC Processing - CVI contours TEST 6
+====================================
+
+1. Extract this ZIP. It is safe to extract over an existing FFC_Processing
+   test folder: this build uses the unique class name FFCProcessingCVI, so
+   a leftover FFCProcessing.mlapp will not shadow the new app.
+
+2. In MATLAB, set Current Folder to the FFC_Processing folder and run:
+
+       ffc_start_cvi
+
+   (ffc_start is equivalent.)
+
+3. The title bar should read:
+
+       FFC Processing - Performance Edition + CVI contours TEST 6
+
+4. Use the buttons under Scan List:
+       Import CVI contours
+       CVI registration
+
+5. Import workflow:
+   - select the .cvi42ws workspace
+   - select the folder containing its matching clinical DICOMs
+   - choose/adjust the registration in the CVI Contour Registration window
+
+A legacy FFCProcessing.mlapp may remain in the folder; TEST 6 does not use it.
+
+
+TEST 9: Added live R/L, A/P and H/F translation sliders (numeric fields retained).

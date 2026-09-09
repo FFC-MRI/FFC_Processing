@@ -1,0 +1,174 @@
+{
+  "source_archive": "FFC_Processing-master(8).zip",
+  "source_sha256": "4050fb4938f11d32283100a78d4e09a4fb1eaf7ea79600f20da3a06da79e8112",
+  "matlab_runtime_validation": "not executed; MATLAB is unavailable in the preparation environment",
+  "changes": [
+    {
+      "path": "FFCJobRunner.m",
+      "change": "added"
+    },
+    {
+      "path": "FFCProcessing.m",
+      "change": "added"
+    },
+    {
+      "path": "ImageReconCore.m",
+      "change": "modified"
+    },
+    {
+      "path": "PERFORMANCE_EDITION.md",
+      "change": "added"
+    },
+    {
+      "path": "README.md",
+      "change": "modified"
+    },
+    {
+      "path": "analysis_methods/t1_mapping/ffc_register_images.m",
+      "change": "added"
+    },
+    {
+      "path": "analysis_methods/t1_mapping/ffc_registration_masks.m",
+      "change": "added"
+    },
+    {
+      "path": "analysis_methods/t1_mapping/register_images.m",
+      "change": "modified"
+    },
+    {
+      "path": "benchmark_ffc.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_compute_task.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_invalidate_analysis.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_preprocess_scans.m",
+      "change": "modified"
+    },
+    {
+      "path": "ffc_reconstruct.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_reconstruction_key.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_reconstruction_valid.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_setup.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_simple_ir_fit.m",
+      "change": "modified"
+    },
+    {
+      "path": "ffc_simple_t1dispersion.m",
+      "change": "modified"
+    },
+    {
+      "path": "ffc_simple_t1map.m",
+      "change": "modified"
+    },
+    {
+      "path": "ffc_start.m",
+      "change": "added"
+    },
+    {
+      "path": "ffc_use_parallel.m",
+      "change": "added"
+    },
+    {
+      "path": "file_handling/open_mrifile.m",
+      "change": "modified"
+    },
+    {
+      "path": "image_handling/correct_orientation.m",
+      "change": "modified"
+    },
+    {
+      "path": "image_handling/estimate_maps_from_acs_walsh.m",
+      "change": "modified"
+    },
+    {
+      "path": "image_handling/ffc_extract_anatomical_plane.m",
+      "change": "modified"
+    },
+    {
+      "path": "image_handling/ffc_mri_filter.m",
+      "change": "modified"
+    },
+    {
+      "path": "image_handling/llr_denoise_stack.m",
+      "change": "modified"
+    },
+    {
+      "path": "kspace_handling/ffc_apply_whitening.m",
+      "change": "added"
+    },
+    {
+      "path": "kspace_handling/ffc_center_pad.m",
+      "change": "added"
+    },
+    {
+      "path": "kspace_handling/ffc_noise_calibration.m",
+      "change": "added"
+    },
+    {
+      "path": "kspace_handling/noise_whiten.m",
+      "change": "modified"
+    },
+    {
+      "path": "kspace_handling/prewhiten_and_select.m",
+      "change": "modified"
+    },
+    {
+      "path": "kspace_handling/wavelet_per_frame.m",
+      "change": "modified"
+    },
+    {
+      "path": "kspace_handling/windowkspace.m",
+      "change": "modified"
+    },
+    {
+      "path": "legacy_app/FFCProcessing_original.mlapp",
+      "change": "added"
+    },
+    {
+      "path": "tests/test_background_lifecycle.m",
+      "change": "added"
+    },
+    {
+      "path": "tests/test_cameleon_loading.m",
+      "change": "modified"
+    },
+    {
+      "path": "tests/test_performance_regressions.m",
+      "change": "added"
+    }
+  ],
+  "removed_or_relocated": [
+    "ImageReconCore.asv",
+    "FFCProcessing.mlapp",
+    "image_handling/bias_correct_n4lite.asv",
+    "image_handling/correct_orientation.asv",
+    "file_handling/read_raw_data_Cameleon.asv",
+    "analysis_methods/t1_mapping/register_images.asv",
+    "file_handling/wave generators/messages.log",
+    "file_handling/wave generators/diary",
+    "file_handling/Sequence files/H9_se_nav_v9_cardiac.asv",
+    "file_handling/Tissue references/messages.log",
+    "file_handling/Tissue references/diary",
+    "pipeline_methods/BM3D/BM3D Denoising.asv"
+  ],
+  "original_app_relocated_to": "legacy_app/FFCProcessing_original.mlapp"
+}
