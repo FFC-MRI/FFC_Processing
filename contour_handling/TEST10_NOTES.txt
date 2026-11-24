@@ -1,0 +1,6 @@
+CVI contours TEST10
+
+- Keeps TEST9 live translation sliders.
+- Mirror left/right and up/down are now display-space handedness corrections applied after projection around the registered contour centre.
+- Mirror L/R therefore always means horizontal on the displayed FCI image and no longer depends on which scan was chosen as the registration target.
+- Physical 3-D registration remains rotation + translation only.

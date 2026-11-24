@@ -70,6 +70,7 @@ classdef ImageReconCore
         flipH %mirror horizontally
         flipV %mirror vertically
         param = struct %other sequence parameters go here
+        source_metadata = struct %raw-dataset patient/study/session metadata
         SENSE %undersampled
         registration_tform %transformation used for image registration
         TwoDimensional
@@ -91,11 +92,27 @@ classdef ImageReconCore
         reconstruction_generation = uint64(0)
         magnitude_generation = uint64(0)
         reconstruction_key = []
+        rf_correction_info = [] % diagnostics and compact RF model for the acquired source
+        sensitivity_cache = []
+        sensitivity_cache_key = []
+        disk_cache_source = '' % raw dataset folder; empty for MAT/MRD
+        disk_cache_identity = [] % source identity observed before raw read
         whitening_cache = [] % small covariance/factor only
         whitening_cache_key = []
         filter_source_magimage = [] % copy-on-write baseline, never cumulative
         processing_history = {}
+        retain_phase_images = true % viewer computes phase only for displayed plane
         retain_coil_images = true % RSSQ compatibility; false saves final coil cube
+        % Manual point-polarity constraints for inversion-recovery fitting.
+        % Each is a 1 x nFields cell array containing sample indices after
+        % evolution-time sorting / duplicate-time averaging. These are user
+        % decisions made in the interactive Check fits diagnostic and are
+        % intentionally retained across refits.
+        manual_negative_indices = {}
+        manual_positive_indices = {}
+        % Legacy alias retained for compatibility with earlier development
+        % builds, where entries meant "force this sample negative".
+        manual_polarity_flips = {}
     end
 
 
@@ -339,6 +356,28 @@ classdef ImageReconCore
                     obj.rawdata = fid.data;
                     cameleon = fid.par.cameleon;
                     obj.param = cameleon;
+                    if isfield(fid.par,'serieMetadata') && isstruct(fid.par.serieMetadata)
+                        obj.source_metadata = fid.par.serieMetadata;
+                    else
+                        obj.source_metadata = struct();
+                    end
+                    obj.source_metadata.AcquisitionDateTime = ...
+                        getCameleonText(obj,cameleon,'ACQUISITION_DATE','');
+                    obj.source_metadata.AcquisitionUUID = ...
+                        getCameleonText(obj,cameleon,'ACQUISITION_UUID','');
+                    obj.source_metadata.SubjectPosition = ...
+                        getCameleonText(obj,cameleon,'SUBJECT_POSITION','');
+                    if isfield(fid.par,'datasetPath')
+                        obj.filelocation = char(string(fid.par.datasetPath));
+                    end
+                    if isfield(fid.par,'openRootPath') && ~isempty(fid.par.openRootPath)
+                        obj.source_metadata.OpenRootPath = char(string(fid.par.openRootPath));
+                    elseif isfield(fid.par,'datasetPath') && ~isempty(fid.par.datasetPath)
+                        obj.source_metadata.OpenRootPath = char(string(fid.par.datasetPath));
+                    end
+                    if isfield(fid,'data_name')
+                        obj.name = char(string(fid.data_name));
+                    end
                     obj.samples = positiveInteger(obj, getParScalar(obj, fid.par, 'md1d', size(fid.data, 1)), size(fid.data, 1));
                     obj.views = positiveInteger(obj, getParScalar(obj, fid.par, 'md2d', 1), 1);
                     obj.slices = positiveInteger(obj, getParScalar(obj, fid.par, 'md3d', 1), 1);
@@ -572,7 +611,9 @@ classdef ImageReconCore
             if isempty(obj.originalcomplexkspace)||(obj.reprocess==1)
                 obj.source_generation = obj.source_generation + 1;
                 obj.reconstruction_key = [];
+                obj.rf_correction_info = [];
                 obj.whitening_cache = [];
+                obj.sensitivity_cache = []; obj.sensitivity_cache_key = [];
                 obj = ffc_invalidate_analysis(obj);
                 obj.mask = [];
                 obj.filter_source_magimage = [];
@@ -725,6 +766,7 @@ classdef ImageReconCore
                 % Keep an untouched, unwhitened copy. Whitening is a user-selectable
                 % reconstruction operation and must be applied exactly once to
                 % the full receiver array in buildimages(), before selection.
+                
                 obj.originalcomplexkspace = obj.complexkspace;
                
             else
@@ -744,16 +786,26 @@ classdef ImageReconCore
         function obj = buildimages(obj, force)
             % Explicit calls force reconstruction; the UI may request reuse.
             if nargin < 2, force = true; end
+
             if ~force && ffc_reconstruction_valid(obj), return; end
             obj = ffc_invalidate_analysis(obj);
             obj.mask = [];
+            if isstruct(obj.param) && isfield(obj.param,'CVIDispersionMask')
+                obj.param = rmfield(obj.param,'CVIDispersionMask');
+            end
             obj.registration_tform = [];
             if ~isempty(obj.is_svs) && logical(obj.is_svs)
+                obj.rf_correction_info = [];
                 obj = buildSVSSignal(obj);
             else
                 obj = ffc_reconstruct(obj, force);
             end
+
             obj.filter_source_magimage = obj.magimage;
+
+
+
+
             if ~isempty(obj.denoise_filter) && ~strcmpi(obj.denoise_filter, 'None')
                 obj.magimage = ffc_mri_filter(obj.filter_source_magimage, ...
                     obj.denoise_filter, obj.denoise_params);
@@ -938,7 +990,8 @@ function obj = buildSVSSignal(obj)
     obj.compleximage = complexSignal;
     obj.complexcombined = complexSignal;
     obj.magimage = magnitudeSignal;
-    obj.phaseimage = angle(complexSignal);
+    obj.phaseimage = [];
+    if obj.retain_phase_images, obj.phaseimage = angle(complexSignal); end
     % Keep the exact time-by-field curves used by the SVS fitter available
     % for direct comparison with a manual extraction.
     obj.param.SVS_PROCESSED_COMPLEX_SIGNAL = reshape(complexSignal, ...
@@ -1117,8 +1170,9 @@ function [obj, results] = T1dispersion(obj, slice, userOptions)
 %T1DISPERSION Simple magnitude-domain inversion-recovery dispersion fit.
 %
 % This is the default for both imaging ROIs and SVS. It fits the ordinary
-% unweighted model A*exp(-t/T1)+C after automatically selecting one common
-% early-negative/late-positive transition from all fields. The former
+% unweighted model A*exp(-t/T1)+C after automatically selecting an early-negative/late-positive
+% transition independently for each field. Interactive manual point-polarity
+% overrides are honoured by the simple fitter. The former
 % phase-aware implementation is retained as T1dispersionAdvanced.
 
     if nargin < 2 || isempty(slice)
@@ -1789,6 +1843,18 @@ end
 function polarity = fieldPolarityConstraints(obj, opts, fieldIndex, sampleCount)
     negative = polarityOptionForField(opts.forcedNegativeIndices, fieldIndex);
     positive = polarityOptionForField(opts.forcedPositiveIndices, fieldIndex);
+    if memberExists(obj, 'manual_negative_indices') && ...
+            ~isempty(obj.manual_negative_indices)
+        manualNegative = polarityOptionForField( ...
+            obj.manual_negative_indices, fieldIndex);
+        negative = [negative(:); manualNegative(:)];
+    end
+    if memberExists(obj, 'manual_positive_indices') && ...
+            ~isempty(obj.manual_positive_indices)
+        manualPositive = polarityOptionForField( ...
+            obj.manual_positive_indices, fieldIndex);
+        positive = [positive(:); manualPositive(:)];
+    end
     if memberExists(obj, 'manual_polarity_flips') && ...
             ~isempty(obj.manual_polarity_flips)
         manualNegative = polarityOptionForField( ...

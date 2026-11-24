@@ -1,4 +1,4 @@
-function obj = open_mrifile()
+function [obj, loadReport, loadFailures, prepared] = open_mrifile(options)
 % Open MRI data for reconstruction.
 % - Option 1: choose a folder -> reconstruct all .dat files (recursive), excluding any under a 'proc' folder
 % - Option 2: cancel folder dialog -> choose file(s) via uigetfile (supports .MRD, .mat, .dat)
@@ -6,6 +6,11 @@ function obj = open_mrifile()
 % Returns:
 %   obj : cell array of ImageReconCore objects (or empty {} on cancel / no valid files)
 
+if nargin < 1, options = struct(); end
+reprocess = isfield(options,'reprocess') && options.reprocess;
+loadReport = []; loadFailures = struct('sequenceIndex',{},'exception',{});
+prepared = false;
+pipeline = isfield(options,'pipeline') && options.pipeline;
 persistent lastFolder
 obj = {};
 
@@ -45,6 +50,12 @@ if ~isequal(rootFolder, 0)
         return;
     end
 
+    if pipeline
+        [obj,loadReport,loadFailures] = ffc_load_raw_pipeline({datList.folder},rootFolder,options);
+        prepared = true;
+        return;
+    end
+
     n = numel(datList);
     obj  = cell(1, n);
     ok   = false(1, n);
@@ -56,16 +67,7 @@ if ~isequal(rootFolder, 0)
         thisDatFolder = datList(k).folder;
 
         try
-            % Important: read_raw_data_Cameleon expects a dataset FOLDER in your current usage
-            [data, par, data_name] = read_raw_data_Cameleon(thisDatFolder, []);
-
-            % Keep all variables local per worker
-            file = struct();
-            file.data = data;
-            file.par  = par;
-            file.data_name = data_name; %#ok<NASGU>
-
-            obj{k} = ImageReconCore(file, '.dat', 1);
+            obj{k} = ffc_open_cameleon_scan(thisDatFolder,rootFolder,reprocess);
             ok(k)  = true;
 
         catch ME
@@ -123,6 +125,15 @@ else
     fileList = nmrfilename;
 end
 
+% The network-optimised path also covers raw-only file selections.
+[~,~,extensions] = cellfun(@fileparts,fileList,'UniformOutput',false);
+if pipeline && all(strcmpi(extensions,'.dat'))
+    folders = cellfun(@(f) fileparts(fullfile(nmrpathname,f)),fileList,'UniformOutput',false);
+    [obj,loadReport,loadFailures] = ffc_load_raw_pipeline(folders,nmrpathname,options);
+    prepared = true;
+    return;
+end
+
 out = {};  %#ok<NASGU>
 obj = {};
 outIdx = 0;
@@ -142,7 +153,9 @@ for n = 1:numel(fileList)
             if isfield(file, 'saveList') && ~isempty(file.saveList)
                 if isa(file.saveList, 'ImageReconCore')
                     outIdx = outIdx + 1;
-                    obj{outIdx} = file.saveList; %#ok<AGROW>
+                    scan = file.saveList;
+                    scan.disk_cache_source = ''; scan.disk_cache_identity = [];
+                    obj{outIdx} = scan; %#ok<AGROW>
                 elseif iscell(file.saveList)
                     % Filter to whitelist imaging sequences (as in your original code)
                     objects = cellfun(@class, file.saveList, 'UniformOutput', false);
@@ -159,6 +172,7 @@ for n = 1:numel(fileList)
                         try
                             if isa(file.saveList{seqIdx}, 'ImageReconCore')
                                 scan = file.saveList{seqIdx};
+                                scan.disk_cache_source = ''; scan.disk_cache_identity = [];
                             else
                                 fid = fopen(fullpath);
                                 scan = ImageReconCore(fid, filetype, seqIdx, file.saveList{seqIdx});
@@ -181,14 +195,9 @@ for n = 1:numel(fileList)
             thisFolder = fileparts(fullpath);
 
             try
-                [data, par, data_name] = read_raw_data_Cameleon(thisFolder, []);
-                file = struct();
-                file.data = data;
-                file.par  = par;
-                file.data_name = data_name; %#ok<NASGU>
-
+                scan = ffc_open_cameleon_scan(thisFolder,nmrpathname,reprocess);
                 outIdx = outIdx + 1;
-                obj{outIdx} = ImageReconCore(file, '.dat', 1); %#ok<AGROW>
+                obj{outIdx} = scan; %#ok<AGROW>
 
             catch ME
                 warning('Failed to reconstruct %s\n  %s', fullpath, ME.message);

@@ -1,0 +1,10 @@
+CVI contours TEST12
+
+- Adds registered cvi42 contours as binary FCI-plane masks for ROI T1 dispersion.
+- New T1 dispersion mask selector in the CVI Registration dialog.
+- Supported masks: saved LGE enhancement, LV myocardium (epi minus endo), LV blood pool, RV blood pool, enhanced-area reference ROI and remote-myocardium ROI when present.
+- Preview Mask shows the rasterised binary-mask boundary as a dashed green outline on the current FCI slice.
+- Export Mask sends the native logical mask and metadata to the MATLAB base workspace.
+- Run T1 dispersion applies the native binary mask directly to ImageReconCore.T1dispersion, without requiring a manually drawn ROI.
+- The mask uses the same 3-D registration, in-plane rotation and display-mirror corrections as the visible CVI contour overlay.
+- T1 dispersion remains restricted to the acquired FCI plane, matching the existing manual ROI workflow.

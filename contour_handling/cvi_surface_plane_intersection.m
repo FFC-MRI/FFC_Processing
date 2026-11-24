@@ -20,37 +20,13 @@ function [x,y,segmentsPatient] = cvi_surface_plane_intersection(surface,view,reg
     Rz=[cz -sz 0;sz cz 0;0 0 1];
     R = Rz*Ry*Rx;
 
-    % Optional handedness correction. A true mirror reflection has
-    % determinant -1 and therefore cannot be produced by any combination of
-    % rigid rotations/translations.  Reflect about the registered source
-    % centre using axes frozen to the selected FCI target view.  Keeping this
-    % separate from R also means subsequent angle adjustments remain proper
-    % rigid-body rotations.
-    M = eye(3);
-    if isfield(registration,'mirrorLeftRight') && logical(registration.mirrorLeftRight)
-        if isfield(registration,'targetBasisXPatient') && ...
-                numel(registration.targetBasisXPatient) == 3
-            mirrorAxis = double(registration.targetBasisXPatient(:));
-        else
-            mirrorAxis = double(view.basisXPatient(:));
-        end
-        if norm(mirrorAxis) > 0
-            mirrorAxis = mirrorAxis ./ norm(mirrorAxis);
-            M = (eye(3) - 2.*(mirrorAxis*mirrorAxis.')) * M;
-        end
-    end
-    if isfield(registration,'mirrorUpDown') && logical(registration.mirrorUpDown)
-        if isfield(registration,'targetBasisYPatient') && ...
-                numel(registration.targetBasisYPatient) == 3
-            mirrorAxis = double(registration.targetBasisYPatient(:));
-        else
-            mirrorAxis = double(view.basisYPatient(:));
-        end
-        if norm(mirrorAxis) > 0
-            mirrorAxis = mirrorAxis ./ norm(mirrorAxis);
-            M = (eye(3) - 2.*(mirrorAxis*mirrorAxis.')) * M;
-        end
-    end
+    % Mirror controls are deliberately NOT applied here in patient space.
+    % They are a display-handedness correction, not part of the physical
+    % rigid registration. Applying them in the frozen target basis made the
+    % apparent L/R axis depend on which FCI scan happened to be selected when
+    % the registration target was captured. TEST10 applies the reflection
+    % after projection into displayed image axes, so left/right always means
+    % horizontal on screen and up/down always means vertical.
 
     % A separate in-plane control is easier to use for the common case in
     % which the clinical contours have the correct tilt but need rotating
@@ -76,8 +52,7 @@ function [x,y,segmentsPatient] = cvi_surface_plane_intersection(surface,view,reg
             R = Rin * R;
         end
     end
-    V = (M * (V-sourceCenter).').';
-    V = (R * V.').';
+    V = (R * (V-sourceCenter).').';
     V = V + targetCenter + T;
 
     p0 = double(view.slicePointPatientMm(:).');
@@ -124,5 +99,20 @@ function [x,y,segmentsPatient] = cvi_surface_plane_intersection(surface,view,reg
         x = [x;xs(1);xs(2);NaN]; %#ok<AGROW>
         y = [y;ys(1);ys(2);NaN]; %#ok<AGROW>
         segmentsPatient = [segmentsPatient;points;[NaN NaN NaN]]; %#ok<AGROW>
+    end
+
+    % Apply optional handedness correction in DISPLAY coordinates about the
+    % projected registered contour-stack centre. Translation is therefore
+    % unchanged when a mirror is toggled, and the mirror axis cannot rotate
+    % merely because a different registration target basis was captured.
+    registeredCentre = targetCenter + T;
+    centreRel = registeredCentre - displayCenter;
+    mirrorCentreX = centreRel * bx.';
+    mirrorCentreY = centreRel * by.';
+    if isfield(registration,'mirrorLeftRight') && logical(registration.mirrorLeftRight)
+        x = 2 .* mirrorCentreX - x;
+    end
+    if isfield(registration,'mirrorUpDown') && logical(registration.mirrorUpDown)
+        y = 2 .* mirrorCentreY - y;
     end
 end

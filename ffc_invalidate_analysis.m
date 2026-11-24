@@ -6,7 +6,7 @@ function scan = ffc_invalidate_analysis(scan)
     scan.dispersioncurve = [];
     if isstruct(scan.param)
         fields = fieldnames(scan.param);
-        scan.param = rmfield(scan.param,fields(startsWith(fields,'SimpleIR')));
+        scan.param = rmfield(scan.param,fields(startsWith(fields,'SimpleIR') | strcmp(fields,'T1DispersionModelFit')));
     end
     scan.magnitude_generation = scan.magnitude_generation + 1;
 end

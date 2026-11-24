@@ -1,3 +1,6 @@
+> TEST25: imported contours stay in DICOM LPS. FCI geometry is converted to LPS
+> by the shared geometry helper. Older RAH descriptions below are historical.
+
 # cvi42 contour import
 
 This edition can import Circle cvi42 ventricular contours and overlay them on FCI images.

@@ -1,0 +1,23 @@
+CVI contours TEST13
+===================
+
+Interactive inversion-recovery polarity editing
+------------------------------------------------
+When "Check fits" is enabled for an ROI or CVI-mask T1 dispersion analysis,
+the app now opens an interactive fit diagnostic rather than the legacy
+read-only dashboard.
+
+- Click any recovery data point to force the opposite signed polarity.
+- The fit is recalculated immediately for all evolution fields.
+- Manually constrained points are drawn as square markers.
+- "Reset manual signs" removes all user polarity constraints and returns to
+  automatic polarity selection.
+- The physical IR model remains a single monotonic recovery with at most one
+  zero crossing. A click that cannot be reconciled with that model is rejected.
+- Manual negative/positive sample constraints are stored on the scan object and
+  survive subsequent refits until reset.
+
+The modern ROI T1dispersion fit does not use one fixed number of negative
+samples for every field. It estimates the recovery polarity independently per
+field. The older simple voxel-wise T1 map implementation still uses a common,
+data-selected negative prefix; that mapping path is unchanged in TEST13.

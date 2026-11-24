@@ -18,6 +18,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         ExportstackedimagesButton      matlab.ui.control.Button
         ExportallimagesButton          matlab.ui.control.Button
         ExportscantoworkspaceButton    matlab.ui.control.Button
+        ExportEnhancedDICOMButton      matlab.ui.control.Button
         Panel_2                        matlab.ui.container.Panel
         BackgroundselectionButton      matlab.ui.control.StateButton
         ReprocessingButton             matlab.ui.control.StateButton
@@ -87,6 +88,12 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         CompassKey = []
         KspaceKey = []
         ViewStates = {}
+        CurrentTaskIndex = []
+        LoadingDataset = false
+        LoadProgressDialog = []
+        LastLoadReport = []
+        CVIOverlayKey = []
+        CVIOverlayData = cell(1,6)
         CurrentTaskKind = ''
         JobRunner = []
         FilterDialogs = []
@@ -101,21 +108,29 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         cviData = []
         cviRegistration = struct()
         CVIOverlayHandles = []
+        CVIMaskPreviewHandle = []
         cviDialog = []
         cviDialogControls = struct()
         cviMenuHandles = struct()
         NoiseWhiteningCheckBoxHandle = []
         ViewOrientationDropDownHandle = []
         ViewOrientationLabelHandle = []
+        T1FitDiagnosticFigure = []
+        T1FitDiagnosticState = struct()
+        T1DispersionResultsFigure = []
+        T1DispersionFitFigure = []
+        RelaxometryColorbar = []
     end
     
     methods (Access = private)
         
         function   activeimage(app)
+            taskRunning = ~isempty(app.JobRunner) && app.JobRunner.isRunning();
+            if taskRunning, setTaskBusy(app,false); end
             app.currentscan = app.ScanList.Value;
             % The viewer consumes combined images; the public core API can
             % still retain per-receiver RSSQ images for external analyses.
-            app.scan_data{app.currentscan}.retain_coil_images = false;
+            app.scan_data{app.currentscan} = ffc_normalize_viewer_scan(app.scan_data{app.currentscan});
             if scanIsSVS(app, app.scan_data{app.currentscan})
                 app.svsOverlayScan = app.currentscan;
             elseif scanIsImaging(app, app.scan_data{app.currentscan})
@@ -258,6 +273,17 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             app.MultichannelDropDown.Value     = selectedReceivers;
             %kspace to image space with selected recon parameters
             if ~ffc_reconstruction_valid(app.scan_data{app.currentscan})
+                if taskRunning
+                    % A changed selection does not cancel work on another scan.
+                    % Completion re-enters activeimage and services this request.
+                    cla(app.axis_image); cla(app.axis_kspace);
+                    message = 'Waiting for current reconstruction...';
+                    if app.CurrentTaskIndex == app.currentscan, message = 'Reconstructing...'; end
+                    text(app.axis_image,0.5,0.5,message,'Units','normalized', ...
+                        'HorizontalAlignment','center');
+                    setTaskBusy(app,true,app.CurrentTaskKind);
+                    return;
+                end
                 startScanTask(app,'reconstruct',struct('force',false));
                 return;
             end
@@ -292,6 +318,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 update3DFFTDropDown(app);
             end
             
+            if taskRunning, setTaskBusy(app,true,app.CurrentTaskKind); end
             drawimages(app)
 
 
@@ -372,7 +399,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 end
                 app.BusyControls = {};
                 app.RebuildImagesButton.Text = 'Rebuild Images';
-                app.UIFigure.Name = 'FFC Processing - Performance Edition + CVI contours TEST 9';
+                app.UIFigure.Name = 'FFC Processing - Performance Edition + Cleanup Fix TEST 29';
             end
         end
 
@@ -382,17 +409,18 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 app.JobRunner.cancel();
             end
             app.CurrentTaskKind = '';
+            app.CurrentTaskIndex = [];
             setTaskBusy(app,false);
         end
 
         function rollbackReconstructionSettings(app)
-            if ~strcmp(app.CurrentTaskKind,'reconstruct') || isempty(app.currentscan), return; end
-            scan = app.scan_data{app.currentscan};
+            if ~strcmp(app.CurrentTaskKind,'reconstruct') || isempty(app.CurrentTaskIndex), return; end
+            scan = app.scan_data{app.CurrentTaskIndex};
             if isempty(scan.reconstruction_key), return; end
             names = {'fft_size','fft_size_3d','window_size','window_function', ...
                 'multichannel_recon','combination','biascorrect','noise_whitening'};
             for i = 1:numel(names), scan.(names{i}) = scan.reconstruction_key.(names{i}); end
-            app.scan_data{app.currentscan} = scan;
+            app.scan_data{app.CurrentTaskIndex} = scan;
         end
 
         function closeFilterDialogs(app)
@@ -407,6 +435,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             if ~strcmp(kind,'filter'), closeFilterDialogs(app); end
             app.CurrentTaskKind = kind;
             index = app.currentscan;
+            app.CurrentTaskIndex = index;
             dataset = app.DatasetGeneration;
             sourceGeneration = app.scan_data{index}.magnitude_generation;
             if strcmp(kind,'reconstruct') && isempty(app.scan_data{index}.magimage)
@@ -423,6 +452,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         function finishScanTask(app,result,index,dataset,sourceGeneration,kind)
             if ~isvalid(app) || ~isgraphics(app.UIFigure), return; end
             app.CurrentTaskKind = '';
+            app.CurrentTaskIndex = [];
             setTaskBusy(app,false);
             if dataset ~= app.DatasetGeneration || index > numel(app.scan_data) || ...
                     sourceGeneration ~= app.scan_data{index}.magnitude_generation
@@ -433,20 +463,16 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 result.(name{1}) = app.scan_data{index}.(name{1});
             end
             app.scan_data{index} = result;
-            if index == app.currentscan
-                if strcmp(kind,'reconstruct')
-                    activeimage(app);
-                else
-                    drawimages(app);
-                    updateFilterButtonTooltip(app);
-                end
-            end
+            if index ~= app.currentscan || ~strcmp(kind,'reconstruct'), saveViewState(app); end
+            activeimage(app);
+            updateFilterButtonTooltip(app);
         end
 
         function failScanTask(app,err)
             if ~isvalid(app) || ~isgraphics(app.UIFigure), return; end
             rollbackReconstructionSettings(app);
             app.CurrentTaskKind = '';
+            app.CurrentTaskIndex = [];
             setTaskBusy(app,false);
             if ~isempty(app.currentscan) && ffc_reconstruction_valid(app.scan_data{app.currentscan})
                 activeimage(app);
@@ -557,24 +583,8 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             if index < 1 || index > numel(app.scan_data)
                 return;
             end
-            localizer = app.scan_data{index};
-            if ~isempty(localizer.magimage)
-                return;
-            end
-            nChannels = max(1, double(localizer.n_receivers));
-            if isempty(localizer.multichannel_recon)
-                localizer.multichannel_recon = 1:nChannels;
-            end
-            if isempty(localizer.combination)
-                localizer.combination = 'Adaptive';
-            end
-            if isempty(localizer.biascorrect)
-                localizer.biascorrect = 'Off';
-            end
-            if isempty(localizer.noise_whitening)
-                localizer.noise_whitening = nChannels > 1;
-            end
-            localizer.retain_coil_images = false;
+            localizer = ffc_normalize_viewer_scan(app.scan_data{index});
+            if ffc_reconstruction_valid(localizer), return; end
             localizer = buildimages(localizer,false);
             app.scan_data{index} = localizer;
         end
@@ -672,10 +682,9 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 fieldIndex = min(app.EvolutionFieldDropDown.Value, ...
                     size(displayScan.magimage, 5));
             end
-            volume = displayScan.magimage(:, :, :, timeIndex, fieldIndex);
-            [image, view] = ffc_extract_anatomical_plane(volume, displayScan, ...
+            [image, view] = ffc_extract_anatomical_plane(displayScan.magimage, displayScan, ...
                 currentViewOrientation(app), app.SliceDropDown.Value, ...
-                currentDisplayTransform(app));
+                currentDisplayTransform(app),timeIndex,fieldIndex);
         end
 
         function drawOrientationCompass(app, view)
@@ -693,11 +702,10 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             % labels describe the pixels the viewer sees, not the array index.
             patientToDisplay = [view.basisXPatient, ...
                 -view.basisYPatient, view.basisNormalPatient].';
-            % RS2D subject convention: +X=R, +Y=A and +Z=H (therefore
-            % -X=L, -Y=P and -Z=F).
-            L = patientToDisplay * [-1; 0; 0];
+            % DICOM LPS: +X=L, +Y=P and +Z=H.
+            L = patientToDisplay * [1; 0; 0];
             R = -L;
-            A = patientToDisplay * [0; 1; 0];
+            A = patientToDisplay * [0; -1; 0];
             P = -A;
             H = patientToDisplay * [0; 0; 1];
             F = -H;
@@ -737,19 +745,26 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         end
 
         function drawCVIContourOverlay(app, view)
+            nTypes = 6;
             if isempty(app.CVIOverlayHandles) || ...
-                    numel(app.CVIOverlayHandles) ~= 3 || ...
+                    numel(app.CVIOverlayHandles) ~= nTypes || ...
                     any(~isgraphics(app.CVIOverlayHandles))
-                app.CVIOverlayHandles = gobjects(1,3);
-                app.CVIOverlayHandles(1) = line(app.axis_image,nan,nan, ...
-                    'Color',[1 0 0.45],'LineWidth',2.0, ...
-                    'HitTest','off','PickableParts','none');
-                app.CVIOverlayHandles(2) = line(app.axis_image,nan,nan, ...
-                    'Color',[0 0.9 0.9],'LineWidth',2.0, ...
-                    'HitTest','off','PickableParts','none');
-                app.CVIOverlayHandles(3) = line(app.axis_image,nan,nan, ...
-                    'Color',[0.95 0.85 0],'LineWidth',2.0, ...
-                    'HitTest','off','PickableParts','none');
+                if ~isempty(app.CVIOverlayHandles)
+                    try, delete(app.CVIOverlayHandles(isgraphics(app.CVIOverlayHandles))); catch, end
+                end
+                app.CVIOverlayHandles = gobjects(1,nTypes);
+                colours = [1 0 0.45; ...       % LV endocardium
+                           0 0.9 0.9; ...      % LV epicardium
+                           0.95 0.85 0; ...    % RV endocardium
+                           1 0.45 0; ...        % saved LGE enhancement boundary
+                           1 0.2 0.8; ...       % FWHM enhanced-area reference ROI
+                           0.15 0.45 1];        % remote myocardium reference ROI
+                widths = [2 2 2 2.6 1.5 1.5];
+                for q = 1:nTypes
+                    app.CVIOverlayHandles(q) = line(app.axis_image,nan,nan, ...
+                        'Color',colours(q,:),'LineWidth',widths(q), ...
+                        'HitTest','off','PickableParts','none');
+                end
             end
             set(app.CVIOverlayHandles,'Visible','off');
             if isempty(app.cviData) || isempty(fieldnames(app.cviRegistration)) || ...
@@ -761,22 +776,42 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 numel(app.cviData.series));
             series = app.cviData.series(seriesIndex);
             phaseIndex = app.cviRegistration.phaseIndex;
-            types = {'LVEndo','LVEpi','RVEndo'};
+            types = {'LVEndo','LVEpi','RVEndo','LGEEnhancement', ...
+                'LGEEnhancementReference','LGERemoteReference'};
             show = [app.cviRegistration.showLVEndo, ...
-                app.cviRegistration.showLVEpi,app.cviRegistration.showRVEndo];
+                app.cviRegistration.showLVEpi,app.cviRegistration.showRVEndo, ...
+                app.cviRegistration.showLGEEnhancement, ...
+                app.cviRegistration.showLGEEnhancementReference, ...
+                app.cviRegistration.showLGERemoteReference];
+            overlayKey = {view,app.cviRegistration};
+            reuseOverlay = isequaln(app.CVIOverlayKey,overlayKey);
+            if ~reuseOverlay, app.CVIOverlayData = cell(1,nTypes); end
             for t = 1:numel(types)
                 if ~show(t), continue; end
-                matches = strcmp({series.Surfaces.Type},types{t}) & ...
-                    [series.Surfaces.PhaseIndex] == phaseIndex;
+                if reuseOverlay
+                    xy = app.CVIOverlayData{t};
+                    if ~isempty(xy)
+                        set(app.CVIOverlayHandles(t),'XData',xy{1},'YData',xy{2},'Visible','on');
+                    end
+                    continue;
+                end
+                matches = strcmp({series.Surfaces.Type},types{t});
+                % Tissue Characterization enhancement is a static LGE mask.
+                % Normal cine/ROI surfaces remain phase-specific.
+                if ~strcmp(types{t},'LGEEnhancement')
+                    matches = matches & [series.Surfaces.PhaseIndex] == phaseIndex;
+                end
                 surfaceIndex = find(matches,1);
                 if isempty(surfaceIndex), continue; end
                 [x,y] = cvi_surface_plane_intersection( ...
                     series.Surfaces(surfaceIndex),view,app.cviRegistration, ...
                     series.SourceCenterPatientMm);
                 if ~isempty(x)
+                    app.CVIOverlayData{t} = {x,y};
                     set(app.CVIOverlayHandles(t),'XData',x,'YData',y,'Visible','on');
                 end
             end
+            app.CVIOverlayKey = overlayKey;
         end
 
         function importCVIContours(app)
@@ -799,6 +834,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 return;
             end
             app.cviData = cvi;
+            app.CVIOverlayKey = [];
             seriesIndex = cvi.defaultSeriesIndex;
             series = cvi.series(seriesIndex);
             phaseIndex = series.PhaseIndices(1);
@@ -824,7 +860,11 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 'targetNormalPatient',targetNormal, ...
                 'targetBasisXPatient',targetBasisX, ...
                 'targetBasisYPatient',targetBasisY, ...
-                'showLVEndo',true,'showLVEpi',true,'showRVEndo',true);
+                'showLVEndo',true,'showLVEpi',true,'showRVEndo',true, ...
+                'showLGEEnhancement',true, ...
+                'showLGEEnhancementReference',false, ...
+                'showLGERemoteReference',false, ...
+                'dispersionMaskSource','LGEEnhancement');
             if isfield(app.cviMenuHandles,'show') && isgraphics(app.cviMenuHandles.show)
                 app.cviMenuHandles.show.Checked = 'on';
             end
@@ -852,11 +892,13 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
 
         function clearCVIContours(app)
             app.cviData = [];
+            app.CVIOverlayKey = [];
             app.cviRegistration = struct();
             if ~isempty(app.CVIOverlayHandles)
                 delete(app.CVIOverlayHandles(isgraphics(app.CVIOverlayHandles)));
             end
             app.CVIOverlayHandles = [];
+            clearCVIMaskPreview(app);
             if ~isempty(app.cviDialog) && isgraphics(app.cviDialog), delete(app.cviDialog); end
             app.cviDialog = [];
             app.cviDialogControls = struct();
@@ -877,43 +919,46 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 return;
             end
             d = uifigure('Name','CVI Contour Registration', ...
-                'Position',[140 100 690 560],'Resize','off');
+                'Position',[140 70 720 620],'Resize','off');
             app.cviDialog = d;
             app.cviDialogControls = struct();
 
-            uilabel(d,'Text','Clinical series','Position',[20 515 95 22]);
-            app.cviDialogControls.seriesDrop = uidropdown(d,'Position',[120 515 545 22], ...
+            uilabel(d,'Text','Clinical series','Position',[20 575 95 22]);
+            app.cviDialogControls.seriesDrop = uidropdown(d,'Position',[120 575 575 22], ...
                 'ValueChangedFcn',@(src,event) cviSeriesChanged(app,src));
-            uilabel(d,'Text','Cardiac phase','Position',[20 480 95 22]);
-            app.cviDialogControls.phaseDrop = uidropdown(d,'Position',[120 480 545 22], ...
+            uilabel(d,'Text','Cardiac phase','Position',[20 540 95 22]);
+            app.cviDialogControls.phaseDrop = uidropdown(d,'Position',[120 540 575 22], ...
                 'ValueChangedFcn',@(src,event) cviPhaseChanged(app,src));
 
-            app.cviDialogControls.showEndo = uicheckbox(d,'Text','LV endocardium','Position',[20 440 120 22], ...
+            app.cviDialogControls.showEndo = uicheckbox(d,'Text','LV endocardium','Position',[20 500 120 22], ...
                 'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showLVEndo',src.Value));
-            app.cviDialogControls.showEpi = uicheckbox(d,'Text','LV epicardium','Position',[150 440 120 22], ...
+            app.cviDialogControls.showEpi = uicheckbox(d,'Text','LV epicardium','Position',[150 500 120 22], ...
                 'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showLVEpi',src.Value));
-            app.cviDialogControls.showRV = uicheckbox(d,'Text','RV endocardium','Position',[280 440 125 22], ...
+            app.cviDialogControls.showRV = uicheckbox(d,'Text','RV endocardium','Position',[280 500 125 22], ...
                 'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showRVEndo',src.Value));
+            app.cviDialogControls.showLGE = uicheckbox(d,'Text','LGE enhancement','Position',[420 500 130 22], ...
+                'Tooltip',{'Boundary of the saved cvi42 Tissue Characterization enhancement overlay'}, ...
+                'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showLGEEnhancement',src.Value));
+            app.cviDialogControls.showLGERef = uicheckbox(d,'Text','Enhanced-area reference ROI','Position',[20 470 185 22], ...
+                'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showLGEEnhancementReference',src.Value));
+            app.cviDialogControls.showRemoteRef = uicheckbox(d,'Text','Remote myocardium ROI','Position',[220 470 170 22], ...
+                'ValueChangedFcn',@(src,event) cviToggleChanged(app,'showLGERemoteReference',src.Value));
 
             uilabel(d,'Text','Rigid registration (clinical contour stack -> FCI)', ...
-                'FontWeight','bold','Position',[20 403 600 22]);
-            labels = {'R/L-axis translation (mm)','A/P-axis translation (mm)','H/F-axis translation (mm)', ...
+                'FontWeight','bold','Position',[20 435 600 22]);
+            labels = {'X translation (+Left, mm)','Y translation (+Posterior, mm)','Z translation (+Head, mm)', ...
                 'Rotation about R/L axis (deg)','Rotation about A/P axis (deg)', ...
                 'Rotation about H/F axis (deg)','In-plane rotation (deg)'};
             fields = gobjects(1,7);
             translationSliders = gobjects(1,3);
             for k = 1:7
-                y = 403-k*34;
+                y = 435-k*34;
                 uilabel(d,'Text',labels{k},'Position',[35 y 190 22]);
                 fields(k) = uieditfield(d,'numeric','Position',[235 y 85 22], ...
                     'ValueChangedFcn',@(src,event) cviNumericChanged(app,k,src.Value));
                 if k <= 3
-                    % Live translation sliders make manual cross-scanner
-                    % registration much easier than repeated numeric edits.
-                    % +/-250 mm comfortably covers the cardiac FOV while the
-                    % numeric field remains available for values outside it.
                     translationSliders(k) = uislider(d, ...
-                        'Position',[345 y+11 300 3], ...
+                        'Position',[345 y+11 330 3], ...
                         'Limits',[-250 250], ...
                         'MajorTicks',-250:50:250, ...
                         'ValueChangingFcn',@(src,event) cviTranslationSliderChanging(app,k,event.Value), ...
@@ -922,16 +967,25 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             end
             app.cviDialogControls.numericFields = fields;
             app.cviDialogControls.translationSliders = translationSliders;
-            % A reflection cannot be represented by the six rigid-body
-            % registration parameters.  Keep it as an explicit, separate
-            % handedness correction.  The axes are frozen to the FCI view
-            % chosen with "Use current FCI scan as target".
             app.cviDialogControls.mirrorUD = uicheckbox(d, ...
-                'Text','Mirror up/down','Position',[500 199 125 22], ...
+                'Text','Display mirror up/down','Position',[500 231 155 22], ...
                 'ValueChangedFcn',@(src,event) cviMirrorChanged(app,'mirrorUpDown',src.Value));
             app.cviDialogControls.mirrorLR = uicheckbox(d, ...
-                'Text','Mirror left/right','Position',[500 165 125 22], ...
+                'Text','Display mirror left/right','Position',[500 197 155 22], ...
                 'ValueChangedFcn',@(src,event) cviMirrorChanged(app,'mirrorLeftRight',src.Value));
+
+            uilabel(d,'Text','T1 dispersion mask','FontWeight','bold','Position',[20 153 115 22]);
+            app.cviDialogControls.maskDrop = uidropdown(d,'Position',[140 153 215 22], ...
+                'ValueChangedFcn',@(src,event) cviMaskSourceChanged(app,src.Value));
+            uibutton(d,'Text','Preview mask','Position',[370 150 90 28], ...
+                'Tooltip',{'Show the binary CVI mask on the current FCI slice'}, ...
+                'ButtonPushedFcn',@(src,event) previewCVIMask(app));
+            uibutton(d,'Text','Export mask','Position',[470 150 90 28], ...
+                'Tooltip',{'Export the native logical mask and metadata to the MATLAB base workspace'}, ...
+                'ButtonPushedFcn',@(src,event) exportCVIMask(app));
+            uibutton(d,'Text','Run T1 dispersion','Position',[570 150 125 28], ...
+                'Tooltip',{'Use this CVI-derived binary mask instead of drawing a freehand ROI'}, ...
+                'ButtonPushedFcn',@(src,event) runCVIT1Dispersion(app));
 
             uibutton(d,'Text','Use current FCI scan as target','Position',[20 105 180 28], ...
                 'Tooltip',{'Keep this FCI scan centre/normal fixed when changing displayed scans'}, ...
@@ -940,9 +994,9 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 'ButtonPushedFcn',@(src,event) resetCVIRegistration(app));
             app.cviDialogControls.visibleCheck = uicheckbox(d,'Text','Show contours','Position',[345 108 105 22], ...
                 'ValueChangedFcn',@(src,event) cviVisibilityChanged(app,src.Value));
-            app.cviDialogControls.statusLabel = uilabel(d,'Text','', 'Position',[20 43 645 52], ...
+            app.cviDialogControls.statusLabel = uilabel(d,'Text','', 'Position',[20 38 675 58], ...
                 'WordWrap','on');
-            uibutton(d,'Text','Close','Position',[575 12 90 28], ...
+            uibutton(d,'Text','Close','Position',[605 8 90 28], ...
                 'ButtonPushedFcn',@(src,event) closeCVIDialog(app));
             updateCVIDialog(app);
         end
@@ -959,13 +1013,20 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             if isempty(app.cviDialog) || ~isgraphics(app.cviDialog) || isempty(app.cviData), return; end
             controls = app.cviDialogControls;
             required = {'seriesDrop','phaseDrop','showEndo','showEpi','showRV', ...
-                'numericFields','translationSliders','mirrorLR','mirrorUD','visibleCheck','statusLabel'};
+                'showLGE','showLGERef','showRemoteRef','numericFields','translationSliders','mirrorLR','mirrorUD','maskDrop','visibleCheck','statusLabel'};
             for q = 1:numel(required)
                 if ~isfield(controls,required{q}), return; end
             end
             seriesDrop = controls.seriesDrop;
-            items = arrayfun(@(s) sprintf('%s (%d contours)',s.Description,s.ContourCount), ...
-                app.cviData.series,'UniformOutput',false);
+            items = cell(1,numel(app.cviData.series));
+            for q = 1:numel(app.cviData.series)
+                ss = app.cviData.series(q);
+                if isfield(ss,'LGEEnhancementAvailable') && ss.LGEEnhancementAvailable
+                    items{q} = sprintf('%s (%d contours; LGE enhancement)',ss.Description,ss.ContourCount);
+                else
+                    items{q} = sprintf('%s (%d contours)',ss.Description,ss.ContourCount);
+                end
+            end
             seriesDrop.Items = items;
             seriesDrop.ItemsData = 1:numel(items);
             seriesDrop.Value = app.cviRegistration.seriesIndex;
@@ -982,6 +1043,36 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             controls.showEndo.Value = app.cviRegistration.showLVEndo;
             controls.showEpi.Value = app.cviRegistration.showLVEpi;
             controls.showRV.Value = app.cviRegistration.showRVEndo;
+            if ~isfield(app.cviRegistration,'showLGEEnhancement'), app.cviRegistration.showLGEEnhancement = true; end
+            if ~isfield(app.cviRegistration,'showLGEEnhancementReference'), app.cviRegistration.showLGEEnhancementReference = false; end
+            if ~isfield(app.cviRegistration,'showLGERemoteReference'), app.cviRegistration.showLGERemoteReference = false; end
+            controls.showLGE.Value = app.cviRegistration.showLGEEnhancement;
+            controls.showLGERef.Value = app.cviRegistration.showLGEEnhancementReference;
+            controls.showRemoteRef.Value = app.cviRegistration.showLGERemoteReference;
+            [maskLabels,maskIds] = availableCVIMaskSources(app,series,app.cviRegistration.phaseIndex);
+            controls.maskDrop.Items = maskLabels;
+            controls.maskDrop.ItemsData = maskIds;
+            if ~isfield(app.cviRegistration,'dispersionMaskSource') || ...
+                    ~any(strcmp(maskIds,char(string(app.cviRegistration.dispersionMaskSource))))
+                if any(strcmp(maskIds,'LGEEnhancement'))
+                    app.cviRegistration.dispersionMaskSource = 'LGEEnhancement';
+                elseif any(strcmp(maskIds,'LVMyocardium'))
+                    app.cviRegistration.dispersionMaskSource = 'LVMyocardium';
+                elseif ~isempty(maskIds)
+                    app.cviRegistration.dispersionMaskSource = maskIds{1};
+                else
+                    app.cviRegistration.dispersionMaskSource = '';
+                end
+            end
+            if ~isempty(maskIds)
+                controls.maskDrop.Enable = 'on';
+                controls.maskDrop.Value = app.cviRegistration.dispersionMaskSource;
+            else
+                controls.maskDrop.Items = {'No mask available'};
+                controls.maskDrop.ItemsData = {''};
+                controls.maskDrop.Value = '';
+                controls.maskDrop.Enable = 'off';
+            end
             fields = controls.numericFields;
             if ~isfield(app.cviRegistration,'inPlaneRotationDeg')
                 app.cviRegistration.inPlaneRotationDeg = 0;
@@ -1019,10 +1110,15 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
                 planeAngle = acosd(min(1,max(-1,abs(dot(a,b)))));
                 planeText = sprintf(' Clinical/FCI plane-normal difference before registration: %.1f deg.',planeAngle);
             end
-            status.Text = sprintf(['Imported %d contours. Selected series: %d frames, %d cardiac phases. ', ...
-                '%d workspace contour(s) could not be matched.%s DICOM/FCI headers determine scale and orientation, but not absolute cross-scanner translation; translation starts from contour-centre to FCI-centre alignment. If anatomy is reflected, use the mirror controls.'], ...
-                numel(app.cviData.contours),series.NumberOfFrames,series.NumberOfPhases, ...
-                app.cviData.unmatchedContourCount,planeText);
+            lgeText = '';
+            if isfield(series,'LGEEnhancementAvailable') && series.LGEEnhancementAvailable
+                lgeText = sprintf(' Saved LGE enhancement recovered from %d slice overlay(s).',series.LGEOverlayCount);
+            end
+            duplicateCount = 0; unresolvedCount = app.cviData.unmatchedContourCount;
+            if isfield(app.cviData,'derivedDuplicateContourCount'), duplicateCount = app.cviData.derivedDuplicateContourCount; end
+            status.Text = sprintf(['Matched %d cvi42 contour objects. %d derived duplicate contour(s) were recognised and skipped; %d remain unresolved.%s%s ', ...
+                'Scale/orientation come from DICOM/FCI geometry; use translation and display-mirror controls for cross-scanner registration.'], ...
+                numel(app.cviData.contours),duplicateCount,unresolvedCount,lgeText,planeText);
         end
 
         function cviSeriesChanged(app,source)
@@ -1036,6 +1132,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
 
         function cviPhaseChanged(app,source)
             app.cviRegistration.phaseIndex = source.Value;
+            updateCVIDialog(app);
             redrawCVI(app);
         end
 
@@ -1108,6 +1205,1155 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             slider.Value = double(value);
         end
 
+        function cviMaskSourceChanged(app,value)
+            app.cviRegistration.dispersionMaskSource = char(string(value));
+            clearCVIMaskPreview(app);
+        end
+
+        function [labels,ids] = availableCVIMaskSources(app,series,phaseIndex) %#ok<INUSL>
+            labels = {}; ids = {};
+            if ~isfield(series,'Surfaces') || isempty(series.Surfaces), return; end
+            types = {series.Surfaces.Type};
+            phases = [series.Surfaces.PhaseIndex];
+            hasEndo = any(strcmp(types,'LVEndo') & phases == phaseIndex);
+            hasEpi = any(strcmp(types,'LVEpi') & phases == phaseIndex);
+            hasRV = any(strcmp(types,'RVEndo') & phases == phaseIndex);
+            hasLGE = any(strcmp(types,'LGEEnhancement'));
+            hasLGERef = any(strcmp(types,'LGEEnhancementReference') & phases == phaseIndex);
+            hasRemote = any(strcmp(types,'LGERemoteReference') & phases == phaseIndex);
+            if hasLGE
+                labels{end+1} = 'LGE enhancement'; ids{end+1} = 'LGEEnhancement'; %#ok<AGROW>
+            end
+            if hasEpi && hasEndo
+                labels{end+1} = 'LV myocardium (epi - endo)'; ids{end+1} = 'LVMyocardium'; %#ok<AGROW>
+            end
+            if hasEndo
+                labels{end+1} = 'LV blood pool'; ids{end+1} = 'LVCavity'; %#ok<AGROW>
+            end
+            if hasRV
+                labels{end+1} = 'RV blood pool'; ids{end+1} = 'RVCavity'; %#ok<AGROW>
+            end
+            if hasLGERef
+                labels{end+1} = 'Enhanced-area reference ROI'; ids{end+1} = 'LGEEnhancementReference'; %#ok<AGROW>
+            end
+            if hasRemote
+                labels{end+1} = 'Remote myocardium ROI'; ids{end+1} = 'LGERemoteReference'; %#ok<AGROW>
+            end
+        end
+
+        function [displayMask,nativeMask,view,details] = currentCVIBinaryMask(app)
+            if isempty(app.cviData) || isempty(fieldnames(app.cviRegistration))
+                error('FFCProcessingCVI:NoCVIContours','Import and register CVI contours first.');
+            end
+            if isempty(app.scan_data) || isempty(app.currentscan)
+                error('FFCProcessingCVI:NoFCIScan','Load an FCI imaging scan first.');
+            end
+            currentScan = app.scan_data{app.currentscan};
+            if scanIsSVS(app,currentScan)
+                error('FFCProcessingCVI:CVIMaskNeedsImaging', ...
+                    'CVI binary masks can only be applied to an imaging scan.');
+            end
+            view = ffc_anatomical_plane_geometry(currentScan, ...
+                currentViewOrientation(app),app.SliceDropDown.Value, ...
+                currentDisplayTransform(app));
+            if view.normalDimension ~= 3
+                error('FFCProcessingCVI:CVIMaskAcquiredPlaneOnly', ...
+                    ['CVI T1-dispersion masks currently use the acquired FCI planes. ', ...
+                     'Switch View to %s before generating the mask.'], ...
+                     acquiredPlaneName(app,currentScan));
+            end
+            timeIndex = min(app.EvolutionTimeDropDown.Value,size(currentScan.magimage,4));
+            fieldIndex = min(app.EvolutionFieldDropDown.Value,size(currentScan.magimage,5));
+            volume = currentScan.magimage(:,:,:,timeIndex,fieldIndex);
+            [displayImage,view] = ffc_extract_anatomical_plane(volume,currentScan, ...
+                currentViewOrientation(app),app.SliceDropDown.Value, ...
+                currentDisplayTransform(app));
+            seriesIndex = min(max(round(app.cviRegistration.seriesIndex),1),numel(app.cviData.series));
+            series = app.cviData.series(seriesIndex);
+            sourceName = char(string(app.cviRegistration.dispersionMaskSource));
+            [displayMask,details] = cvi_series_plane_binary_mask(series, ...
+                app.cviRegistration.phaseIndex,series.SourceCenterPatientMm, ...
+                view,app.cviRegistration,size(displayImage),sourceName);
+            nativeMask = ffc_restore_native_plane_mask(displayMask,view);
+            details.nativePixelCount = nnz(nativeMask);
+            details.sliceIndex = view.sliceIndex;
+            details.seriesIndex = seriesIndex;
+            details.seriesDescription = series.Description;
+            details.phaseIndex = app.cviRegistration.phaseIndex;
+            details.registration = app.cviRegistration;
+        end
+
+        function previewCVIMask(app)
+            try
+                [displayMask,~,view,details] = currentCVIBinaryMask(app);
+            catch err
+                uialert(app.UIFigure,err.message,'Could not create CVI mask');
+                return;
+            end
+            clearCVIMaskPreview(app);
+            try
+                boundaries = bwboundaries(displayMask,'noholes');
+            catch
+                boundaries = bwboundaries(displayMask);
+            end
+            rows=size(displayMask,1); cols=size(displayMask,2);
+            px=double(view.fovX)/cols; py=double(view.fovY)/rows;
+            xx=[]; yy=[];
+            for k=1:numel(boundaries)
+                b=boundaries{k};
+                if isempty(b), continue; end
+                x=-double(view.fovX)/2 + (double(b(:,2))-0.5)*px;
+                y=-double(view.fovY)/2 + (double(b(:,1))-0.5)*py;
+                xx=[xx;x;NaN]; yy=[yy;y;NaN]; %#ok<AGROW>
+            end
+            app.CVIMaskPreviewHandle = line(app.axis_image,xx,yy, ...
+                'Color',[0.2 1 0.2],'LineWidth',3,'LineStyle','--', ...
+                'HitTest','off','PickableParts','none');
+            if isfield(app.cviDialogControls,'statusLabel') && ...
+                    isgraphics(app.cviDialogControls.statusLabel)
+                app.cviDialogControls.statusLabel.Text = sprintf( ...
+                    '%s mask: %d pixels (%.1f mm^2) on FCI slice %d. Dashed green = binary-mask boundary.', ...
+                    details.sourceLabel,details.pixelCount,details.areaMm2,details.sliceIndex);
+            end
+        end
+
+        function clearCVIMaskPreview(app)
+            if ~isempty(app.CVIMaskPreviewHandle)
+                try
+                    delete(app.CVIMaskPreviewHandle(isgraphics(app.CVIMaskPreviewHandle)));
+                catch
+                end
+            end
+            app.CVIMaskPreviewHandle = [];
+        end
+
+        function exportCVIMask(app)
+            try
+                [displayMask,nativeMask,~,details] = currentCVIBinaryMask(app);
+            catch err
+                uialert(app.UIFigure,err.message,'Could not create CVI mask');
+                return;
+            end
+            baseName = matlab.lang.makeValidName(sprintf('CVI_%s_mask',details.source));
+            existing = evalin('base','who');
+            maskName = matlab.lang.makeUniqueStrings(baseName,existing);
+            assignin('base',maskName,logical(nativeMask));
+            infoName = matlab.lang.makeUniqueStrings([maskName '_info'],[existing;{maskName}]);
+            info = details;
+            info.displayMask = logical(displayMask);
+            info.nativeMaskVariable = maskName;
+            assignin('base',infoName,info);
+            uialert(app.UIFigure,sprintf('Exported logical mask as %s and metadata as %s.', ...
+                maskName,infoName),'CVI mask exported');
+        end
+
+        function runCVIT1Dispersion(app)
+            if isempty(app.scan_data) || isempty(app.currentscan), return; end
+            currentScan = app.scan_data{app.currentscan};
+            if scanIsSVS(app,currentScan)
+                uialert(app.UIFigure,'Select an FCI imaging scan for a CVI-derived ROI.','Select imaging scan');
+                return;
+            end
+            if size(currentScan.magimage,4) < 2
+                uialert(app.UIFigure,'The selected scan does not contain multiple evolution times.','No T1 dispersion data');
+                return;
+            end
+            try
+                [displayMask,nativeMask,view,details] = currentCVIBinaryMask(app); %#ok<ASGLU>
+            catch err
+                uialert(app.UIFigure,err.message,'Could not create CVI mask');
+                return;
+            end
+            showFitDiagnostic = logical(app.CheckfitsButton.Value);
+            currentScan.checkfit = showFitDiagnostic;
+            currentScan.R1T1 = app.DisplayingasT1Button.Value;
+            currentScan.mask = logical(nativeMask);
+            try
+                if ~isstruct(currentScan.param), currentScan.param = struct(); end
+                currentScan.param.CVIDispersionMask = rmfieldIfPresent(details,'registration');
+                currentScan.param.CVIDispersionMask.mask = logical(nativeMask);
+                currentScan.param.CVIDispersionMask.registration = app.cviRegistration;
+            catch
+            end
+            try
+                % The app supplies its own interactive Check-fits window so
+                % suppress the legacy read-only dashboard for this call.
+                [currentScan,results] = T1dispersion(currentScan,view.sliceIndex, ...
+                    struct('showDashboard',false,'showFits',false, ...
+                    'makeDispersionPlot',~showFitDiagnostic, ...
+                    'plausibleT1RangeMs',[20 1500]));
+                currentScan=clearStoredDispersionModelFit(app,currentScan);
+            catch err
+                fprintf(2,'%s\n',getReport(err,'extended','hyperlinks','off'));
+                uialert(app.UIFigure,err.message,'CVI-mask T1 dispersion failed');
+                return;
+            end
+            try
+                results.maskSource = details.source;
+                results.maskSourceLabel = details.sourceLabel;
+                results.maskPixelCount = nnz(nativeMask);
+                results.maskAreaMm2 = details.areaMm2;
+                results.cviSeries = details.seriesDescription;
+                results.cviPhaseIndex = details.phaseIndex;
+                currentScan.T1FitResults = results;
+            catch
+            end
+            diagnosticScanIndex = app.currentscan;
+            app.scan_data{diagnosticScanIndex} = currentScan;
+            previewCVIMask(app);
+            if showFitDiagnostic
+                openInteractiveT1FitDiagnostic(app,diagnosticScanIndex,view.sliceIndex);
+            end
+        end
+
+        function openInteractiveT1FitDiagnostic(app,scanIndex,sliceIndex)
+            if isempty(app.scan_data) || scanIndex < 1 || ...
+                    scanIndex > numel(app.scan_data)
+                return;
+            end
+            scan = app.scan_data{scanIndex};
+            if ~isprop(scan,'T1FitResults') || isempty(scan.T1FitResults) || ...
+                    ~isstruct(scan.T1FitResults) || ...
+                    ~isfield(scan.T1FitResults,'field')
+                return;
+            end
+            try
+                if ~isempty(app.T1FitDiagnosticFigure) && ...
+                        isgraphics(app.T1FitDiagnosticFigure)
+                    delete(app.T1FitDiagnosticFigure);
+                end
+            catch
+            end
+            app.T1FitDiagnosticState = struct('scanIndex',scanIndex, ...
+                'sliceIndex',sliceIndex);
+            app.T1FitDiagnosticFigure = figure( ...
+                'Name','FCI T1 fit diagnostic - click near points to flip sign', ...
+                'NumberTitle','off','Color','w', ...
+                'Position',[80 80 1450 900], ...
+                'CloseRequestFcn',@(src,event) closeInteractiveT1FitDiagnostic(app,src));
+            redrawInteractiveT1FitDiagnostic(app);
+        end
+
+        function closeInteractiveT1FitDiagnostic(app,fig)
+            try
+                if isgraphics(fig), delete(fig); end
+            catch
+            end
+            app.T1FitDiagnosticFigure = [];
+            app.T1FitDiagnosticState = struct();
+        end
+
+        function redrawInteractiveT1FitDiagnostic(app)
+            if isempty(app.T1FitDiagnosticFigure) || ...
+                    ~isgraphics(app.T1FitDiagnosticFigure) || ...
+                    ~isstruct(app.T1FitDiagnosticState) || ...
+                    ~isfield(app.T1FitDiagnosticState,'scanIndex')
+                return;
+            end
+            fig = app.T1FitDiagnosticFigure;
+            scanIndex = app.T1FitDiagnosticState.scanIndex;
+            if scanIndex < 1 || scanIndex > numel(app.scan_data), return; end
+            scan = app.scan_data{scanIndex};
+            results = scan.T1FitResults;
+            if isempty(results) || ~isfield(results,'field'), return; end
+
+            isSimple = isfield(results.field,'timesMs') && ...
+                isfield(results.field,'signedSignal');
+
+            clf(fig);
+            fig.CloseRequestFcn = @(src,event) closeInteractiveT1FitDiagnostic(app,src);
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.012 0.947 0.56 0.044], ...
+                'HorizontalAlignment','left','BackgroundColor','w', ...
+                'FontWeight','bold','String', ...
+                ['Click ON or NEAR any numbered recovery point to flip its sign.  ', ...
+                 'A generous nearest-point hit area is used, so exact marker clicks are not required.  ', ...
+                 'Manual points are squares; remaining signs are re-selected automatically within 20--1500 ms.']);
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.585 0.952 0.105 0.035], ...
+                'String','Results table', ...
+                'Callback',@(src,event) openT1DispersionResults(app));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.698 0.952 0.105 0.035], ...
+                'String','Export CSV', ...
+                'Callback',@(src,event) exportT1DispersionResults(app,'csv'));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.811 0.952 0.105 0.035], ...
+                'String','Reset signs', ...
+                'Callback',@(src,event) resetManualT1Polarity(app));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.924 0.952 0.065 0.035], ...
+                'String','Refresh', ...
+                'Callback',@(src,event) redrawInteractiveT1FitDiagnostic(app));
+
+            panel = uipanel(fig,'Units','normalized','Position',[0.01 0.01 0.98 0.925], ...
+                'BorderType','none','BackgroundColor','w');
+            if isSimple
+                panelIndex = find(arrayfun(@(r) ~isempty(r.timesMs), results.field));
+            elseif isfield(results.field,'tSeconds')
+                panelIndex = find(arrayfun(@(r) ~isempty(r.tSeconds), results.field));
+            else
+                panelIndex = [];
+            end
+            if isempty(panelIndex)
+                uicontrol(panel,'Style','text','Units','normalized', ...
+                    'Position',[0.1 0.4 0.8 0.2],'BackgroundColor','w', ...
+                    'String','No fitted field contains recovery points.');
+                return;
+            end
+            nPanels = numel(panelIndex);
+            nColumns = max(2,ceil(sqrt(nPanels)));
+            fitRows = ceil(nPanels/nColumns);
+            overviewRows = 2;
+            nRows = overviewRows + fitRows;
+            layout = tiledlayout(panel,nRows,nColumns, ...
+                'TileSpacing','compact','Padding','compact');
+
+            overview = nexttile(layout,1,[overviewRows nColumns]);
+            valid = isfinite(results.R1) & results.R1 > 0 & ...
+                isfinite(results.fields_mT);
+            hold(overview,'on');
+            if any(valid)
+                if isSimple || ~isfield(results,'T1CI95') || ...
+                        isempty(results.T1CI95)
+                    plot(overview,results.fields_mT(valid),results.T1ms(valid), ...
+                        'o-','LineWidth',1.3,'HitTest','off');
+                else
+                    yValues = results.T1ms(valid);
+                    intervals = results.T1CI95(:,valid);
+                    lowerError = max(yValues-intervals(1,:),0);
+                    upperError = max(intervals(2,:)-yValues,0);
+                    lowerError(~isfinite(lowerError))=0;
+                    upperError(~isfinite(upperError))=0;
+                    errorbar(overview,results.fields_mT(valid),yValues, ...
+                        lowerError,upperError,'o-','LineWidth',1.3, ...
+                        'HitTest','off');
+                end
+                validIndices=find(valid);
+                for labelIndex=1:numel(validIndices)
+                    text(overview,results.fields_mT(validIndices(labelIndex)), ...
+                        results.T1ms(validIndices(labelIndex)), ...
+                        sprintf('  %d',validIndices(labelIndex)), ...
+                        'FontSize',8,'HitTest','off');
+                end
+            end
+            if any(valid) && all(results.fields_mT(valid)>0)
+                set(overview,'XScale','log');
+            end
+            grid(overview,'on');
+            xlabel(overview,'Evolution field (mT)');
+            ylabel(overview,'T_1 (ms)');
+            manualCount = manualT1ConstraintCount(app,scan);
+            if isSimple && isfield(results,'automaticNegativePrefixCount')
+                prefixText = mat2str(results.automaticNegativePrefixCount);
+                if isfield(results,'plausibleT1RangeMs') && ...
+                        numel(results.plausibleT1RangeMs)==2
+                    rangeText = sprintf('%.0f--%.0f ms', ...
+                        results.plausibleT1RangeMs(1),results.plausibleT1RangeMs(2));
+                else
+                    rangeText = 'configured range';
+                end
+                title(overview,sprintf(['Interactive inversion-recovery fits: %d/%d plausible T1 | ', ...
+                    '%d manual point(s) | T1 range %s | selected -ve prefixes %s'], ...
+                    sum(valid),numel(results.field),manualCount,rangeText,prefixText), ...
+                    'Interpreter','none');
+            else
+                title(overview,sprintf(['Interactive inversion-recovery fits: %d/%d finite T1 | ', ...
+                    '%d manually constrained point(s)'],sum(valid),numel(results.field),manualCount));
+            end
+            hold(overview,'off');
+
+            firstFitTile = overviewRows*nColumns + 1;
+            for k=1:nPanels
+                fieldIndex = panelIndex(k);
+                r = results.field(fieldIndex);
+                ax = nexttile(layout,firstFitTile+k-1);
+                hold(ax,'on');
+                negativeManual = manualT1Indices(app,scan,'manual_negative_indices',fieldIndex);
+                positiveManual = manualT1Indices(app,scan,'manual_positive_indices',fieldIndex);
+                manual = union(negativeManual,positiveManual);
+
+                if isSimple
+                    t = r.timesMs(:);
+                    displayed = real(r.signedSignal(:));
+                    xLabelText = 'Evolution time (ms)';
+                else
+                    displayed = r.displaySignal;
+                    if numel(displayed) ~= numel(r.tSeconds)
+                        displayed = real(r.rawSignal);
+                    end
+                    displayed = real(displayed(:));
+                    t = r.tSeconds(:);
+                    xLabelText = 'Evolution time (s)';
+                end
+
+                % Make manual polarity correction deliberately forgiving.
+                % Direct marker clicks still work, but the axes also select the
+                % nearest point within a generous normalized hit radius. This
+                % is much easier than having to hit a 6-pixel marker exactly.
+                for sampleIndex=1:numel(t)
+                    if ismember(sampleIndex,manual)
+                        marker='s'; markerSize=11; lineWidth=1.8;
+                    elseif ~isSimple && isfield(r,'outlierIndices') && ...
+                            ismember(sampleIndex,r.outlierIndices)
+                        marker='x'; markerSize=11; lineWidth=1.5;
+                    else
+                        marker='o'; markerSize=9; lineWidth=1.2;
+                    end
+                    h = plot(ax,t(sampleIndex),displayed(sampleIndex),marker, ...
+                        'MarkerSize',markerSize,'LineWidth',lineWidth, ...
+                        'ButtonDownFcn',@(src,event) toggleT1FitPointPolarity( ...
+                            app,fieldIndex,sampleIndex));
+                    try, h.PickableParts='all'; catch, end
+                    try, h.HitTest='on'; catch, end
+                    hLabel=text(ax,t(sampleIndex),displayed(sampleIndex), ...
+                        sprintf('  %d',sampleIndex),'FontSize',8, ...
+                        'VerticalAlignment','bottom','Interpreter','none');
+                    try, hLabel.HitTest='off'; catch, end
+                    try, hLabel.PickableParts='none'; catch, end
+                end
+
+                if isSimple
+                    fitT1 = r.T1ms;
+                    fitStyle = '-';
+                    if (~isfinite(fitT1) || fitT1<=0) && ...
+                            isfield(r,'rawT1ms') && isfinite(r.rawT1ms) && r.rawT1ms>0
+                        fitT1 = r.rawT1ms;
+                        fitStyle = '--';
+                    end
+                    if isfinite(fitT1) && fitT1>0 && ...
+                            isfinite(r.A) && isfinite(r.C)
+                        denseTime = linspace(min(t),max(t),300).';
+                        denseFit = r.A.*exp(-denseTime./fitT1)+r.C;
+                        hFit=plot(ax,denseTime,denseFit,fitStyle,'LineWidth',1.2);
+                        try, hFit.HitTest='off'; catch, end
+                    end
+                elseif isfinite(r.R1) && isfinite(r.B) && isfinite(r.C)
+                    denseTime = linspace(min(t),max(t),300).';
+                    denseFit = r.B-r.C.*exp(-r.R1.*denseTime);
+                    hFit=plot(ax,denseTime,denseFit,'-','LineWidth',1.2);
+                    try, hFit.HitTest='off'; catch, end
+                end
+                hZero=yline(ax,0,'--');
+                try, hZero.HitTest='off'; catch, end
+                grid(ax,'on');
+                xlabel(ax,xLabelText);
+                ylabel(ax,'Signed signal (AU)');
+                if isSimple
+                    if isfield(r,'fitWithinPlausibleRange') && ...
+                            ~r.fitWithinPlausibleRange && isfield(r,'rawT1ms')
+                        title(ax,sprintf('%d: %.4g mT | NO 20--1500 ms solution | best %.4g ms | -ve %d', ...
+                            fieldIndex,r.field_mT,r.rawT1ms,r.automaticNegativePrefixCount), ...
+                            'Interpreter','none');
+                    else
+                        title(ax,sprintf('%d: %.4g mT | T1 %.4g ms | selected -ve %d', ...
+                            fieldIndex,r.field_mT,r.T1ms,r.automaticNegativePrefixCount), ...
+                            'Interpreter','none');
+                    end
+                else
+                    title(ax,sprintf('%d: %.4g mT | T1 %.4g ms | %s', ...
+                        fieldIndex,r.field_mT,r.T1ms,shortT1DiagnosticQc(app,r.qc)), ...
+                        'Interpreter','none');
+                end
+                % Clicking the axes background near a point also flips the
+                % nearest point. Distances are normalized by the displayed
+                % axis ranges so the hit radius behaves consistently across
+                % fields with very different signal amplitudes/time ranges.
+                set(ax,'ButtonDownFcn',@(src,event) toggleNearestT1FitPointPolarity( ...
+                    app,fieldIndex,src,t,displayed));
+                try, ax.PickableParts='all'; catch, end
+                try, ax.HitTest='on'; catch, end
+                hold(ax,'off');
+            end
+        end
+
+        function toggleNearestT1FitPointPolarity(app,fieldIndex,ax,t,displayed)
+            if isempty(ax) || ~isgraphics(ax), return; end
+            try
+                cp=ax.CurrentPoint;
+                clickX=cp(1,1); clickY=cp(1,2);
+                xLimits=xlim(ax); yLimits=ylim(ax);
+                xRange=max(abs(diff(xLimits)),eps);
+                yRange=max(abs(diff(yLimits)),eps);
+                dx=(double(t(:))-clickX)./xRange;
+                dy=(double(displayed(:))-clickY)./yRange;
+                [distance,sampleIndex]=min(hypot(dx,dy));
+                % 0.10 corresponds to roughly 10%% of an axes span and is
+                % intentionally forgiving without making distant clicks act.
+                if isfinite(distance) && distance <= 0.10
+                    toggleT1FitPointPolarity(app,fieldIndex,sampleIndex);
+                end
+            catch
+                % A missed diagnostic click should never interrupt the fit UI.
+            end
+        end
+
+        function toggleT1FitPointPolarity(app,fieldIndex,sampleIndex)
+            if isempty(app.T1FitDiagnosticState) || ...
+                    ~isfield(app.T1FitDiagnosticState,'scanIndex'), return; end
+            scanIndex=app.T1FitDiagnosticState.scanIndex;
+            sliceIndex=app.T1FitDiagnosticState.sliceIndex;
+            if scanIndex<1 || scanIndex>numel(app.scan_data), return; end
+            scan=app.scan_data{scanIndex};
+            if isempty(scan.T1FitResults) || fieldIndex>numel(scan.T1FitResults.field)
+                return;
+            end
+            r=scan.T1FitResults.field(fieldIndex);
+            if isfield(r,'timesMs') && isfield(r,'signedSignal')
+                displayed=real(r.signedSignal(:));
+            elseif isfield(r,'displaySignal') && isfield(r,'tSeconds')
+                displayed=r.displaySignal;
+                if numel(displayed)~=numel(r.tSeconds)
+                    displayed=real(r.rawSignal);
+                end
+                displayed=real(displayed(:));
+            else
+                return;
+            end
+            if sampleIndex<1 || sampleIndex>numel(displayed), return; end
+            currentValue=real(displayed(sampleIndex));
+            nFields=numel(scan.fieldpoints);
+            if isempty(scan.manual_negative_indices)
+                scan.manual_negative_indices=cell(1,nFields);
+            elseif numel(scan.manual_negative_indices)<nFields
+                scan.manual_negative_indices{nFields}=[];
+            end
+            if isempty(scan.manual_positive_indices)
+                scan.manual_positive_indices=cell(1,nFields);
+            elseif numel(scan.manual_positive_indices)<nFields
+                scan.manual_positive_indices{nFields}=[];
+            end
+            neg=scan.manual_negative_indices{fieldIndex};
+            pos=scan.manual_positive_indices{fieldIndex};
+            neg=setdiff(neg,sampleIndex);
+            pos=setdiff(pos,sampleIndex);
+            if currentValue<0
+                pos=unique([pos(:).' sampleIndex]);
+            else
+                neg=unique([neg(:).' sampleIndex]);
+            end
+            scan.manual_negative_indices{fieldIndex}=neg;
+            scan.manual_positive_indices{fieldIndex}=pos;
+            previousResults=scan.T1FitResults;
+            try
+                [scan,newResults]=T1dispersion(scan,sliceIndex,struct( ...
+                    'showDashboard',false,'showFits',false, ...
+                    'makeDispersionPlot',false,'printSummary',false, ...
+                    'plausibleT1RangeMs',[20 1500]));
+                scan=clearStoredDispersionModelFit(app,scan);
+                newResults=copyT1ResultContext(app,previousResults,newResults);
+                scan.T1FitResults=newResults;
+                app.scan_data{scanIndex}=scan;
+                redrawInteractiveT1FitDiagnostic(app);
+            catch err
+                uialert(app.UIFigure,sprintf(['That polarity change could not be fitted.\n\n%s'], ...
+                    err.message),'T1 polarity change rejected');
+            end
+        end
+
+        function resetManualT1Polarity(app)
+            if isempty(app.T1FitDiagnosticState) || ...
+                    ~isfield(app.T1FitDiagnosticState,'scanIndex'), return; end
+            scanIndex=app.T1FitDiagnosticState.scanIndex;
+            sliceIndex=app.T1FitDiagnosticState.sliceIndex;
+            scan=app.scan_data{scanIndex};
+            previousResults=scan.T1FitResults;
+            scan.manual_negative_indices={};
+            scan.manual_positive_indices={};
+            scan.manual_polarity_flips={};
+            try
+                [scan,newResults]=T1dispersion(scan,sliceIndex,struct( ...
+                    'showDashboard',false,'showFits',false, ...
+                    'makeDispersionPlot',false,'printSummary',false, ...
+                    'plausibleT1RangeMs',[20 1500]));
+                scan=clearStoredDispersionModelFit(app,scan);
+                newResults=copyT1ResultContext(app,previousResults,newResults);
+                scan.T1FitResults=newResults;
+                app.scan_data{scanIndex}=scan;
+                redrawInteractiveT1FitDiagnostic(app);
+            catch err
+                uialert(app.UIFigure,err.message,'Could not reset T1 polarity');
+            end
+        end
+
+        function indices=manualT1Indices(app,scan,propertyName,fieldIndex) %#ok<INUSL>
+            indices=[];
+            try
+                value=scan.(propertyName);
+                if iscell(value) && fieldIndex<=numel(value) && ...
+                        ~isempty(value{fieldIndex})
+                    indices=unique(round(double(value{fieldIndex}(:).')));
+                end
+            catch
+            end
+        end
+
+        function count=manualT1ConstraintCount(app,scan)
+            count=0;
+            for fieldIndex=1:numel(scan.fieldpoints)
+                count=count+numel(manualT1Indices(app,scan, ...
+                    'manual_negative_indices',fieldIndex));
+                count=count+numel(manualT1Indices(app,scan, ...
+                    'manual_positive_indices',fieldIndex));
+            end
+        end
+
+        function openT1DispersionResults(app)
+            [scan,results,scanIndex,ok] = currentT1Results(app);
+            if ~ok, return; end
+            resultTable = buildT1DispersionResultsTable(app,scan,results);
+            try
+                if ~isempty(app.T1DispersionResultsFigure) && ...
+                        isgraphics(app.T1DispersionResultsFigure)
+                    delete(app.T1DispersionResultsFigure);
+                end
+            catch
+            end
+            fig=figure('Name','FCI T1 dispersion results', ...
+                'NumberTitle','off','Color','w','Position',[140 120 1120 620]);
+            app.T1DispersionResultsFigure=fig;
+
+            contextText=sprintf('Scan %d | %d evolution fields', ...
+                scanIndex,size(resultTable,1));
+            if isfield(results,'maskSourceLabel') && ~isempty(results.maskSourceLabel)
+                contextText=[contextText ' | ROI: ' char(string(results.maskSourceLabel))]; %#ok<AGROW>
+            end
+            if isfield(results,'slice') && ~isempty(results.slice)
+                contextText=[contextText sprintf(' | Slice %g',results.slice)]; %#ok<AGROW>
+            end
+            if isfield(results,'plausibleT1RangeMs') && numel(results.plausibleT1RangeMs)==2
+                contextText=[contextText sprintf(' | Plausible T1 %.0f--%.0f ms', ...
+                    results.plausibleT1RangeMs(1),results.plausibleT1RangeMs(2))]; %#ok<AGROW>
+            end
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.02 0.935 0.50 0.045], ...
+                'HorizontalAlignment','left','BackgroundColor','w', ...
+                'FontWeight','bold','String',contextText);
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.53 0.94 0.11 0.04],'String','Fit model', ...
+                'Callback',@(src,event) openT1DispersionModelFit(app));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.65 0.94 0.10 0.04],'String','Export CSV', ...
+                'Callback',@(src,event) exportT1DispersionResults(app,'csv'));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.76 0.94 0.10 0.04],'String','Export XLSX', ...
+                'Callback',@(src,event) exportT1DispersionResults(app,'xlsx'));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.87 0.94 0.11 0.04],'String','To workspace', ...
+                'Callback',@(src,event) exportT1DispersionResults(app,'workspace'));
+
+            uiData=table2cell(resultTable);
+            % Older MATLAB uitable versions accept char but not string scalars.
+            for ii = 1:numel(uiData)
+                if isstring(uiData{ii})
+                    uiData{ii} = char(uiData{ii});
+                end
+            end
+            columnNames={'Field (mT)','T1 (ms)','R1 (s^-1)','Status', ...
+                'Negative points','Manual constraints','RMSE','R^2','Raw T1 (ms)'};
+            uitable(fig,'Units','normalized','Position',[0.02 0.05 0.96 0.865], ...
+                'Data',uiData,'ColumnName',columnNames,'RowName',[], ...
+                'ColumnWidth',{90 90 90 185 110 125 100 90 100});
+        end
+
+        function exportT1DispersionResults(app,format)
+            [scan,results,~,ok] = currentT1Results(app);
+            if ~ok, return; end
+            resultTable=buildT1DispersionResultsTable(app,scan,results);
+            switch lower(format)
+                case 'workspace'
+                    existing=evalin('base','who');
+                    tableName=matlab.lang.makeUniqueStrings('T1_dispersion_results',existing);
+                    assignin('base',tableName,resultTable);
+                    existing=[existing;{tableName}];
+                    fullName=matlab.lang.makeUniqueStrings('T1_dispersion_fit_details',existing);
+                    assignin('base',fullName,results);
+                    uialert(app.UIFigure,sprintf( ...
+                        'Exported %s (table) and %s (full fit structure).', ...
+                        tableName,fullName),'T1 dispersion exported');
+                case 'csv'
+                    [file,path]=uiputfile({'*.csv','CSV file (*.csv)'}, ...
+                        'Export T1 dispersion results','T1_dispersion_results.csv');
+                    if isequal(file,0), return; end
+                    try
+                        writetable(resultTable,fullfile(path,file));
+                    catch err
+                        uialert(app.UIFigure,err.message,'Could not export CSV');
+                    end
+                case 'xlsx'
+                    [file,path]=uiputfile({'*.xlsx','Excel workbook (*.xlsx)'}, ...
+                        'Export T1 dispersion results','T1_dispersion_results.xlsx');
+                    if isequal(file,0), return; end
+                    try
+                        outputFile=fullfile(path,file);
+                        writetable(resultTable,outputFile,'Sheet','T1 dispersion');
+                        metadata=buildT1DispersionMetadataTable(app,results);
+                        if ~isempty(metadata)
+                            writetable(metadata,outputFile,'Sheet','Metadata', ...
+                                'WriteVariableNames',false);
+                        end
+                    catch err
+                        uialert(app.UIFigure,err.message,'Could not export Excel results');
+                    end
+                otherwise
+                    uialert(app.UIFigure,'Unknown T1 results export format.', ...
+                        'T1 dispersion export');
+            end
+        end
+
+        function [scan,results,scanIndex,ok]=currentT1Results(app)
+            scan=[]; results=[]; scanIndex=[]; ok=false;
+            if isempty(app.scan_data)
+                uialert(app.UIFigure,'No data set is loaded.','No T1 dispersion results');
+                return;
+            end
+            scanIndex=app.currentscan;
+            if isempty(scanIndex) || scanIndex<1 || scanIndex>numel(app.scan_data)
+                uialert(app.UIFigure,'Select a scan first.','No T1 dispersion results');
+                return;
+            end
+            scan=app.scan_data{scanIndex};
+            try
+                results=scan.T1FitResults;
+            catch
+                results=[];
+            end
+            if isempty(results) || ~isstruct(results) || ~isfield(results,'field')
+                uialert(app.UIFigure, ...
+                    'The selected scan does not yet contain T1 dispersion results.', ...
+                    'No T1 dispersion results');
+                return;
+            end
+            ok=true;
+        end
+
+        function output=buildT1DispersionResultsTable(app,scan,results) %#ok<INUSL>
+            n=numel(results.field);
+            field_mT=nan(n,1); T1_ms=nan(n,1); R1_s_1=nan(n,1);
+            status=strings(n,1); negativePoints=zeros(n,1);
+            manualConstraints=zeros(n,1); rmse=nan(n,1); rsquared=nan(n,1);
+            rawT1_ms=nan(n,1);
+            for k=1:n
+                r=results.field(k);
+                if isfield(r,'field_mT'), field_mT(k)=double(r.field_mT); end
+                if isfield(r,'T1ms'), T1_ms(k)=double(r.T1ms); end
+                if isfield(r,'R1'), R1_s_1(k)=double(r.R1); end
+                if isfield(r,'rawT1ms'), rawT1_ms(k)=double(r.rawT1ms); end
+                if isfield(r,'rmse'), rmse(k)=double(r.rmse); end
+                if isfield(r,'rsquare'), rsquared(k)=double(r.rsquare); end
+                if isfield(r,'negativeIndices') && ~isempty(r.negativeIndices)
+                    negativePoints(k)=numel(r.negativeIndices);
+                elseif isfield(r,'negativePrefixCount') && isfinite(r.negativePrefixCount)
+                    negativePoints(k)=double(r.negativePrefixCount);
+                end
+                if isfield(r,'manualOverrideCount') && isfinite(r.manualOverrideCount)
+                    manualConstraints(k)=double(r.manualOverrideCount);
+                else
+                    manualConstraints(k)=numel(manualT1Indices(app,scan, ...
+                        'manual_negative_indices',k))+numel(manualT1Indices(app,scan, ...
+                        'manual_positive_indices',k));
+                end
+                if isfield(r,'fitWithinPlausibleRange')
+                    if logical(r.fitWithinPlausibleRange) && isfinite(T1_ms(k))
+                        status(k)="OK";
+                    else
+                        status(k)="Rejected: no plausible T1";
+                    end
+                elseif isfield(r,'qc')
+                    status(k)=string(r.qc);
+                elseif isfinite(T1_ms(k))
+                    status(k)="OK";
+                else
+                    status(k)="Fit failed";
+                end
+            end
+            output=table(field_mT,T1_ms,R1_s_1,status,negativePoints, ...
+                manualConstraints,rmse,rsquared,rawT1_ms, ...
+                'VariableNames',{'Field_mT','T1_ms','R1_s_1','Status', ...
+                'NegativePoints','ManualConstraints','RMSE','Rsquared','RawT1_ms'});
+        end
+
+        function metadata=buildT1DispersionMetadataTable(app,results) %#ok<INUSL>
+            name={}; value={};
+            % Construct explicitly for compatibility with older MATLAB table IO.
+            if isfield(results,'modelName'), name{end+1,1}='Model'; value{end+1,1}=char(string(results.modelName)); end
+            if isfield(results,'modelEquation'), name{end+1,1}='Equation'; value{end+1,1}=char(string(results.modelEquation)); end
+            if isfield(results,'slice'), name{end+1,1}='Slice'; value{end+1,1}=num2str(results.slice); end
+            if isfield(results,'maskSourceLabel'), name{end+1,1}='ROI / mask'; value{end+1,1}=char(string(results.maskSourceLabel)); end
+            if isfield(results,'maskPixelCount'), name{end+1,1}='Mask pixels'; value{end+1,1}=num2str(results.maskPixelCount); end
+            if isfield(results,'maskAreaMm2'), name{end+1,1}='Mask area (mm^2)'; value{end+1,1}=num2str(results.maskAreaMm2); end
+            if isfield(results,'cviSeries'), name{end+1,1}='CVI series'; value{end+1,1}=char(string(results.cviSeries)); end
+            if isfield(results,'plausibleT1RangeMs') && numel(results.plausibleT1RangeMs)==2
+                name{end+1,1}='Plausible T1 range (ms)';
+                value{end+1,1}=sprintf('%.0f to %.0f',results.plausibleT1RangeMs(1),results.plausibleT1RangeMs(2));
+            end
+            if isfield(results,'dispersionModelFit') && isstruct(results.dispersionModelFit)
+                mf=results.dispersionModelFit;
+                if isfield(mf,'modelName'), name{end+1,1}='Dispersion background model'; value{end+1,1}=char(mf.modelName); end
+                if isfield(mf,'quadrupoleLabel'), name{end+1,1}='Quadrupole model'; value{end+1,1}=char(mf.quadrupoleLabel); end
+                if isfield(mf,'rsquare'), name{end+1,1}='Dispersion model R squared'; value{end+1,1}=num2str(mf.rsquare); end
+                if isfield(mf,'AICc'), name{end+1,1}='Dispersion model AICc'; value{end+1,1}=num2str(mf.AICc); end
+            end
+            if isempty(name)
+                metadata=table();
+            else
+                metadata=table(name,value,'VariableNames',{'Name','Value'});
+            end
+        end
+
+
+        function openT1DispersionModelFit(app)
+            [~,results,~,ok] = currentT1Results(app);
+            if ~ok, return; end
+            valid = isfinite(results.fields_mT) & results.fields_mT > 0 & ...
+                isfinite(results.R1) & results.R1 > 0;
+            if nnz(valid) < 4
+                uialert(app.UIFigure, ...
+                    'At least four accepted T1/R1 field points are required for dispersion modelling.', ...
+                    'Not enough dispersion points');
+                return;
+            end
+
+            try
+                if ~isempty(app.T1DispersionFitFigure) && ...
+                        isgraphics(app.T1DispersionFitFigure)
+                    delete(app.T1DispersionFitFigure);
+                end
+            catch
+            end
+
+            fig=figure('Name','FCI T1 dispersion model fitting', ...
+                'NumberTitle','off','Color','w','Position',[90 80 1320 800]);
+            app.T1DispersionFitFigure=fig;
+
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.015 0.948 0.105 0.028], ...
+                'String','Background model','HorizontalAlignment','left', ...
+                'BackgroundColor','w','FontWeight','bold');
+            modelPopup=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
+                'Position',[0.12 0.947 0.205 0.034], ...
+                'String',{'Power law (biological)', ...
+                          'BPP single tau (standard)', ...
+                          'BPP two tau (biological)', ...
+                          'Power law + BPP (biological)'}, ...
+                'Value',1);
+
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.335 0.948 0.075 0.028], ...
+                'String','Quadrupole','HorizontalAlignment','left', ...
+                'BackgroundColor','w','FontWeight','bold');
+            qPopup=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
+                'Position',[0.41 0.947 0.205 0.034], ...
+                'String',{'None', ...
+                          '14N high-field pair (2.08, 2.76 MHz)', ...
+                          '14N all three (0.70, 2.08, 2.76 MHz)', ...
+                          'Broad QRE (~2 MHz)'}, ...
+                'Value',1);
+
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.625 0.948 0.075 0.028], ...
+                'String','Q HWHM','HorizontalAlignment','left', ...
+                'BackgroundColor','w');
+            qWidthEdit=uicontrol(fig,'Style','edit','Units','normalized', ...
+                'Position',[0.695 0.949 0.052 0.032], ...
+                'String','0.20','TooltipString','Quadrupole Lorentzian half-width at half maximum in MHz.');
+            fitWidthCheck=uicontrol(fig,'Style','checkbox','Units','normalized', ...
+                'Position',[0.755 0.949 0.085 0.032], ...
+                'String','Fit width','BackgroundColor','w','Value',0);
+
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.842 0.948 0.048 0.028], ...
+                'String','Display','HorizontalAlignment','left', ...
+                'BackgroundColor','w');
+            displayPopup=uicontrol(fig,'Style','popupmenu','Units','normalized', ...
+                'Position',[0.887 0.949 0.050 0.032], ...
+                'String',{'R1','T1'}, ...
+                'Value',1+double(~logical(app.DisplayingasT1Button.Value)));
+
+            fitButton=uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.944 0.947 0.045 0.036], ...
+                'String','Fit');
+
+            axMain=axes('Parent',fig,'Units','normalized', ...
+                'Position',[0.065 0.375 0.59 0.51]);
+            axResidual=axes('Parent',fig,'Units','normalized', ...
+                'Position',[0.065 0.105 0.59 0.18]);
+
+            paramTable=uitable(fig,'Units','normalized', ...
+                'Position',[0.685 0.285 0.295 0.60], ...
+                'Data',cell(0,3), ...
+                'ColumnName',{'Parameter','Value','Units'}, ...
+                'RowName',[], ...
+                'ColumnWidth',{145 95 115});
+
+            statusText=uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.685 0.135 0.295 0.125], ...
+                'HorizontalAlignment','left','BackgroundColor','w', ...
+                'String',['Models are fitted to R1 versus proton Larmor frequency. ', ...
+                          'Quadrupole terms are positive Lorentzians in R1.']);
+
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.685 0.075 0.09 0.038], ...
+                'String','Export CSV', ...
+                'Callback',@(src,event) exportT1DispersionModelFit(app,'csv'));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.785 0.075 0.09 0.038], ...
+                'String','Export XLSX', ...
+                'Callback',@(src,event) exportT1DispersionModelFit(app,'xlsx'));
+            uicontrol(fig,'Style','pushbutton','Units','normalized', ...
+                'Position',[0.885 0.075 0.095 0.038], ...
+                'String','To workspace', ...
+                'Callback',@(src,event) exportT1DispersionModelFit(app,'workspace'));
+
+            uicontrol(fig,'Style','text','Units','normalized', ...
+                'Position',[0.685 0.018 0.295 0.044], ...
+                'HorizontalAlignment','left','BackgroundColor','w', ...
+                'ForegroundColor',[0.25 0.25 0.25], ...
+                'String',['QRE centres are fixed to literature values by default. ', ...
+                          'Use "Fit width" only when the dispersion has enough field samples.']);
+
+            fitButton.Callback=@(src,event) runT1DispersionModelFit(app, ...
+                modelPopup,qPopup,qWidthEdit,fitWidthCheck,displayPopup, ...
+                axMain,axResidual,paramTable,statusText);
+
+            % Start with the biological power-law background and no QRE so
+            % that opening the tool immediately gives a useful baseline fit.
+            runT1DispersionModelFit(app,modelPopup,qPopup,qWidthEdit, ...
+                fitWidthCheck,displayPopup,axMain,axResidual,paramTable,statusText);
+        end
+
+        function runT1DispersionModelFit(app,modelPopup,qPopup,qWidthEdit, ...
+                fitWidthCheck,displayPopup,axMain,axResidual,paramTable,statusText)
+            [scan,results,scanIndex,ok] = currentT1Results(app);
+            if ~ok, return; end
+            modelName=popupControlString(app,modelPopup);
+            qMode=popupControlString(app,qPopup);
+            qWidth=str2double(get(qWidthEdit,'String'));
+            if ~isfinite(qWidth) || qWidth<=0
+                qWidth=0.20;
+                set(qWidthEdit,'String','0.20');
+            end
+            fitWidth=logical(get(fitWidthCheck,'Value'));
+            try
+                fitResult=ffc_fit_t1_dispersion_model( ...
+                    results.fields_mT,results.R1,modelName,qMode, ...
+                    struct('qHWHMMHz',qWidth,'fitQWidth',fitWidth,'nStarts',24));
+            catch err
+                cla(axMain); cla(axResidual);
+                set(statusText,'String',sprintf('Fit failed: %s',err.message));
+                uialert(app.UIFigure,err.message,'T1 dispersion model fit failed');
+                return;
+            end
+
+            results.dispersionModelFit=fitResult;
+            scan.T1FitResults=results;
+            try
+                if ~isstruct(scan.param), scan.param=struct(); end
+                scan.param.T1DispersionModelFit=fitResult;
+            catch
+            end
+            app.scan_data{scanIndex}=scan;
+
+            displayMode=popupControlString(app,displayPopup);
+            cla(axMain); cla(axResidual);
+            hold(axMain,'on');
+            if strcmpi(displayMode,'T1')
+                yObserved=fitResult.observedT1ms;
+                yDense=fitResult.denseT1ms;
+                ylabel(axMain,'T_1 (ms)');
+            else
+                yObserved=fitResult.observedR1;
+                yDense=fitResult.denseR1;
+                ylabel(axMain,'R_1 (s^{-1})');
+            end
+            hData=loglog(axMain,fitResult.frequencyMHz,yObserved,'o', ...
+                'MarkerSize',7,'LineWidth',1.2);
+            hFit=loglog(axMain,fitResult.denseFrequencyMHz,yDense,'-', ...
+                'LineWidth',1.6);
+            if ~isempty(fitResult.quadrupoleCentersMHz)
+                yLim=get(axMain,'YLim');
+                for k=1:numel(fitResult.quadrupoleCentersMHz)
+                    xline(axMain,fitResult.quadrupoleCentersMHz(k),'--');
+                end
+                ylim(axMain,yLim);
+            end
+            grid(axMain,'on');
+            xlabel(axMain,'Proton Larmor frequency (MHz)');
+            title(axMain,sprintf('%s | %s',fitResult.modelName, ...
+                fitResult.quadrupoleLabel),'Interpreter','none');
+            legend(axMain,[hData hFit],{'Measured','Fit'},'Location','best');
+            hold(axMain,'off');
+
+            stem(axResidual,fitResult.frequencyMHz,fitResult.residualR1,'filled');
+            set(axResidual,'XScale','log');
+            yline(axResidual,0,'--');
+            grid(axResidual,'on');
+            xlabel(axResidual,'Proton Larmor frequency (MHz)');
+            ylabel(axResidual,'R_1 residual');
+            title(axResidual,'Residuals (fit is always performed in R_1)');
+
+            parameterData=cell(numel(fitResult.parameters),3);
+            for k=1:numel(fitResult.parameters)
+                parameterData{k,1}=char(fitResult.parameterNames{k});
+                parameterData{k,2}=double(fitResult.parameters(k));
+                parameterData{k,3}=char(fitResult.parameterUnits{k});
+            end
+            if ~isempty(fitResult.quadrupoleCentersMHz)
+                parameterData(end+1,:)={'Q total area', ...
+                    double(fitResult.totalQuadrupoleArea_s_1_MHz), ...
+                    's^-1 MHz'}; %#ok<AGROW>
+            end
+            set(paramTable,'Data',parameterData);
+
+            if isfinite(fitResult.AICc)
+                aiccText=sprintf('%.3g',fitResult.AICc);
+            else
+                aiccText='n/a';
+            end
+            caution='';
+            if fitResult.degreesOfFreedom < 2
+                caution=sprintf('\nCAUTION: only %d residual degree(s) of freedom.', ...
+                    fitResult.degreesOfFreedom);
+            end
+            set(statusText,'String',sprintf([ ...
+                'Fit stored in scan.T1FitResults.dispersionModelFit\n', ...
+                'R^2 = %.4f    RMSE = %.4g s^-1\n', ...
+                'AICc = %s    BIC = %.3g    n = %d, p = %d%s'], ...
+                fitResult.rsquare,fitResult.rmse,aiccText,fitResult.BIC, ...
+                fitResult.nPoints,fitResult.nParameters,caution));
+        end
+
+        function exportT1DispersionModelFit(app,format)
+            [~,results,~,ok]=currentT1Results(app);
+            if ~ok, return; end
+            if ~isfield(results,'dispersionModelFit') || ...
+                    isempty(results.dispersionModelFit)
+                uialert(app.UIFigure,'Fit a dispersion model first.', ...
+                    'No dispersion model fit');
+                return;
+            end
+            fitResult=results.dispersionModelFit;
+            parameterTable=table( ...
+                string(fitResult.parameterNames(:)), ...
+                fitResult.parameters(:), ...
+                string(fitResult.parameterUnits(:)), ...
+                'VariableNames',{'Parameter','Value','Units'});
+            curveTable=table(fitResult.fields_mT(:), ...
+                fitResult.frequencyMHz(:),fitResult.observedR1(:), ...
+                fitResult.predictedR1(:),fitResult.residualR1(:), ...
+                fitResult.observedT1ms(:),fitResult.predictedT1ms(:), ...
+                'VariableNames',{'Field_mT','Frequency_MHz','Observed_R1_s_1', ...
+                'Fitted_R1_s_1','Residual_R1_s_1','Observed_T1_ms','Fitted_T1_ms'});
+            if ~isempty(fitResult.quadrupoleCentersMHz)
+                qTable=table(fitResult.quadrupoleCentersMHz(:), ...
+                    fitResult.quadrupoleAmplitudes_s_1(:), ...
+                    fitResult.quadrupoleAreas_s_1_MHz(:), ...
+                    'VariableNames',{'Centre_MHz','Amplitude_s_1','Area_s_1_MHz'});
+            else
+                qTable=table();
+            end
+
+            switch lower(format)
+                case 'workspace'
+                    existing=evalin('base','who');
+                    fitName=matlab.lang.makeUniqueStrings( ...
+                        'T1_dispersion_model_fit',existing);
+                    assignin('base',fitName,fitResult);
+                    tableName=matlab.lang.makeUniqueStrings( ...
+                        'T1_dispersion_model_curve',[existing;{fitName}]);
+                    assignin('base',tableName,curveTable);
+                    uialert(app.UIFigure,sprintf( ...
+                        'Exported %s and %s.',fitName,tableName), ...
+                        'Dispersion model exported');
+                case 'csv'
+                    [file,path]=uiputfile({'*.csv','CSV file (*.csv)'}, ...
+                        'Export fitted T1 dispersion','T1_dispersion_model_fit.csv');
+                    if isequal(file,0), return; end
+                    outputFile=fullfile(path,file);
+                    try
+                        writetable(curveTable,outputFile);
+                        [folder,base,~]=fileparts(outputFile);
+                        writetable(parameterTable,fullfile(folder,[base '_parameters.csv']));
+                        if ~isempty(qTable)
+                            writetable(qTable,fullfile(folder,[base '_quadrupole.csv']));
+                        end
+                    catch err
+                        uialert(app.UIFigure,err.message,'Could not export model fit');
+                    end
+                case 'xlsx'
+                    [file,path]=uiputfile({'*.xlsx','Excel workbook (*.xlsx)'}, ...
+                        'Export fitted T1 dispersion','T1_dispersion_model_fit.xlsx');
+                    if isequal(file,0), return; end
+                    try
+                        outputFile=fullfile(path,file);
+                        writetable(curveTable,outputFile,'Sheet','Curve');
+                        writetable(parameterTable,outputFile,'Sheet','Parameters');
+                        metrics=table( ...
+                            {'Background model';'Quadrupole model';'R squared'; ...
+                             'RMSE (s^-1)';'AIC';'AICc';'BIC';'Degrees of freedom'}, ...
+                            {fitResult.modelName;fitResult.quadrupoleLabel; ...
+                             num2str(fitResult.rsquare);num2str(fitResult.rmse); ...
+                             num2str(fitResult.AIC);num2str(fitResult.AICc); ...
+                             num2str(fitResult.BIC);num2str(fitResult.degreesOfFreedom)}, ...
+                            'VariableNames',{'Metric','Value'});
+                        writetable(metrics,outputFile,'Sheet','Fit metrics');
+                        if ~isempty(qTable)
+                            writetable(qTable,outputFile,'Sheet','Quadrupole');
+                        end
+                    catch err
+                        uialert(app.UIFigure,err.message,'Could not export model fit');
+                    end
+            end
+        end
+
+        function value=popupControlString(app,h) %#ok<INUSL>
+            items=get(h,'String');
+            index=get(h,'Value');
+            if iscell(items)
+                value=char(items{index});
+            elseif isstring(items)
+                value=char(items(index));
+            elseif ischar(items)
+                if size(items,1)>1
+                    value=strtrim(items(index,:));
+                else
+                    value=strtrim(items);
+                end
+            else
+                value='';
+            end
+        end
+
+        function value=shortT1DiagnosticQc(app,qc) %#ok<INUSL>
+            if strncmp(qc,'good',4), value='good';
+            elseif strncmp(qc,'failed',6), value='failed';
+            else, value='review'; end
+        end
+
+        function updated=copyT1ResultContext(app,previous,updated) %#ok<INUSL>
+            if ~isstruct(previous) || ~isstruct(updated), return; end
+            names={'maskSource','maskSourceLabel','maskPixelCount','maskAreaMm2', ...
+                'cviSeries','cviPhaseIndex'};
+            for k=1:numel(names)
+                if isfield(previous,names{k})
+                    updated.(names{k})=previous.(names{k});
+                end
+            end
+        end
+
+        function scan=clearStoredDispersionModelFit(app,scan) %#ok<INUSL>
+            try
+                if isstruct(scan.param) && isfield(scan.param,'T1DispersionModelFit')
+                    scan.param=rmfield(scan.param,'T1DispersionModelFit');
+                end
+            catch
+            end
+        end
+
+        function s = rmfieldIfPresent(app,s,name) %#ok<INUSL>
+            if isstruct(s) && isfield(s,name), s=rmfield(s,name); end
+        end
+
         function setCVITargetToCurrentScan(app)
             if isempty(app.scan_data) || isempty(app.currentscan), return; end
             try
@@ -1149,6 +2395,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         end
 
         function redrawCVI(app)
+            clearCVIMaskPreview(app);
             if ~isempty(app.scan_data) && ~isempty(app.currentscan), drawimages(app); end
         end
 
@@ -1344,37 +2591,48 @@ end
             end
             switch imageType
                 case "Magnitude"
-                    volume = displayScan.magimage(:, :, :, ...
-                        displayTime, displayField);
+                    volume = displayScan.magimage;
+                    volumeTime = displayTime; volumeField = displayField;
                 case "Phase"
-                    volume = displayScan.phaseimage(:, :, :, ...
-                        displayTime, displayField);
+                    volume = displayScan.complexcombined;
+                    volumeTime = displayTime; volumeField = displayField;
                 otherwise
                     currentScan.R1T1 = app.DisplayingasT1Button.Value;
                     app.scan_data{app.currentscan} = currentScan;
                     if currentScan.R1T1 == 0
-                        volume = currentScan.T1Maps(:, :, :, dispField);
+                        volume = currentScan.T1Maps;
                     else
-                        volume = currentScan.R1Maps(:, :, :, dispField);
+                        volume = currentScan.R1Maps;
                     end
-                    if app.LogarithmicMapsButton.Value
-                        volume = log(volume);
-                    end
+                    volumeTime = dispField; volumeField = 1;
+            end
+
+            relaxCmap = [];
+            relaxMapType = '';
+            if imageType == "Magnitude"
+                imageClim = windowLimits(app);
+            elseif imageType == "Phase"
+                imageClim = [-pi pi];
+            else
+                imageClim = [app.ColourAxisLowerLimitEditField.Value, ...
+                    app.ColourAxisUpperLimitEditField.Value];
+                if imageClim(2) <= imageClim(1)
+                    imageClim(2) = imageClim(1)+eps(max(1,abs(imageClim(1))));
+                end
+                if app.DisplayingasT1Button.Value
+                    relaxMapType = 'R1';
+                else
+                    relaxMapType = 'T1';
+                end
             end
 
             [displayedImage, view] = ffc_extract_anatomical_plane( ...
-                volume, displayScan, planeName, sliceIndex, geomT);
-            if imageType == "Magnitude"
-                colormap(app.axis_image,gray);
-                imageClim = windowLimits(app);
-            elseif imageType == "Phase"
-                colormap(app.axis_image,gray);
-                imageClim = [-pi pi];
-            else
-                colormap(app.axis_image,jet);
-                imageClim = [app.ColourAxisLowerLimitEditField.Value, ...
-                    app.ColourAxisUpperLimitEditField.Value];
-                if imageClim(2) <= imageClim(1), imageClim(2) = imageClim(1)+eps(max(1,abs(imageClim(1)))); end
+                volume, displayScan, planeName, sliceIndex, geomT,volumeTime,volumeField);
+            if imageType == "Phase", displayedImage = angle(displayedImage); end
+            if imageType == "Relaxometry Map"
+                [displayedImage, relaxCmap] = ffc_ismrm_relaxation_colormap( ...
+                    relaxMapType, displayedImage, imageClim(1), imageClim(2), ...
+                    logical(app.LogarithmicMapsButton.Value));
             end
 
             % K-space is still generated from the native acquisition product,
@@ -1387,8 +2645,8 @@ end
                 kspaceVolume = displayScan.magkspace;
                 kspaceScan = displayScan; kspaceScan.magimage = kspaceVolume;
                 [displayedKspace,~] = ffc_extract_anatomical_plane( ...
-                    kspaceVolume(:,:,:,displayTime,displayField),kspaceScan, ...
-                    planeName,sliceIndex,geomT);
+                    kspaceVolume,kspaceScan, ...
+                    planeName,sliceIndex,geomT,displayTime,displayField);
                 displayedKspace = log1p(double(displayedKspace));
                 if (isempty(app.KspaceHandle) || ~isgraphics(app.KspaceHandle))
                     app.KspaceHandle = imagesc(app.axis_kspace,displayedKspace);
@@ -1406,7 +2664,7 @@ end
                 displayTime,displayField,planeName,sliceIndex,geomT};
             if ~isequaln(app.ImagePlaneKey,planeKey)
                 if ~isempty(app.mask) && isvalid(app.mask), delete(app.mask); end
-                app.mask = []; app.ImagePlaneKey = planeKey;
+                app.mask = []; clearCVIMaskPreview(app); app.ImagePlaneKey = planeKey;
             end
             if (isempty(app.ImageHandle) || ~isgraphics(app.ImageHandle))
                 cla(app.axis_image);
@@ -1417,8 +2675,30 @@ end
                 app.ImageHandle.CData = displayedImage;
             end
             app.axis_image.CLim = imageClim;
-            if imageType == "Relaxometry Map", colormap(app.axis_image,jet);
-            else, colormap(app.axis_image,gray); end
+            if imageType == "Relaxometry Map"
+                colormap(app.axis_image,relaxCmap);
+                app.LogarithmicMapsButton.Enable = 'on';
+                app.DisplayingasT1Button.Enable = 'on';
+                app.ColourAxisLowerLimitEditField.Enable = 'on';
+                app.ColourAxisUpperLimitEditField.Enable = 'on';
+                app.ColourAxisLowerLimitEditFieldLabel.Enable = 'on';
+                app.ColourAxisUpperLimitEditFieldLabel.Enable = 'on';
+                if isempty(app.RelaxometryColorbar) || ~isgraphics(app.RelaxometryColorbar)
+                    app.RelaxometryColorbar = colorbar(app.axis_image);
+                end
+                app.RelaxometryColorbar.Visible = 'on';
+                if strcmp(relaxMapType,'R1')
+                    app.RelaxometryColorbar.Label.String = 'R1 (s^{-1})';
+                else
+                    app.RelaxometryColorbar.Label.String = 'T1 (ms)';
+                end
+            else
+                colormap(app.axis_image,gray);
+                if ~isempty(app.RelaxometryColorbar) && isgraphics(app.RelaxometryColorbar)
+                    delete(app.RelaxometryColorbar);
+                    app.RelaxometryColorbar = [];
+                end
+            end
             applyImageFovGeometry(app,view);
             drawSVSVoxelOverlay(app,view);
             drawCVIContourOverlay(app,view);
@@ -2051,7 +3331,7 @@ end
         % Code that executes after component creation
         function startupFcn(app)
             app.JobRunner = FFCJobRunner();
-            app.UIFigure.Name = 'FFC Processing - Performance Edition + CVI contours TEST 9';
+            app.UIFigure.Name = 'FFC Processing - Performance Edition + Cleanup Fix TEST 29';
 
             cviMenu = uimenu(app.UIFigure,'Text','CVI Contours');
             app.cviMenuHandles.import = uimenu(cviMenu,'Text','Import workspace...', ...
@@ -2111,17 +3391,43 @@ end
 
         % Button pushed function: LoadDataSetButton
         function LoadDataSetButtonPushed(app, event)
+            if app.LoadingDataset, return; end
+            app.LoadingDataset = true;
+            loadCleanup = onCleanup(@() finishDatasetLoad(app)); %#ok<NASGU>
             cancelScanTask(app);
             closeFilterDialogs(app);
-            file = open_mrifile;
-            if isempty(file)
-                return; % cancellation must not replace an existing dataset
-            end
             options = struct( ...
                 'backgroundselect', get(app.BackgroundselectionButton, 'Value'), ...
                 'reprocess', get(app.ReprocessingButton, 'Value'), ...
-                'checkfit', get(app.CheckfitsButton, 'Value'));
-            [file, sequencelist, failures] = ffc_preprocess_scans(file, options);
+                'checkfit', get(app.CheckfitsButton, 'Value'), ...
+                'reconstruct', true);
+            options.pipeline = true;
+            options.loadProgress = @(state) rawLoadProgress(app,state);
+            try
+                [file,loadReport,failures,prepared] = open_mrifile(options);
+                if isempty(file) && ~prepared, return; end
+                if prepared
+                    sequencelist = cellfun(@(scan) scan.displayname,file,'UniformOutput',false);
+                    app.LastLoadReport = loadReport;
+                else
+                    % Legacy MAT/MRD loads retain the existing serial path.
+                    dlg = uiprogressdlg(app.UIFigure,'Title','Opening image set', ...
+                        'Message','Preparing all sequences...', 'Cancelable','on');
+                    app.LoadProgressDialog = dlg;
+                    options.progress = @(i,n) datasetLoadProgress(app,dlg,i,n);
+                    [file, sequencelist, failures] = ffc_preprocess_scans(file, options);
+                    if ~isvalid(app) || ~isgraphics(app.UIFigure), return; end
+                    if dlg.CancelRequested, return; end
+                    app.LastLoadReport = [];
+                end
+                if ~isvalid(app) || ~isgraphics(app.UIFigure), return; end
+                closeProgressDialog(app,app.LoadProgressDialog);
+                app.LoadProgressDialog = [];
+            catch ME
+                if strcmp(ME.identifier,'ffc:LoadCancelled'), return; end
+                rethrow(ME);
+            end
+
             for n = 1:numel(failures)
                 fprintf(2, 'Error while processing sequence number %d:\n%s\n', ...
                     failures(n).sequenceIndex, ...
@@ -2129,7 +3435,7 @@ end
             end
             if isempty(file)
                 uialert(app.UIFigure, ...
-                    ['No sequences could be preprocessed. The current dataset ', ...
+                    ['No sequences could be reconstructed. The current dataset ', ...
                      'was not changed. Full error details are in the Command Window.'], ...
                     'Dataset not loaded');
                 return;
@@ -2137,6 +3443,7 @@ end
 
             app.DatasetGeneration = app.DatasetGeneration + 1;
             app.ViewStates = {}; app.KspaceKey = []; app.CompassKey = [];
+            app.ImagePlaneKey = []; app.CVIOverlayKey = [];
             app.ScanList.Items = sequencelist;
             app.ScanList.ItemsData =1:numel(app.ScanList.Items); %allows us to get index of selected scan
             app.ScanList.Value = 1;
@@ -2161,6 +3468,41 @@ end
             
         end
 
+        function proceed = datasetLoadProgress(app,dlg,index,count)
+            proceed = isvalid(app) && isgraphics(app.UIFigure);
+            if ~proceed, return; end
+            dlg.Value = (index-1)/max(1,count);
+            dlg.Message = sprintf('Reconstructing sequence %d of %d...',index,count);
+            drawnow;
+            proceed = isvalid(app) && isgraphics(app.UIFigure) && ...
+                isvalid(dlg) && ~dlg.CancelRequested;
+        end
+
+        function proceed = rawLoadProgress(app,state)
+            proceed = isvalid(app) && isgraphics(app.UIFigure);
+            if ~proceed, return; end
+            if isempty(app.LoadProgressDialog) || ~isvalid(app.LoadProgressDialog)
+                app.LoadProgressDialog = uiprogressdlg(app.UIFigure, ...
+                    'Title','Opening image set','Cancelable','on');
+            end
+            dlg = app.LoadProgressDialog;
+            dlg.Value = state.completed/max(1,state.total);
+            dlg.Message = sprintf(['%s\n%d/%d ready or failed; %d jobs active; %.1f s elapsed' ...
+                '\nRaw/header reads: %.1f s; completed reconstruction work: %.1f s'], ...
+                state.label,state.completed,state.total,state.active,state.elapsed, ...
+                state.readSeconds,state.reconstructSeconds);
+            drawnow;
+            proceed = isvalid(app) && isgraphics(app.UIFigure) && isvalid(dlg) && ~dlg.CancelRequested;
+        end
+
+        function finishDatasetLoad(app)
+            if isvalid(app)
+                closeProgressDialog(app,app.LoadProgressDialog);
+                app.LoadProgressDialog = [];
+                app.LoadingDataset = false;
+            end
+        end
+
         % Value changed function: WindowLevelSlider
         function WindowLevelSliderValueChanged(app, event)
             updateWindowOnly(app)
@@ -2179,7 +3521,6 @@ end
         % Value changed function: ScanList
         function ScanListValueChanged(app, event)
             saveViewState(app);
-            cancelScanTask(app);
             closeFilterDialogs(app);
             activeimage(app)
             
@@ -2245,15 +3586,24 @@ end
     targetIndex = app.currentscan; targetDataset = app.DatasetGeneration;
     targetGeneration = app.scan_data{targetIndex}.magnitude_generation;
     currentScan = app.scan_data{app.currentscan};
-    currentScan.checkfit = app.CheckfitsButton.Value;
+    showFitDiagnostic = logical(app.CheckfitsButton.Value);
+    currentScan.checkfit = showFitDiagnostic;
     currentScan.R1T1 = app.DisplayingasT1Button.Value;
 
     if scanIsSVS(app, currentScan)
         % There is no spatial ROI to draw for SVS. buildSVSSignal has
         % already reduced dimension 1 using mean(abs(rawdata),1).
         currentScan.mask = true(1, 1);
-        [currentScan, ~] = T1dispersion(currentScan, 1);
-        app.scan_data{app.currentscan} = currentScan;
+        [currentScan, ~] = T1dispersion(currentScan, 1, ...
+            struct('showDashboard',false,'showFits',false, ...
+                    'makeDispersionPlot',~showFitDiagnostic, ...
+                    'plausibleT1RangeMs',[20 1500]));
+        currentScan=clearStoredDispersionModelFit(app,currentScan);
+        diagnosticScanIndex = app.currentscan;
+        app.scan_data{diagnosticScanIndex} = currentScan;
+        if showFitDiagnostic
+            openInteractiveT1FitDiagnostic(app,diagnosticScanIndex,1);
+        end
         return;
     end
 
@@ -2316,8 +3666,16 @@ end
     % Restore the drawn display mask to native reconstruction dimensions.
     currentScan.mask = ffc_restore_native_plane_mask( ...
         createMask(app.mask), currentView);
-    [currentScan, ~] = T1dispersion(currentScan, currentView.sliceIndex);
-    app.scan_data{app.currentscan} = currentScan;
+    [currentScan, ~] = T1dispersion(currentScan, currentView.sliceIndex, ...
+        struct('showDashboard',false,'showFits',false, ...
+                    'makeDispersionPlot',~showFitDiagnostic, ...
+                    'plausibleT1RangeMs',[20 1500]));
+    currentScan=clearStoredDispersionModelFit(app,currentScan);
+    diagnosticScanIndex = app.currentscan;
+    app.scan_data{diagnosticScanIndex} = currentScan;
+    if showFitDiagnostic
+        openInteractiveT1FitDiagnostic(app,diagnosticScanIndex,currentView.sliceIndex);
+    end
         end
 
         % Button pushed function: GenerateRelaxationMapsButton
@@ -2379,22 +3737,16 @@ end
 
         % Value changed function: LogarithmicMapsButton
         function LogarithmicMapsButtonValueChanged(app, event)
-            value = app.LogarithmicMapsButton.Value;
-            if value
-                app.LogarithmicMapsButton.Text = "Log scale Relaxation Maps";
-                %try and select sensible limits when log scale selected
-                if  app.ColourAxisLowerLimitEditField.Value <1  %log of 0 is inf
-                    app.ColourAxisLowerLimitEditField.Value = 1;
-                end
-                app.ColourAxisLowerLimitEditField.Value =  log(app.ColourAxisLowerLimitEditField.Value);
-                app.ColourAxisUpperLimitEditField.Value =  log(app.ColourAxisUpperLimitEditField.Value);
+            % The ISMRM recommendation remaps the colour table rather than
+            % taking the logarithm of the T1/R1 image values.  Keeping a
+            % linear-Lipari option is useful diagnostically, but the
+            % recommended log-remapped Lipari display is the default.
+            if app.LogarithmicMapsButton.Value
+                app.LogarithmicMapsButton.Text = 'ISMRM log-Lipari';
             else
-                app.LogarithmicMapsButton.Text = "Linear scale Relaxation Maps";
-                app.ColourAxisLowerLimitEditField.Value =  exp(app.ColourAxisLowerLimitEditField.Value);
-                app.ColourAxisUpperLimitEditField.Value =  exp(app.ColourAxisUpperLimitEditField.Value);
+                app.LogarithmicMapsButton.Text = 'Linear Lipari';
             end
             drawimages(app)
-            
         end
 
         % Value changed function: DisplayingasT1Button
@@ -2418,6 +3770,7 @@ end
         % Button pushed function: ExportscantoworkspaceButton
         function ExportscantoworkspaceButtonPushed(app, event)
          file = app.scan_data{app.currentscan};
+         if isempty(file.phaseimage), file.phaseimage = angle(file.complexcombined); end
 
     try
         rawName = file.displayname;
@@ -2442,6 +3795,147 @@ end
     % Optional: tell the user what name it used
     uialert(app.UIFigure, "Exported as: " + name, "Export complete");
     
+        end
+
+        function closeProgressDialog(app,dlg) %#ok<INUSD>
+            try
+                if ~isempty(dlg) && isvalid(dlg), close(dlg); end
+            catch
+            end
+        end
+
+        % Button pushed function: ExportEnhancedDICOMButton
+        function ExportEnhancedDICOMButtonPushed(app, event)
+            if isempty(app.scan_data) || isempty(app.currentscan) || ...
+                    app.currentscan < 1 || app.currentscan > numel(app.scan_data)
+                uialert(app.UIFigure,'No reconstructed scan is selected.', ...
+                    'Enhanced DICOM export');
+                return
+            end
+
+            choice = uiconfirm(app.UIFigure, ...
+                ['Export only the highlighted sequence, or export every image ', ...
+                 'sequence for ALL loaded participants?'], ...
+                'Enhanced DICOM export', ...
+                'Options',{'Selected sequence','All loaded participants','Cancel'}, ...
+                'DefaultOption',2,'CancelOption',3);
+            if strcmp(choice,'Cancel'), return; end
+
+            if strcmp(choice,'Selected sequence')
+                scan = app.scan_data{app.currentscan};
+                try
+                    meta = ffc_extract_dicom_metadata(scan);
+                    rawName = string(meta.SeriesDescription);
+                    if strlength(rawName) == 0, rawName = string(scan.displayname); end
+                catch
+                    rawName = "FCI_reconstruction";
+                end
+                defaultName = matlab.lang.makeValidName(rawName);
+                if strlength(defaultName) == 0, defaultName = "FCI_reconstruction"; end
+                defaultName = char(defaultName + "_EnhancedMR.dcm");
+                defaultDicomFolder = getDefaultDicomExportFolder(app,scan);
+                [fileName,pathName] = uiputfile({'*.dcm','Enhanced MR DICOM (*.dcm)'}, ...
+                    'Export reconstructed magnitude data as Enhanced MR DICOM', ...
+                    fullfile(defaultDicomFolder,defaultName));
+                if isequal(fileName,0), return; end
+                outputFile = fullfile(pathName,fileName);
+
+                progress = uiprogressdlg(app.UIFigure,'Title','Enhanced DICOM export', ...
+                    'Message','Writing Enhanced MR multi-frame object...', ...
+                    'Indeterminate','on');
+                cleanup = onCleanup(@() closeProgressDialog(app,progress)); %#ok<NASGU>
+                try
+                    if ~ffc_reconstruction_valid(scan)
+                        scan = buildimages(scan, false);
+                    end
+                    exportInfo = ffc_export_enhanced_mr(scan,outputFile);
+                    scan.param.LastEnhancedDICOMExport = exportInfo;
+                    app.scan_data{app.currentscan} = scan;
+                    uialert(app.UIFigure,sprintf([ ...
+                        'Enhanced MR DICOM written successfully.\n\n' ...
+                        'Patient: %s  ID: %s\n%d frame(s)\n\n%s'], ...
+                        exportInfo.PatientName,exportInfo.PatientID, ...
+                        exportInfo.NumberOfFrames,outputFile),'Enhanced DICOM export');
+                catch ME
+                    uialert(app.UIFigure,ME.message,'Enhanced DICOM export failed');
+                end
+                return
+            end
+
+            outputFolder = uigetdir(getDefaultDicomExportFolder(app,app.scan_data{app.currentscan}), ...
+                'Select output folder for ALL loaded participants');
+            if isequal(outputFolder,0), return; end
+            if app.JobRunner.isRunning()
+                uialert(app.UIFigure,'Wait for current processing to finish before batch export.', ...
+                    'Processing in progress');
+                return;
+            end
+            progress = uiprogressdlg(app.UIFigure,'Title','All participants DICOM export', ...
+                'Message','Preparing all loaded imaging sequences...', 'Cancelable','on');
+            cleanup = onCleanup(@() closeProgressDialog(app,progress)); %#ok<NASGU>
+            try
+                report = ffc_export_dicom_batch(app.scan_data,outputFolder, ...
+                    @(label,done,total) dicomBatchProgress(app,progress,label,done,total));
+                if ~isvalid(app) || ~isgraphics(app.UIFigure), return; end
+                for n = 1:numel(report.results)
+                    result = report.results{n};
+                    if ~isempty(result.rebuiltScan), app.scan_data{result.index} = result.rebuiltScan; end
+                    app.scan_data{result.index}.param.LastEnhancedDICOMExport = result.info;
+                end
+                closeProgressDialog(app,progress);
+                for n = 1:numel(report.skipped), fprintf(2,'%s\n',report.skipped{n}); end
+                for n = 1:numel(report.failed), fprintf(2,'%s\n',report.failed{n}); end
+                status = 'Complete';
+                if report.cancelled, status = 'Cancelled (completed files retained)'; end
+                msg = sprintf(['%s\n\n%d series written; %d skipped; %d failed.\n' ...
+                    '%d participant identities in export plan.\n%.1f seconds; %d workers.\n\n%s'], ...
+                    status,numel(report.results),numel(report.skipped),numel(report.failed), ...
+                    report.participantCount,report.seconds,report.workers,report.folder);
+                uialert(app.UIFigure,msg,'All participants DICOM export');
+            catch ME
+                uialert(app.UIFigure,ME.message,'DICOM export failed');
+            end
+        end
+
+        function proceed = dicomBatchProgress(app,dlg,label,done,total)
+            proceed = isvalid(app) && isgraphics(app.UIFigure) && isvalid(dlg);
+            if ~proceed, return; end
+            dlg.Message = label; dlg.Value = done/max(1,total);
+            drawnow;
+            proceed = isvalid(app) && isgraphics(app.UIFigure) && isvalid(dlg) && ~dlg.CancelRequested;
+        end
+
+        function outputFolder = getDefaultDicomExportFolder(app,scan) %#ok<INUSD>
+            % Default to a 'dicom' folder beneath the folder originally
+            % selected when the raw participant/session was opened.
+            sourceRoot = '';
+            try
+                if isprop(scan,'source_metadata') && isstruct(scan.source_metadata) && ...
+                        isfield(scan.source_metadata,'OpenRootPath') && ...
+                        ~isempty(scan.source_metadata.OpenRootPath)
+                    sourceRoot = char(string(scan.source_metadata.OpenRootPath));
+                end
+            catch
+            end
+            if isempty(sourceRoot)
+                try
+                    if isprop(scan,'filelocation') && ~isempty(scan.filelocation)
+                        sourceRoot = char(string(scan.filelocation));
+                    end
+                catch
+                end
+            end
+            if isempty(sourceRoot) || ~isfolder(sourceRoot)
+                sourceRoot = pwd;
+            end
+            outputFolder = fullfile(sourceRoot,'dicom');
+            if ~isfolder(outputFolder)
+                try
+                    mkdir(outputFolder);
+                catch
+                    outputFolder = sourceRoot;
+                end
+            end
         end
 
         % Button pushed function: ExportscanparameterstoworkspaceButton
@@ -2557,12 +4051,12 @@ end
                         imagename = char(([num2str(round(fieldlist(field))) ' mT_' tag 'map.tif']));
                         minD = app.ColourAxisLowerLimitEditField.Value;
                         maxD = app.ColourAxisUpperLimitEditField.Value*1;
-                        mapped_image = ind2rgb(double(round((1+imagesforexport(:,:,1,field) - minD) * 255 ./ (maxD - minD))), jet(256)); %this creates a tif RGB image with the same colour scaling as in the GUI
+                        mapped_image = ffc_relaxometry_rgb(tag, imagesforexport(:,:,1,field), minD, maxD, logical(app.LogarithmicMapsButton.Value));
                         imwrite(mapped_image, imagename);
                     end
                     
                 case "Phase"
-                    imagesforexport = squeeze(app.scan_data{app.currentscan}.phaseimage);
+                    imagesforexport = squeeze(angle(app.scan_data{app.currentscan}.complexcombined));
                     tag = 'phasemap';
                     for field = 1:n_fieldpoints
                         for times = 1:n_timepoints
@@ -2613,12 +4107,12 @@ end
                         imagename = char((['Stacked ' tag 'map.tif']));
                         minD = app.ColourAxisLowerLimitEditField.Value;
                         maxD = app.ColourAxisUpperLimitEditField.Value;
-                        mapped_image = ind2rgb(double(round((1+imagesforexport(:,:,field) - minD) * 255 ./ (maxD - minD))), jet(256)); %this creates a tif RGB image with the same colour scaling as in the GUI
+                        mapped_image = ffc_relaxometry_rgb(tag, imagesforexport(:,:,field), minD, maxD, logical(app.LogarithmicMapsButton.Value));
                         imwrite(mapped_image, imagename,'WriteMode','append');
                     end
                     
                 case "Phase"
-                    imagesforexport = squeeze(app.scan_data{app.currentscan}.phaseimage);
+                    imagesforexport = squeeze(angle(app.scan_data{app.currentscan}.complexcombined));
                     for field = 1:n_fieldpoints
                         imagename = char(([num2str(round(fieldlist(field))) ' mT phase stack.tif']));
                         if exist(imagename, 'file')==2
@@ -4023,9 +5517,23 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.GenerateROIDispersionCurveButton.Position = [12 117 186 22];
             app.GenerateROIDispersionCurveButton.Text = 'Generate ROI Dispersion Curve';
 
+            % Create T1 dispersion results button
+            resultsButton = uibutton(app.RelaxometryPanel, 'push');
+            resultsButton.ButtonPushedFcn = @(src,event) openT1DispersionResults(app);
+            resultsButton.Tooltip = {'Shows the most recent T1 dispersion values for the selected scan and provides CSV, Excel and MATLAB workspace export.'};
+            resultsButton.Position = [12 88 186 22];
+            resultsButton.Text = 'T1 Dispersion Results';
+
+            % Create T1 dispersion model fitting button
+            fitDispersionButton = uibutton(app.RelaxometryPanel, 'push');
+            fitDispersionButton.ButtonPushedFcn = @(src,event) openT1DispersionModelFit(app);
+            fitDispersionButton.Tooltip = {'Fits the accepted T1 dispersion points using standard dipolar or biological tissue models, with optional 14N quadrupolar-enhanced-relaxation terms.'};
+            fitDispersionButton.Position = [12 59 186 22];
+            fitDispersionButton.Text = 'Fit T1 Dispersion Model';
+
             % Create CheckfitsButton
             app.CheckfitsButton = uibutton(app.RelaxometryPanel, 'state');
-            app.CheckfitsButton.Tooltip = {'Displays the relaxation fits when either relaxation maps or ROI dispersion curves are generated'};
+            app.CheckfitsButton.Tooltip = {'For ROI/CVI T1 dispersion, opens an interactive fit diagnostic. Click on or near a numbered recovery point to flip its sign and refit.'};
             app.CheckfitsButton.Enable = 'off';
             app.CheckfitsButton.Text = 'Check fits';
             app.CheckfitsButton.Position = [215 146 158 22];
@@ -4033,9 +5541,10 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             % Create LogarithmicMapsButton
             app.LogarithmicMapsButton = uibutton(app.RelaxometryPanel, 'state');
             app.LogarithmicMapsButton.ValueChangedFcn = createCallbackFcn(app, @LogarithmicMapsButtonValueChanged, true);
-            app.LogarithmicMapsButton.Tooltip = {'Visualises relaxation maps either linearly or in log scale. Log scale can be useful for comparing relaxation between different magnetic fields where there is a large change in T1 values'};
+            app.LogarithmicMapsButton.Tooltip = {'ISMRM-recommended logarithm-remapped Lipari colour map. Turn off only to inspect the unprocessed linear Lipari map.'};
             app.LogarithmicMapsButton.Enable = 'off';
-            app.LogarithmicMapsButton.Text = 'Logarithmic Maps';
+            app.LogarithmicMapsButton.Value = true;
+            app.LogarithmicMapsButton.Text = 'ISMRM log-Lipari';
             app.LogarithmicMapsButton.Position = [215 117 158 22];
 
             % Create DisplayingasT1Button
@@ -4105,14 +5614,14 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.ExportOptionsPanel = uipanel(app.UIFigure);
             app.ExportOptionsPanel.AutoResizeChildren = 'off';
             app.ExportOptionsPanel.Title = 'Export Options';
-            app.ExportOptionsPanel.Position = [822 10 433 109];
+            app.ExportOptionsPanel.Position = [822 10 433 126];
 
             % Create ExportscantoworkspaceButton
             app.ExportscantoworkspaceButton = uibutton(app.ExportOptionsPanel, 'push');
             app.ExportscantoworkspaceButton.ButtonPushedFcn = createCallbackFcn(app, @ExportscantoworkspaceButtonPushed, true);
             app.ExportscantoworkspaceButton.Enable = 'off';
             app.ExportscantoworkspaceButton.Tooltip = {'Export the scan object to the MATLAB workspace'};
-            app.ExportscantoworkspaceButton.Position = [9 63 145 22];
+            app.ExportscantoworkspaceButton.Position = [9 80 145 22];
             app.ExportscantoworkspaceButton.Text = 'Export scan to workspace';
 
             % Create ExportallimagesButton
@@ -4120,7 +5629,7 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.ExportallimagesButton.ButtonPushedFcn = createCallbackFcn(app, @ExportallimagesButtonPushed, true);
             app.ExportallimagesButton.Enable = 'off';
             app.ExportallimagesButton.Tooltip = {'Export the current data set (magnitude, phase or relaxation map) as a series of .tif images.'};
-            app.ExportallimagesButton.Position = [9 34 145 22];
+            app.ExportallimagesButton.Position = [9 51 145 22];
             app.ExportallimagesButton.Text = 'Export all images';
 
             % Create ExportstackedimagesButton
@@ -4128,7 +5637,7 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.ExportstackedimagesButton.ButtonPushedFcn = createCallbackFcn(app, @ExportstackedimagesButtonPushed, true);
             app.ExportstackedimagesButton.Enable = 'off';
             app.ExportstackedimagesButton.Tooltip = {'Export the current data set (magnitude, phase or relaxation map) as a stacked .tif image. For magnitude and phase images a stacked image of evolution times will be generated for each evolution field. For relaxation maps a single stack containing all relaxation maps will be generated.'};
-            app.ExportstackedimagesButton.Position = [9 7 145 22];
+            app.ExportstackedimagesButton.Position = [9 22 145 22];
             app.ExportstackedimagesButton.Text = 'Export stacked images';
 
             % Create ExportscanparameterstoworkspaceButton
@@ -4136,22 +5645,30 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.ExportscanparameterstoworkspaceButton.ButtonPushedFcn = createCallbackFcn(app, @ExportscanparameterstoworkspaceButtonPushed, true);
             app.ExportscanparameterstoworkspaceButton.Enable = 'off';
             app.ExportscanparameterstoworkspaceButton.Tooltip = {'Write the current scan parameters in the workspace'};
-            app.ExportscanparameterstoworkspaceButton.Position = [160 63 218 22];
+            app.ExportscanparameterstoworkspaceButton.Position = [160 80 218 22];
             app.ExportscanparameterstoworkspaceButton.Text = 'Export scan parameters to workspace';
+
+            % Create ExportEnhancedDICOMButton
+            app.ExportEnhancedDICOMButton = uibutton(app.ExportOptionsPanel, 'push');
+            app.ExportEnhancedDICOMButton.ButtonPushedFcn = createCallbackFcn(app, @ExportEnhancedDICOMButtonPushed, true);
+            app.ExportEnhancedDICOMButton.Enable = 'off';
+            app.ExportEnhancedDICOMButton.Tooltip = {'Export the highlighted sequence or all loaded image sequences for the same participant as standards-oriented Enhanced MR DICOM. Identity comes from the raw dataset metadata only.'};
+            app.ExportEnhancedDICOMButton.Position = [160 51 218 22];
+            app.ExportEnhancedDICOMButton.Text = 'Export Enhanced MR DICOM(s)';
 
             % Create CreateFigurePanel
             app.CreateFigurePanel = uipanel(app.ExportOptionsPanel);
             app.CreateFigurePanel.AutoResizeChildren = 'off';
             app.CreateFigurePanel.Title = 'Create Figure';
             app.CreateFigurePanel.Scrollable = 'on';
-            app.CreateFigurePanel.Position = [160 4 218 51];
+            app.CreateFigurePanel.Position = [160 4 218 41];
 
             % Create kspaceButton
             app.kspaceButton = uibutton(app.CreateFigurePanel, 'push');
             app.kspaceButton.ButtonPushedFcn = createCallbackFcn(app, @kspaceButtonPushed, true);
             app.kspaceButton.Enable = 'off';
             app.kspaceButton.Tooltip = {'Produce a new figure containing the currently displayed k-space matrix.'};
-            app.kspaceButton.Position = [5 2 100 22];
+            app.kspaceButton.Position = [5 0 100 22];
             app.kspaceButton.Text = 'k-space';
 
             % Create ImageButton
@@ -4159,7 +5676,7 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
             app.ImageButton.ButtonPushedFcn = createCallbackFcn(app, @ImageButtonPushed, true);
             app.ImageButton.Enable = 'off';
             app.ImageButton.Tooltip = {'Produce a new figure containing the currently displayed image.'};
-            app.ImageButton.Position = [109 2 100 22];
+            app.ImageButton.Position = [109 0 100 22];
             app.ImageButton.Text = 'Image';
 
             % Create MultichannelDropDown
@@ -4217,6 +5734,11 @@ fprintf('Selected Diameter (mm): %.2f\nACR Diameter (mm): %.2f\nError (mm): %.2f
 
     % App creation and deletion
     methods (Access = public)
+
+        function report = getLoadTimingReport(app)
+            % Per-sequence timings for the most recent raw pipeline load.
+            report = app.LastLoadReport;
+        end
 
         % Construct app
         function app = FFCProcessingCVI

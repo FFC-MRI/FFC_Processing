@@ -80,6 +80,8 @@ else
     par.seqName = '';
 end
 par.serieName = getSerieNameFromSerieXML(data_path);
+par.serieMetadata = getSerieMetadataFromSerieXML(data_path);
+par.datasetPath = data_path;
 if isfield(par.cameleon, 'SEQUENCE_VERSION')
     par.seqVersion = char(par.cameleon.SEQUENCE_VERSION);
 else
@@ -319,4 +321,47 @@ try
 catch
     % leave as ''
 end
+end
+
+function metadata = getSerieMetadataFromSerieXML(data_path)
+%GETSERIEMETADATAFROMSERIEXML Read top-level patient/study/session metadata
+% stored alongside the raw Cameleon dataset. No DICOM files are required.
+metadata = struct();
+seriePath = fullfile(data_path, 'Serie.xml');
+if ~isfile(seriePath)
+    return;
+end
+try
+    txt = fileread(seriePath);
+    block = regexp(txt, '<metadata>\s*([\s\S]*?)\s*</metadata>', 'tokens', 'once');
+    if ~isempty(block)
+        entries = regexp(block{1}, ...
+            '<entry>\s*<key>\s*(.*?)\s*</key>\s*<value>\s*(.*?)\s*</value>\s*</entry>', ...
+            'tokens');
+        for k = 1:numel(entries)
+            key = matlab.lang.makeValidName(xmlDecodeText(entries{k}{1}));
+            value = xmlDecodeText(entries{k}{2});
+            if ~isempty(key)
+                metadata.(key) = value;
+            end
+        end
+    end
+    tok = regexp(txt, '<serie>\s*<id>\s*(.*?)\s*</id>', 'tokens', 'once');
+    if ~isempty(tok), metadata.SerieID = xmlDecodeText(tok{1}); end
+    tok = regexp(txt, '<serie>[\s\S]*?<uuid>\s*(.*?)\s*</uuid>', 'tokens', 'once');
+    if ~isempty(tok), metadata.SerieUUID = xmlDecodeText(tok{1}); end
+    tok = regexp(txt, '<serie>[\s\S]*?<name>\s*(.*?)\s*</name>', 'tokens', 'once');
+    if ~isempty(tok), metadata.SerieName = xmlDecodeText(tok{1}); end
+catch
+    metadata = struct();
+end
+end
+
+function out = xmlDecodeText(in)
+out = strtrim(char(in));
+out = strrep(out, '&amp;', '&');
+out = strrep(out, '&lt;',  '<');
+out = strrep(out, '&gt;',  '>');
+out = strrep(out, '&quot;','"');
+out = strrep(out, '&apos;', char(39));
 end

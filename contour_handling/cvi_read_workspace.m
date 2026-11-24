@@ -22,9 +22,9 @@ function cvi = cvi_read_workspace(filename)
     [~,~,ext] = fileparts(filename);
     switch lower(ext)
         case '.cvi42ws'
-            contours = readBinaryWorkspace(filename);
+            [contours,workImageOverlays] = readBinaryWorkspace(filename);
         case '.cvi42wsx'
-            contours = readXmlWorkspace(filename);
+            [contours,workImageOverlays] = readXmlWorkspace(filename);
         otherwise
             error('cvi_read_workspace:UnsupportedFormat', ...
                 'Expected a .cvi42ws or .cvi42wsx file.');
@@ -32,16 +32,17 @@ function cvi = cvi_read_workspace(filename)
 
     if isempty(contours)
         error('cvi_read_workspace:NoContours', ...
-            'No supported SAX ventricular contours were found in the workspace.');
+            'No supported cvi42 contours were found in the workspace.');
     end
 
     cvi = struct();
     cvi.workspaceFile = filename;
     cvi.contours = contours;
+    cvi.workImageOverlays = workImageOverlays;
     cvi.importedUtc = datetime('now','TimeZone','UTC');
 end
 
-function contours = readBinaryWorkspace(filename)
+function [contours,workImageOverlays] = readBinaryWorkspace(filename)
     fid = fopen(filename,'rb');
     cleaner = onCleanup(@() fclose(fid)); %#ok<NASGU>
     packed = fread(fid,inf,'*uint8').';
@@ -61,7 +62,10 @@ function contours = readBinaryWorkspace(filename)
     supported = { ...
         'saendocardialContour','LVEndo'; ...
         'saepicardialContour','LVEpi'; ...
-        'sarvendocardialContour','RVEndo'};
+        'sarvendocardialContour','RVEndo'; ...
+        'bloodpoolContour','BloodPool'; ...
+        'saEnhancementReferenceMyoContour','LGEEnhancementReference'; ...
+        'saReferenceMyoContour','LGERemoteReference'};
     uidPattern = utf16beAscii('1.3.');
     uidStarts = strfind(bytes,uidPattern);
     if isempty(uidStarts)
@@ -154,6 +158,153 @@ function contours = readBinaryWorkspace(filename)
         [~,order] = sort([contours.WorkspaceOffset]);
         contours = contours(order);
     end
+
+    % cvi42 stores the actual Tissue Characterization enhancement overlay
+    % separately from the manual ROI contours.  WorkImageOverlays contains
+    % sparse native-pixel and sub-pixel masks for each analysed LGE slice.
+    % Decode those as well so the enhancement boundary itself can be
+    % transferred to FCI, rather than only the FWHM/remote reference ROIs.
+    workImageOverlays = readBinaryWorkImageOverlays(bytes);
+end
+
+function overlays = readBinaryWorkImageOverlays(bytes)
+%CVI_READ_WORK_IMAGE_OVERLAYS Decode cvi42 Tissue Characterization masks.
+%
+% cvi42 serialises each WorkImageOverlay as a QVariant hash containing:
+% Phase, PixelCoordinates, PixelValues, Series, Slice,
+% SubpixelCoordinates, SubpixelValues and SubpixelResolution.  Pixel values
+% describe fully classified native pixels; SubpixelCoordinates preserve the
+% fractional edge of the segmentation (typically at 4x resolution).
+
+    template = struct('SeriesIndex',NaN,'SliceIndex',NaN,'PhaseIndex',NaN, ...
+        'PixelCoordinates',zeros(0,2),'PixelValues',zeros(0,1), ...
+        'SubpixelCoordinates',zeros(0,2),'SubpixelValues',zeros(0,1), ...
+        'SubpixelResolution',1,'WorkspaceOffset',NaN);
+    overlays = repmat(template,0,1);
+
+    workPattern = utf16beAscii('WorkImageOverlays');
+    workStarts = strfind(bytes,workPattern);
+    if isempty(workStarts), return; end
+    workStart = workStarts(1);
+
+    pixelPattern = utf16beAscii('PixelCoordinates');
+    allPixelStarts = strfind(bytes,pixelPattern);
+    allPixelStarts = allPixelStarts(allPixelStarts > workStart);
+    if isempty(allPixelStarts), return; end
+
+    % The next Tissue Characterization setting marks the end of this hash in
+    % the binary workspaces examined so far.  If absent, stop at the end of
+    % the decompressed stream.
+    stopPattern = utf16beAscii('ManualSliderGreyzone');
+    stopStarts = strfind(bytes,stopPattern);
+    stopStarts = stopStarts(stopStarts > workStart);
+    if isempty(stopStarts), workEnd = numel(bytes); else, workEnd = stopStarts(1)-1; end
+    allPixelStarts = allPixelStarts(allPixelStarts < workEnd);
+
+    for k = 1:numel(allPixelStarts)
+        pcStart = allPixelStarts(k);
+        if k < numel(allPixelStarts), blockEnd = allPixelStarts(k+1)-1; else, blockEnd = workEnd; end
+        blockStart = max(workStart,pcStart-256);
+
+        phaseStart = findLastInRange(bytes,utf16beAscii('Phase'),blockStart,pcStart-1);
+        seriesStart = findFirstInRange(bytes,utf16beAscii('Series'),pcStart,blockEnd);
+        sliceStart = findFirstInRange(bytes,utf16beAscii('Slice'),pcStart,blockEnd);
+        pixValStart = findFirstInRange(bytes,utf16beAscii('PixelValues'),pcStart,blockEnd);
+        subCoordStart = findFirstInRange(bytes,utf16beAscii('SubpixelCoordinates'),pcStart,blockEnd);
+        subValStart = findFirstInRange(bytes,utf16beAscii('SubpixelValues'),pcStart,blockEnd);
+        subResStart = findFirstInRange(bytes,utf16beAscii('SubpixelResolution'),pcStart,blockEnd);
+        if any([phaseStart seriesStart sliceStart pixValStart subCoordStart subValStart subResStart] == 0)
+            continue;
+        end
+        try
+            [pixelCoords,~] = readQPointListValue(bytes,pcStart,numel(pixelPattern));
+            pixelVals = readQListIntValue(bytes,pixValStart,numel(utf16beAscii('PixelValues')));
+            [subCoords,~] = readQPointListValue(bytes,subCoordStart,numel(utf16beAscii('SubpixelCoordinates')));
+            subVals = readQListIntValue(bytes,subValStart,numel(utf16beAscii('SubpixelValues')));
+            item = template;
+            item.SeriesIndex = readQVariantIntValue(bytes,seriesStart,numel(utf16beAscii('Series')));
+            item.SliceIndex = readQVariantIntValue(bytes,sliceStart,numel(utf16beAscii('Slice')));
+            item.PhaseIndex = readQVariantIntValue(bytes,phaseStart,numel(utf16beAscii('Phase')));
+            item.SubpixelResolution = readQVariantIntValue(bytes,subResStart,numel(utf16beAscii('SubpixelResolution')));
+            if ~isfinite(item.SubpixelResolution) || item.SubpixelResolution < 1
+                item.SubpixelResolution = 1;
+            end
+            if numel(pixelVals) ~= size(pixelCoords,1), continue; end
+            if numel(subVals) ~= size(subCoords,1), continue; end
+            item.PixelCoordinates = pixelCoords;
+            item.PixelValues = pixelVals(:);
+            item.SubpixelCoordinates = subCoords;
+            item.SubpixelValues = subVals(:);
+            item.WorkspaceOffset = pcStart;
+            overlays(end+1,1) = item; %#ok<AGROW>
+        catch
+            % Do not make the entire workspace unreadable because of an
+            % unfamiliar optional overlay entry. Supported contour objects
+            % are still useful even if one overlay cannot be decoded.
+        end
+    end
+end
+
+function index = findFirstInRange(bytes,pattern,first,last)
+    index = 0;
+    if first > last, return; end
+    rel = strfind(bytes(first:last),pattern);
+    if ~isempty(rel), index = first + rel(1) - 1; end
+end
+
+function index = findLastInRange(bytes,pattern,first,last)
+    index = 0;
+    if first > last, return; end
+    rel = strfind(bytes(first:last),pattern);
+    if ~isempty(rel), index = first + rel(end) - 1; end
+end
+
+function [points,count] = readQPointListValue(bytes,keyStart,keyLength)
+    p = keyStart + keyLength;
+    payloadLength = double(readBEUInt32(bytes,p)); %#ok<NASGU>
+    typeId = double(readBEUInt32(bytes,p+4));
+    if typeId ~= 71
+        error('cvi_read_workspace:UnexpectedPointType','Unexpected cvi42 point-list type %d.',typeId);
+    end
+    count = double(readBEUInt32(bytes,p+9)); % QVariant has a one-byte null flag
+    if count < 0 || count > 1e7, error('Invalid cvi42 point count.'); end
+    dataStart = p + 13;
+    dataEnd = dataStart + 8*count - 1;
+    if dataEnd > numel(bytes), error('Truncated cvi42 point list.'); end
+    raw = typecast(uint8(bytes(dataStart:dataEnd)),'int32');
+    raw = swapbytes(raw);
+    points = reshape(double(raw),2,[]).';
+end
+
+function values = readQListIntValue(bytes,keyStart,keyLength)
+    p = keyStart + keyLength;
+    typeId = double(readBEUInt32(bytes,p+4));
+    if typeId ~= 127
+        error('cvi_read_workspace:UnexpectedListType','Unexpected cvi42 integer-list type %d.',typeId);
+    end
+    q = p + 9; % 4-byte payload length + 4-byte QVariant type + null byte
+    nameLength = double(readBEUInt32(bytes,q)); q = q + 4;
+    q = q + nameLength; % QByteArray type name, normally QList<int>
+    count = double(readBEUInt32(bytes,q)); q = q + 4;
+    if count < 0 || count > 1e7 || q + 4*count - 1 > numel(bytes)
+        error('Invalid cvi42 integer list.');
+    end
+    raw = typecast(uint8(bytes(q:q+4*count-1)),'int32');
+    values = double(swapbytes(raw(:)));
+end
+
+function value = readQVariantIntValue(bytes,keyStart,keyLength)
+    p = keyStart + keyLength;
+    typeId = double(readBEUInt32(bytes,p+4));
+    if typeId ~= 2
+        error('cvi_read_workspace:UnexpectedIntType','Unexpected cvi42 integer type %d.',typeId);
+    end
+    value = double(readBEInt32(bytes,p+9));
+end
+
+function value = readBEInt32(bytes,startIndex)
+    raw = typecast(uint8(bytes(startIndex:startIndex+3)),'int32');
+    value = swapbytes(raw);
 end
 
 
@@ -259,10 +410,13 @@ function closeJavaInputStreams(inflater,input)
     try, input.close(); catch, end
 end
 
-function contours = readXmlWorkspace(filename)
+function [contours,workImageOverlays] = readXmlWorkspace(filename)
     % cvi42wsx is an XML hash.  This implementation follows the public
     % cvi42wsx convention used by research tools such as shortCardiac.
     doc = xmlread(filename);
+    workImageOverlays = struct('SeriesIndex',{},'SliceIndex',{},'PhaseIndex',{}, ...
+        'PixelCoordinates',{},'PixelValues',{},'SubpixelCoordinates',{}, ...
+        'SubpixelValues',{},'SubpixelResolution',{},'WorkspaceOffset',{});
     template = struct('Type','','CVIName','','ImageKey','','ImageUID','', ...
         'FrameIndex0',NaN,'SubpixelResolution',NaN,'PointsPixel',[], ...
         'PixelArea',NaN,'WorkspaceOffset',NaN,'DicomFile','', ...
@@ -272,8 +426,9 @@ function contours = readXmlWorkspace(filename)
     contours = repmat(template,0,1);
     imageStates = findHashKeyNodes(doc.getDocumentElement(),'ImageStates');
     supported = containers.Map( ...
-        {'saendocardialContour','saepicardialContour','sarvendocardialContour'}, ...
-        {'LVEndo','LVEpi','RVEndo'});
+        {'saendocardialContour','saepicardialContour','sarvendocardialContour', ...
+         'bloodpoolContour','saEnhancementReferenceMyoContour','saReferenceMyoContour'}, ...
+        {'LVEndo','LVEpi','RVEndo','BloodPool','LGEEnhancementReference','LGERemoteReference'});
     for n = 1:numel(imageStates)
         imageStateContainer = imageStates{n};
         imageNodes = elementChildren(imageStateContainer);

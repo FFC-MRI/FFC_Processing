@@ -1,0 +1,24 @@
+CVI contours TEST14
+===================
+
+Interactive inversion-recovery polarity editing
+------------------------------------------------
+TEST13 exposed an interactive diagnostic but incorrectly assumed the advanced
+T1 fitter's result fields (tSeconds/displaySignal). The normal ROI/CVI workflow
+uses ffc_simple_t1dispersion, whose fields are timesMs/signedSignal. TEST14 fixes
+the diagnostic for that real data structure.
+
+The simple IR fit has also been corrected at source:
+
+- Automatic sign selection is now independent for each evolution field.
+- Each field therefore has its own automatic early-negative prefix length.
+- Clicking a point in Check fits flips that individual point's sign and refits.
+- Manual negative/positive indices are stored on the ImageReconCore scan object.
+- Manual choices are honoured by subsequent simple-IR refits until Reset manual
+  signs is pressed.
+- The diagnostic shows square markers for manually overridden points.
+- The overview reports the automatic negative-prefix count for each field.
+
+This change applies to ROI and CVI-mask T1 dispersion through
+ffc_simple_t1dispersion. The voxel-wise ffc_simple_t1map path is intentionally
+unchanged and still uses its existing study-wide data-selected prefix.

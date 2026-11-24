@@ -1,0 +1,12 @@
+{
+  "changed_matlab_files": [
+    "ffc_start_cvi.m",
+    "ffc_export_dicom_batch.m",
+    "ffc_plan_dicom_batch.m",
+    "FFCProcessingCVI.m",
+    "ffc_write_dicom_job.m",
+    "dicom_handling/ffc_export_enhanced_mr.m",
+    "tests/test_dicom_batch.m"
+  ],
+  "runtime_tests": "not run"
+}

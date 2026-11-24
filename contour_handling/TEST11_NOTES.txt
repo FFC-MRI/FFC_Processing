@@ -1,0 +1,9 @@
+CVI contours TEST11
+
+- Parses bloodpoolContour, saEnhancementReferenceMyoContour and saReferenceMyoContour in addition to ventricular contours.
+- Parses ModuleTissueCharacterization/WorkImageOverlays sparse masks.
+- Reconstructs the saved LGE enhancement overlay from full pixels plus sub-pixel edge samples and creates a 3-D patient-space mesh for FCI plane intersection.
+- Adds LGE enhancement, enhanced-area reference ROI and remote myocardium ROI display controls.
+- Prefers the LGE series by default when a saved enhancement overlay is available.
+- Detects exact cvi42-derived T1 contour aliases and skips them without counting them as unresolved DICOM matches.
+- Retains TEST10 display-axis mirror behaviour and translation sliders.

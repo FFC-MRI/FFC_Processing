@@ -1,0 +1,27 @@
+{
+  "changed_matlab_files": [
+    "benchmark_ffc_dataset.m",
+    "FFCProcessingCVI.m",
+    "ffc_start_cvi.m",
+    "ffc_disk_cache.m",
+    "ffc_open_cameleon_scan.m",
+    "ffc_reconstruction_key.m",
+    "ffc_reconstruct.m",
+    "ImageReconCore.m",
+    "ffc_preprocess_scans.m",
+    "ffc_normalize_viewer_scan.m",
+    "ffc_invalidate_analysis.m",
+    "tests/test_performance_regressions.m",
+    "kspace_handling/windowkspace.m",
+    "file_handling/open_mrifile.m",
+    "image_handling/ffc_extract_anatomical_plane.m"
+  ],
+  "unchanged_protected_files": [
+    "image_handling/correct_orientation.m",
+    "image_handling/ffc_scan_spatial_geometry.m",
+    "dicom_handling/ffc_export_enhanced_mr.m",
+    "dicom_handling/ffc_extract_dicom_metadata.m",
+    "contour_handling/cvi_import_contours.m"
+  ],
+  "matlab_runtime_tests": "NOT RUN"
+}

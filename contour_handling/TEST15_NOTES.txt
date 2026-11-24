@@ -1,0 +1,29 @@
+CVI contours TEST15
+===================
+
+T1-dispersion inversion-recovery fitting now uses a physically plausible
+T1 range of 20--1500 ms when choosing the signed-magnitude zero crossing.
+
+For each evolution field independently, every allowed early-negative /
+late-positive sign transition is fitted. Candidates whose fitted T1 falls
+outside 20--1500 ms are rejected from automatic selection. The lowest-SSE
+candidate inside the range is used.
+
+Manual point choices in the Check Fits diagnostic are hard sign constraints.
+After a click, the unconstrained points are re-selected automatically and the
+sign transition is moved as needed to retain a 20--1500 ms T1 where possible.
+If no sign pattern consistent with the manual constraints gives a plausible
+T1, that field is excluded from the dispersion curve (T1/R1 = NaN) and the
+best unconstrained fit is shown dashed for diagnosis.
+
+The fit result stores:
+  results.plausibleT1RangeMs
+  results.signCandidateT1ms
+  results.signCandidatePlausible
+and per field:
+  rawT1ms / rawR1
+  fitWithinPlausibleRange
+  candidateT1ms
+  plausibleCandidateMask
+
+The voxel-wise ffc_simple_t1map path is unchanged in this build.

@@ -1,0 +1,7 @@
+TEST20 validation
+=================
+Enhanced DICOM / raw metadata static checks: 20/20 passed.
+Independent numerical reconstruction checks: 22/22 passed.
+
+Runtime note: MATLAB and CVI42 are not installed in the build environment, so
+GUI execution and CVI42 import require scanner-side/user testing.

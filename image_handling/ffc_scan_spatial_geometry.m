@@ -3,7 +3,9 @@ function geometry = ffc_scan_spatial_geometry(scan)
 %
 % Array dimensions are read, phase and slice/partition.  IMAGE_ORIENTATION_
 % SUBJECT supplies the corresponding read and phase unit vectors; their
-% cross-product supplies the third direction.  Distances are returned in mm.
+% cross-product supplies the prescription normal. Returned patient coordinates
+% are DICOM LPS in mm. Cameleon scanner coordinates are converted once here.
+% TEST25 Y/Z conversion is based on the supplied HFS axial/SAX datasets.
 
     orientation = memberValue(scan, 'orientation', []);
     if isempty(orientation)
@@ -30,16 +32,6 @@ function geometry = ffc_scan_spatial_geometry(scan)
         prescriptionPhaseDirection);
     prescriptionSliceDirection = prescriptionSliceDirection ./ ...
         norm(prescriptionSliceDirection);
-
-    % RS2D IMAGE_ORIENTATION_SUBJECT describes the prescription row/column
-    % frame.  With the Cameleon complex-data convention and centred inverse
-    % FFT used by this pipeline, increasing reconstructed phase and partition
-    % indices have the opposite polarity to the prescription column and
-    % normal.  Keeping these bases separate is essential: prescription
-    % offsets use the header frame, whereas displayed image coordinates use
-    % the reconstructed-array frame.
-    phaseDirection = -prescriptionPhaseDirection;
-    sliceDirection = -prescriptionSliceDirection;
 
     fovRead = positiveScalar(memberValue(scan, 'fov', []), NaN);
     fovPhase = positiveScalar(memberValue(scan, 'fov_phase', []), fovRead);
@@ -105,20 +97,54 @@ function geometry = ffc_scan_spatial_geometry(scan)
     twoDimensional = memberValue(scan, 'TwoDimensional', 1);
     isSVS = logicalScalar(memberValue(scan, 'is_svs', false), false);
 
+    % Only Cameleon metadata identifies the scanner convention reviewed in
+    % TEST25. Do not silently apply this conversion to unrelated file formats.
+    parameters = memberValue(scan, 'param', struct());
+    isCameleon = isstruct(parameters) && ...
+        isfield(parameters, 'IMAGE_ORIENTATION_SUBJECT');
+    scannerToPatient = eye(3);
+    if isCameleon
+        scannerToPatient = diag([1 -1 -1]);
+        % The empirical TEST24 export maps native [read phase slice] to
+        % DICOM by reversing both in-plane indices and retaining slice order.
+        % Use the SAME mapping for display/contours, not the previous phase-
+        % and-slice reversal. 3-D ordering still needs scanner validation.
+        arrayBasis = prescriptionBasis * diag([-1 -1 1]);
+    else
+        % Preserve the existing array mapping for legacy input formats.
+        arrayBasis = prescriptionBasis * diag([1 -1 -1]);
+    end
     geometry = struct();
-    geometry.dimensionBasisPatient = ...
-        [readDirection, phaseDirection, sliceDirection];
-    geometry.prescriptionBasisPatient = prescriptionBasis;
-    geometry.centerPatientMm = centerPatientMm;
+    geometry.dimensionBasisPatient = scannerToPatient * arrayBasis;
+    geometry.prescriptionBasisPatient = scannerToPatient * prescriptionBasis;
+    geometry.scannerToPatient = scannerToPatient;
+    geometry.coordinateConvention = 'DICOM LPS';
+    geometry.geometryVersion = 25;
+    geometry.centerPatientMm = scannerToPatient * centerPatientMm;
     geometry.centerSource = centerSource;
-    geometry.localFrameCenterPatientMm = localFrameCenterMm;
-    geometry.centerConsistencyErrorMm = norm( ...
-        centerPatientMm - localFrameCenterMm);
+    geometry.localFrameCenterPatientMm = scannerToPatient * localFrameCenterMm;
+    geometry.centerConsistencyErrorMm = norm(centerPatientMm - localFrameCenterMm);
     geometry.fovMm = [fovRead, fovPhase, fovSlice];
     geometry.matrixSize = matrixSize;
     geometry.spacingMm = geometry.fovMm ./ matrixSize;
     geometry.is3D = ~isSVS && finiteScalar(twoDimensional, 1) ~= 1 && ...
         matrixSize(3) > 1;
+    if ~isSVS && finiteScalar(twoDimensional, 1) == 1
+        thicknessMm = 1000 * positiveScalar( ...
+            parameterValue(scan, 'SLICE_THICKNESS', []), NaN);
+        if ~isfinite(thicknessMm)
+            thicknessMm = positiveScalar(memberValue(scan, 'thk', []), NaN);
+        end
+        gapMm = 1000 * finiteScalar( ...
+            parameterValue(scan, 'SPACING_BETWEEN_SLICE', 0), 0);
+        if gapMm < 0
+            error('ffc_scan_spatial_geometry:NegativeGap', ...
+                'SPACING_BETWEEN_SLICE is a physical gap and must be nonnegative.');
+        end
+        if isfinite(thicknessMm)
+            geometry.spacingMm(3) = thicknessMm + gapMm;
+        end
+    end
 end
 
 

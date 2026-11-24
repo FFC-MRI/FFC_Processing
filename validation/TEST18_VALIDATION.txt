@@ -1,0 +1,9 @@
+TEST 18 validation summary
+Existing independent reconstruction/geometry numerical checks: 22/22 passed
+Maximum reported error: 1.3328003944934608e-07
+
+SHA-256 of TEST18-specific files:
+a1a4ca6f0a35493daf3b37bb39a6b6467da0eca8dbd0c50987eaf5008eec96e1  FFCProcessingCVI.m
+45964b774356e1cb35187ea30da56e99dde3e49f603cb5bcd6ebc32d5cdbb3d7  ffc_fit_t1_dispersion_model.m
+2cc093741c532d58ceb7bb48094d787374bf245c26e731822eb3b714957e3268  ffc_start_cvi.m
+783004c62c40528b62bb820812fd1398ceb11ed4d5b46bc4493c16dcb0477989  T1_DISPERSION_MODELS_TEST18.md

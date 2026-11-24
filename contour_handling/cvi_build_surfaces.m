@@ -5,7 +5,7 @@ function surfaces = cvi_build_surfaces(contours)
 % intended as a diagnostic volumetric segmentation.  Rings are re-sampled
 % by arc length and cyclically aligned between adjacent slices.
 
-    types = {'LVEndo','LVEpi','RVEndo'};
+    types = {'LVEndo','LVEpi','RVEndo','LGEEnhancementReference','LGERemoteReference'};
     phases = unique([contours.PhaseIndex]);
     template = struct('Type','','PhaseIndex',NaN,'Vertices',[],'Faces',[], ...
         'SliceCount',0,'SliceIndices',[]);

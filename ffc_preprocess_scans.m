@@ -13,6 +13,11 @@ function [scans, names, failures] = ffc_preprocess_scans(inputScans, options)
     nAccepted = 0;
 
     for sequenceIndex = 1:numel(inputScans)
+        if isfield(options,'progress') && ~isempty(options.progress)
+            if ~options.progress(sequenceIndex,numel(inputScans))
+                error('ffc:LoadCancelled','Dataset loading cancelled.');
+            end
+        end
         try
             scan = rename_sequence(inputScans{sequenceIndex});
             if isfield(options, 'backgroundselect')
@@ -25,6 +30,16 @@ function [scans, names, failures] = ffc_preprocess_scans(inputScans, options)
                 scan.checkfit = options.checkfit;
             end
             scan = preprocessing(scan);
+            if isfield(options,'reconstruct') && options.reconstruct
+                scan = ffc_normalize_viewer_scan(scan);
+                reused = ffc_reconstruction_valid(scan);
+                scan = buildimages(scan,false);
+                % Only raw-folder baseline reconstructions are disk cached.
+                % Manual postprocessing remains in the current session.
+                if ~reused && ~isempty(scan.disk_cache_source)
+                    ffc_disk_cache('save',scan.disk_cache_source,scan);
+                end
+            end
 
             nAccepted = nAccepted + 1;
             scans{nAccepted} = scan;

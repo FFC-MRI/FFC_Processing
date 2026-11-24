@@ -1,4 +1,4 @@
-function [plane, view] = ffc_extract_anatomical_plane(volume, scan, planeName, sliceIndex, geomT)
+function [plane, view] = ffc_extract_anatomical_plane(volume, scan, planeName, sliceIndex, geomT, timeIndex, fieldIndex)
 %FFC_EXTRACT_ANATOMICAL_PLANE Extract and losslessly orient one volume plane.
 
     if nargin < 5 || isempty(geomT)
@@ -14,6 +14,11 @@ function [plane, view] = ffc_extract_anatomical_plane(volume, scan, planeName, s
     % Select the thin native slab before permuting, avoiding a volume copy.
     indices = repmat({':'}, 1, max(3, ndims(volume)));
     indices{view.normalDimension} = min(view.sliceIndex, size(volume,view.normalDimension));
+    if nargin >= 6
+        indices{4} = timeIndex;
+        if nargin < 7, fieldIndex = 1; end
+        indices{5} = fieldIndex;
+    end
     permuted = permute(volume(indices{:}), permutation);
     plane = permuted(:, :, 1, :);
     plane = reshape(plane, size(permuted, 1), size(permuted, 2), []);

@@ -6,9 +6,8 @@ function view = ffc_anatomical_plane_geometry(scan, planeName, sliceIndex, geomT
 % bottom, so the compass uses -basisY for its screen-up direction.  The
 % acquisition dimensions are selected from IMAGE_ORIENTATION_SUBJECT and are
 % then signed to the same patient convention for every 2D/3D acquisition.
-% RS2D subject coordinates are +X=R, +Y=A and +Z=H, so the canonical
-% radiological display has axial/coronal left=R, right=L and axial
-% top=A, bottom=P.
+% Patient coordinates are DICOM LPS: +X left, +Y posterior, +Z head.
+% The canonical radiological screen has right=L and axial down=P.
 
     if nargin < 2 || isempty(planeName)
         planeName = 'Axial';
@@ -28,15 +27,15 @@ function view = ffc_anatomical_plane_geometry(scan, planeName, sliceIndex, geomT
     switch planeName
         case 'Axial'
             targetNormal = [0; 0; 1];
-            targetHorizontal = [-1; 0; 0]; % screen right = patient L
-            targetRowDown = [0; -1; 0];    % screen down = patient P
+            targetHorizontal = [1; 0; 0]; % screen right = patient L
+            targetRowDown = [0; 1; 0];    % screen down = patient P
         case 'Coronal'
             targetNormal = [0; 1; 0];
-            targetHorizontal = [-1; 0; 0]; % screen right = patient L
+            targetHorizontal = [1; 0; 0]; % screen right = patient L
             targetRowDown = [0; 0; -1];    % screen down = patient F
         otherwise % Sagittal
             targetNormal = [1; 0; 0];
-            targetHorizontal = [0; -1; 0]; % screen right = patient P
+            targetHorizontal = [0; 1; 0]; % screen right = patient P
             targetRowDown = [0; 0; -1];    % screen down = patient F
     end
 

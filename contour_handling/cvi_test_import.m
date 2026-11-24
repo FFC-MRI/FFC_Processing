@@ -13,15 +13,19 @@ function report = cvi_test_import(workspaceFile,dicomRoot)
     report = struct();
     report.MatchedContours = numel(cvi.contours);
     report.UnmatchedContours = cvi.unmatchedContourCount;
+    report.DerivedDuplicateContours = cvi.derivedDuplicateContourCount;
+    report.DerivedDuplicateVentricularContours = cvi.derivedDuplicateVentricularCount;
     report.NumberOfSeries = numel(cvi.series);
     report.DefaultSeries = cvi.defaultSeriesIndex;
     report.Series = repmat(struct('Description','','ContourCount',0, ...
         'NumberOfFrames',0,'NumberOfPhases',0,'PhaseLabels',{{}}, ...
-        'SurfaceCount',0,'ClinicalSliceIndices',[],'ClinicalStackNormalPatient',[NaN NaN NaN]),numel(cvi.series),1);
+        'SurfaceCount',0,'ClinicalSliceIndices',[],'ClinicalStackNormalPatient',[NaN NaN NaN], ...
+        'LGEEnhancementAvailable',false,'LGEOverlayCount',0),numel(cvi.series),1);
 
     fprintf('\ncvi42 import diagnostic\n');
     fprintf('  Matched contours:   %d\n',report.MatchedContours);
-    fprintf('  Unmatched contours: %d\n',report.UnmatchedContours);
+    fprintf('  Derived duplicates: %d (%d ventricular)\n',report.DerivedDuplicateContours,report.DerivedDuplicateVentricularContours);
+    fprintf('  Unresolved contours:%d\n',report.UnmatchedContours);
     fprintf('  DICOM source groups:%d\n',report.NumberOfSeries);
     for s = 1:numel(cvi.series)
         series = cvi.series(s);
@@ -33,12 +37,17 @@ function report = cvi_test_import(workspaceFile,dicomRoot)
         report.Series(s).SurfaceCount = numel(series.Surfaces);
         report.Series(s).ClinicalSliceIndices = series.ClinicalSliceIndices;
         report.Series(s).ClinicalStackNormalPatient = series.ClinicalStackNormalPatient;
+        report.Series(s).LGEEnhancementAvailable = series.LGEEnhancementAvailable;
+        report.Series(s).LGEOverlayCount = series.LGEOverlayCount;
         marker = ' ';
         if s == cvi.defaultSeriesIndex, marker = '*'; end
         fprintf('%s Series %d: %s\n',marker,s,series.Description);
         fprintf('    contours=%d, frames=%d, phases=%d, surfaces=%d\n', ...
             series.ContourCount,series.NumberOfFrames,series.NumberOfPhases, ...
             numel(series.Surfaces));
+        if series.LGEEnhancementAvailable
+            fprintf('    saved LGE enhancement overlay: %d matched slice(s)\n',series.LGEOverlayCount);
+        end
         fprintf('    available contour phases: %s\n',strjoin(series.PhaseLabels,', '));
         fprintf('    clinical slice indices: %s\n',mat2str(series.ClinicalSliceIndices));
         fprintf('    clinical stack normal: %s\n',mat2str(series.ClinicalStackNormalPatient,4));

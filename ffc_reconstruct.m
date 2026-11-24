@@ -5,7 +5,17 @@ function scan = ffc_reconstruct(scan, force)
         error('ImageReconCore:NoPreprocessedKspace', ...
             'Run preprocessing successfully before buildimages.');
     end
-    scan.complexkspace = scan.originalcomplexkspace;
+    rfConfig = ffc_rf_correction_config(scan);
+    sourceKey = struct('generation',scan.source_generation, ...
+        'size',size(scan.originalcomplexkspace),'rfCorrection',rfConfig);
+    model = [];
+    if ~force && isfield(scan.rf_correction_info,'sourceKey') && ...
+            isequaln(scan.rf_correction_info.sourceKey,sourceKey)
+        model = scan.rf_correction_info;
+    end
+    [scan.complexkspace, scan.rf_correction_info] = ...
+        ffc_correct_rf(scan.originalcomplexkspace,rfConfig,model);
+    scan.rf_correction_info.sourceKey = sourceKey;
     scan.fov_offsets_applied = false;
     scan = apply_fov_offset_phase_ramp(scan);
     source = scan.complexkspace;
@@ -34,7 +44,7 @@ function scan = ffc_reconstruct(scan, force)
         logical(scan.noise_whitening) && nc > 1;
     % Calibration depends on the corrected source, not FFT size or selection.
     calibrationKey = struct('source',scan.source_generation,'size',sz, ...
-        'offsets',scan.fov_offset_info);
+        'offsets',scan.fov_offset_info,'rfCorrection',rfConfig);
     if whiten
         if ~force && ~isempty(scan.whitening_cache) && ...
                 isequaln(scan.whitening_cache_key, calibrationKey)
@@ -65,12 +75,18 @@ function scan = ffc_reconstruct(scan, force)
     if ~isfinite(target(3)) || target(3) < sz(3)
         error('buildimages:partitionFftSizeTooSmall', 'Partition FFT size is smaller than acquired data.');
     end
-    mode = "ACS/Walsh";
-    if ~isempty(scan.combination), mode = string(scan.combination); end
+    mode = 'ACS/Walsh';
+    if ~isempty(scan.combination), mode = char(scan.combination); end
     bias = strcmpi(scan.biascorrect, 'ACS') && nSel > 1;
-    needMaps = nSel > 1 && (mode == "ACS/Walsh" || bias);
+    needMaps = nSel > 1 && (strcmp(mode,'ACS/Walsh') || bias);
     maps = [];
-    if needMaps
+    mapKey = struct('calibration',calibrationKey,'whiten',whiten, ...
+        'selection',sel,'target',target,'window',scan.window_function, ...
+        'windowSize',scan.window_size,'is2D',scan.TwoDimensional);
+    if needMaps && ~force && ~isempty(scan.sensitivity_cache) && ...
+            isequaln(scan.sensitivity_cache_key,mapKey)
+        maps = scan.sensitivity_cache;
+    elseif needMaps
         % Preserve mean(mean(...,field,'omitnan'),time,'omitnan').
         refSize = [sz(1:3) 1 1 nSel];
         total = zeros(refSize,'like',source);
@@ -93,6 +109,8 @@ function scan = ffc_reconstruct(scan, force)
         reference = windowkspace(reference, scan.window_size, scan.window_function);
         reference = ffc_center_pad(reference, target);
         maps = estimate_maps_from_acs_walsh(reference, 1:nSel, scan);
+        scan.sensitivity_cache = maps;
+        scan.sensitivity_cache_key = mapKey;
         clear reference
     end
 
@@ -100,7 +118,7 @@ function scan = ffc_reconstruct(scan, force)
     scan.magimage = zeros(outSize, class(source));
     scan.complexcombined = zeros(outSize, 'like', source);
     scan.magkspace = zeros(sz(1:5), class(source));
-    keepCoils = nSel > 1 && mode ~= "Adaptive" && mode ~= "ACS/Walsh" && ...
+    keepCoils = nSel > 1 && ~any(strcmp(mode,{'Adaptive','ACS/Walsh'})) && ...
         scan.retain_coil_images;
     scan.compleximage = [];
     if keepCoils
@@ -122,10 +140,10 @@ function scan = ffc_reconstruct(scan, force)
             clear block
             if nSel == 1
                 combined = coils; magnitude = abs(combined);
-            elseif mode == "Adaptive"
+            elseif strcmp(mode,'Adaptive')
                 combined = combine_adaptive_smoothed(coils,ccopts);
                 magnitude = abs(combined);
-            elseif mode == "ACS/Walsh"
+            elseif strcmp(mode,'ACS/Walsh')
                 combined = combine_with_maps(coils,maps,1:nSel,scan);
                 magnitude = abs(combined);
             else
@@ -138,5 +156,6 @@ function scan = ffc_reconstruct(scan, force)
     end
     if ~keepCoils, scan.compleximage = scan.complexcombined; end
     if bias, scan.magimage = map_guided_bias_correct(scan.magimage,maps,scan); end
-    scan.phaseimage = angle(scan.complexcombined);
+    scan.phaseimage = [];
+    if scan.retain_phase_images, scan.phaseimage = angle(scan.complexcombined); end
 end

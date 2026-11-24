@@ -1,0 +1,13 @@
+CVI contours TEST16
+===================
+
+T1 dispersion results:
+- Added GUI results table with Field, T1, R1, status, negative points, manual constraints, RMSE, R^2 and raw T1.
+- Added CSV, XLSX and MATLAB workspace export. XLSX includes a Metadata sheet where available.
+- Added a main Relaxometry-panel "T1 Dispersion Results" button and Results/CSV controls in the Check-fits window.
+
+Manual polarity correction:
+- Larger recovery-point markers.
+- Point numbers drawn beside each sample.
+- Clicking near a point (not just directly on its marker) toggles the nearest sample within a normalized 10% axes-radius hit zone.
+- Existing manual constraints and 20--1500 ms plausibility handling are retained.

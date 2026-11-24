@@ -306,3 +306,164 @@ function Y = legacyLlr(X,opts)
         idx = wgt>0; Y(idx) = acc(idx)./wgt(idx); Y = max(Y,0);
     end
 end
+
+function testViewerBatchReadyAndSwitchingDoesNotRebuild(testCase)
+    input = {makeScan(true),makeScan(false)};
+    [scans,names,failures] = ffc_preprocess_scans(input, ...
+        struct('reconstruct',true,'reprocess',false));
+    verifyEmpty(testCase,failures); verifyNumElements(testCase,names,2);
+    generation = cellfun(@(x) x.reconstruction_generation,scans);
+    for index = [1 2 1 2 1]
+        scans{index} = ffc_normalize_viewer_scan(scans{index});
+        verifyTrue(testCase,ffc_reconstruction_valid(scans{index}));
+        scans{index} = buildimages(scans{index},false);
+    end
+    verifyEqual(testCase,cellfun(@(x) x.reconstruction_generation,scans),generation);
+    verifyFalse(testCase,scans{1}.retain_coil_images);
+end
+
+function testAnalysisMetadataDoesNotInvalidateOrEraseResults(testCase)
+    scan = buildimages(ffc_normalize_viewer_scan(makeScan(true)),false);
+    generation = scan.reconstruction_generation;
+    scan.param.CVIDispersionMask = struct('mask',true(9,7),'registration',eye(4));
+    scan.param.T1DispersionModelFit = struct('model','power law','R1',1:3);
+    scan.param.LastEnhancedDICOMExport = struct('folder','example');
+    scan.T1FitResults = struct('T1ms',[100 200 300]);
+    scan.mask = true(9,7); scan.T1Maps = ones(9,7,3);
+    scan.registration_tform = struct('test',true);
+    before = scan;
+    scan = buildimages(scan,false);
+    verifyEqual(testCase,scan.reconstruction_generation,generation);
+    verifyEqual(testCase,scan.T1FitResults,before.T1FitResults);
+    verifyEqual(testCase,scan.mask,before.mask);
+    verifyEqual(testCase,scan.T1Maps,before.T1Maps);
+    verifyEqual(testCase,scan.registration_tform,before.registration_tform);
+    rebuilt = buildimages(scan,true);
+    verifyEmpty(testCase,rebuilt.T1FitResults);
+    verifyFalse(testCase,isfield(rebuilt.param,'T1DispersionModelFit'));
+    verifyFalse(testCase,isfield(rebuilt.param,'CVIDispersionMask'));
+end
+
+function testRealSettingsAndOffsetsStillInvalidate(testCase)
+    scan = buildimages(ffc_normalize_viewer_scan(makeScan(true)),false);
+    settings = {'fft_size','window_size','noise_whitening','multichannel_recon'};
+    values = {18,0.8,true,[2 1]};
+    for k = 1:numel(settings)
+        changed = scan; changed.(settings{k}) = values{k};
+        verifyFalse(testCase,ffc_reconstruction_valid(changed));
+    end
+    for name = {'OFF_CENTER_FIELD_OF_VIEW_1D','OFF_CENTER_FIELD_OF_VIEW_2D', ...
+            'OFF_CENTER_FIELD_OF_VIEW_3D','FIELD_OF_VIEW','FIELD_OF_VIEW_PHASE','FIELD_OF_VIEW_3D'}
+        changed = scan; changed.param.(name{1}) = 0.013;
+        verifyFalse(testCase,ffc_reconstruction_valid(changed));
+    end
+    changed = scan; changed.param.OFF_CENTER_FIELD_OF_VIEW_EFF = [0.01 0 0];
+    verifyFalse(testCase,ffc_reconstruction_valid(changed));
+end
+
+function testViewerDefaultsAreIdempotent(testCase)
+    scan = makeScan(true);
+    scan.multichannel_recon = logical([1 0 1 0]);
+    scan.window_function = 'none'; scan.fft_size_3d = [];
+    scan = ffc_normalize_viewer_scan(scan);
+    key = ffc_reconstruction_key(scan);
+    scan = ffc_normalize_viewer_scan(scan);
+    verifyEqual(testCase,ffc_reconstruction_key(scan),key);
+    verifyEqual(testCase,scan.multichannel_recon,[1 3]);
+    verifyEqual(testCase,scan.window_function,'None');
+end
+
+function testDirectSlabMatchesVolumeExtraction(testCase)
+    for is2D = [true false]
+        scan = buildimages(makeScan(is2D));
+        for name = {'Axial','Coronal','Sagittal'}
+            for transform = {eye(3),[0 -1 0;1 0 0;0 0 1],[-1 0 0;0 1 0;0 0 1]}
+                volume = scan.magimage(:,:,:,2,3);
+                expected = ffc_extract_anatomical_plane(volume,scan,name{1},2,transform{1});
+                actual = ffc_extract_anatomical_plane(scan.magimage,scan,name{1},2,transform{1},2,3);
+                verifyEqual(testCase,actual,expected);
+            end
+        end
+    end
+end
+
+function testDeferredPhaseMatchesStoredPhase(testCase)
+    full = buildimages(makeScan(false));
+    lean = buildimages(ffc_normalize_viewer_scan(makeScan(false)),false);
+    verifyEmpty(testCase,lean.phaseimage);
+    for name = {'Axial','Coronal','Sagittal'}
+        expected = ffc_extract_anatomical_plane(full.phaseimage,full,name{1},2,eye(3),2,3);
+        actual = angle(ffc_extract_anatomical_plane(lean.complexcombined,lean,name{1},2,eye(3),2,3));
+        verifyEqual(testCase,actual,expected);
+    end
+end
+
+function testSensitivityCacheAndInvalidation(testCase)
+    scan = makeScan(false); scan.combination = 'ACS/Walsh';
+    scan = buildimages(scan,false);
+    key = scan.sensitivity_cache_key; maps = scan.sensitivity_cache;
+    scan.biascorrect = 'ACS';
+    reused = buildimages(scan,false);
+    forced = buildimages(scan,true);
+    verifyEqual(testCase,reused.sensitivity_cache_key,key);
+    verifyEqual(testCase,reused.sensitivity_cache,maps);
+    verifyEqual(testCase,reused.magimage,forced.magimage,'AbsTol',single(5e-5));
+    reused.multichannel_recon = [2 1]; reused = buildimages(reused,false);
+    verifyNotEqual(testCase,reused.sensitivity_cache_key,key);
+    verifyEqual(testCase,size(reused.sensitivity_cache,6),2);
+end
+
+function testBatchCancellationAndFailureIsolation(testCase)
+    good = makeScan(true); bad = good;
+    bad.fft_size = 1;
+    [scans,names,failures] = ffc_preprocess_scans({good,bad,good},struct('reconstruct',true));
+    verifyNumElements(testCase,scans,2); verifyNumElements(testCase,names,2);
+    verifyEqual(testCase,failures.sequenceIndex,2);
+    verifyTrue(testCase,all(cellfun(@ffc_reconstruction_valid,scans)));
+    verifyError(testCase,@() ffc_preprocess_scans({good,good}, ...
+        struct('reconstruct',true,'progress',@(i,n) i < 2)), 'ffc:LoadCancelled');
+end
+
+function testDiskCacheRoundTripAndSourceChanges(testCase)
+    root = tempname; mkdir(root); cache = fullfile(root,'cache');
+    names = {'DiskCacheDirectory','DiskCacheEnabled'};
+    old = cell(1,2); existed = false(1,2);
+    for k = 1:2
+        existed(k) = ispref('FFCProcessing',names{k});
+        if existed(k), old{k} = getpref('FFCProcessing',names{k}); end
+    end
+    cleanup = onCleanup(@restore); %#ok<NASGU>
+    setpref('FFCProcessing','DiskCacheDirectory',cache);
+    setpref('FFCProcessing','DiskCacheEnabled',true);
+    writeBytes(fullfile(root,'data.dat'),uint8(1:20));
+    writeBytes(fullfile(root,'header.xml'),uint8('<header>one</header>'));
+    writeBytes(fullfile(root,'Serie.xml'),uint8('<serie>one</serie>'));
+    scan = buildimages(ffc_normalize_viewer_scan(makeScan(true)),false);
+    scan.disk_cache_source = root;
+    scan.disk_cache_identity = ffc_disk_cache('identity',root);
+    verifyTrue(testCase,ffc_disk_cache('save',root,scan));
+    restored = ffc_disk_cache('load',root);
+    verifyEqual(testCase,restored.magimage,scan.magimage);
+    verifyEqual(testCase,restored.reconstruction_generation,scan.reconstruction_generation);
+    % Metadata changes invalidate even when the byte length stays the same.
+    writeBytes(fullfile(root,'Serie.xml'),uint8('<serie>two</serie>'));
+    verifyEmpty(testCase,ffc_disk_cache('load',root));
+    writeBytes(fullfile(root,'Serie.xml'),uint8('<serie>one</serie>'));
+    writeBytes(fullfile(root,'header.xml'),uint8('<header>two</header>'));
+    verifyEmpty(testCase,ffc_disk_cache('load',root));
+    writeBytes(fullfile(root,'header.xml'),uint8('<header>one</header>'));
+    writeBytes(fullfile(root,'data.dat'),uint8(1:21));
+    verifyEmpty(testCase,ffc_disk_cache('load',root));
+    verifyEmpty(testCase,ffc_disk_cache('save',root,scan));
+    function restore()
+        for j = 1:2
+            if existed(j), setpref('FFCProcessing',names{j},old{j});
+            elseif ispref('FFCProcessing',names{j}), rmpref('FFCProcessing',names{j}); end
+        end
+        if isfolder(root), rmdir(root,'s'); end
+    end
+end
+function writeBytes(file,bytes)
+    fid = fopen(file,'wb'); cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+    fwrite(fid,bytes,'uint8');
+end

@@ -33,6 +33,13 @@ if strcmpi(windowtype, 'None') && window_size == 1
     return;
 end
 
+persistent cachedKey cachedWindow
+key = {n1,n2,window_size,windowtype};
+if isequaln(key,cachedKey)
+    windowed_kspace = reshape(kspace_reshaped .* cachedWindow,dims);
+    return;
+end
+
 % Calculate requested window dimensions.
 % Do NOT force even sizes. Odd-sized matrices need odd-sized windows.
 windowdim1 = max(1, round(window_size * n1));
@@ -77,6 +84,9 @@ windowfull = window1 * window2.';
 
 % Centre crop or centre pad to exactly match k-space size
 windowfull = centre_crop_or_pad_2d(windowfull, n1, n2);
+
+cachedKey = key;
+cachedWindow = windowfull;
 
 % Apply window, preserving trailing dimensions
 windowed_kspace = reshape(kspace_reshaped .* windowfull, dims);

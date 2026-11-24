@@ -58,4 +58,4 @@ TEST 6 keeps bulk copying within Java when possible and has a scalar Java
 read fallback that is compatible with older MATLAB releases.
 
 
-TEST 9: Added live R/L, A/P and H/F translation sliders (numeric fields retained).
+TEST 10: Added live R/L, A/P and H/F translation sliders (numeric fields retained).

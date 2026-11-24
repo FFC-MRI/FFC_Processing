@@ -2,12 +2,9 @@ function cvi = cvi_import_contours(workspaceFile,dicomRoot)
 %CVI_IMPORT_CONTOURS Import cvi42 contours and attach clinical DICOM geometry.
 %
 %   CVI = CVI_IMPORT_CONTOURS(WORKSPACEFILE,DICOMROOT) reads ventricular
-%   contours and converts every matched point into the same subject-coordinate
-%   basis used by RS2D IMAGE_ORIENTATION_SUBJECT, in millimetres.  For the
-%   supplied cardiac data the RS2D orientation vectors are numerically in the
-%   same LPS-like basis as the clinical DICOM direction cosines, so the DICOM
-%   X/Y coordinates must NOT be sign-flipped.  TEST6 incorrectly converted
-%   them to RAH, producing the large artificial registration rotations.
+%   contours and converts every matched point into DICOM LPS millimetres.
+%   TEST25 FCI geometry is also returned in LPS by ffc_scan_spatial_geometry.
+%   Clinical DICOM points must not receive the scanner Y/Z conversion.
 
     cvi = cvi_read_workspace(workspaceFile);
     if ~isfolder(dicomRoot)
@@ -59,9 +56,10 @@ function cvi = cvi_import_contours(workspaceFile,dicomRoot)
         end
     end
 
-    unmatched = false(numel(cvi.contours),1);
-    for c = 1:numel(cvi.contours)
-        uidIndex = find(strcmp(uniqueUIDs,cvi.contours(c).ImageUID),1);
+    decodedContours = cvi.contours;
+    directMatched = false(numel(decodedContours),1);
+    for c = 1:numel(decodedContours)
+        uidIndex = find(strcmp(uniqueUIDs,decodedContours(c).ImageUID),1);
         candidates = uidMatches{uidIndex};
         selected = '';
         selectedInfo = [];
@@ -71,39 +69,46 @@ function cvi = cvi_import_contours(workspaceFile,dicomRoot)
                 continue;
             end
             nFrames = dicomFrameCount(info);
-            if cvi.contours(c).FrameIndex0 + 1 <= nFrames
+            if decodedContours(c).FrameIndex0 + 1 <= nFrames
                 selected = candidates{f};
                 selectedInfo = info;
                 break;
             end
         end
-        if isempty(selected)
-            unmatched(c) = true;
-            continue;
-        end
-        frameNumber = cvi.contours(c).FrameIndex0 + 1;
+        if isempty(selected), continue; end
+        frameNumber = decodedContours(c).FrameIndex0 + 1;
         geometry = cvi_dicom_frame_geometry(selectedInfo,frameNumber);
-        points = cvi.contours(c).PointsPixel;
+        points = decodedContours(c).PointsPixel;
         x = points(:,1).'; % increasing DICOM column index
         y = points(:,2).'; % increasing DICOM row index
         patientLPS = geometry.imagePositionPatient + ...
             geometry.rowDirection .* (geometry.columnSpacingMm .* x) + ...
             geometry.columnDirection .* (geometry.rowSpacingMm .* y);
-        % Keep the DICOM patient coordinates in their native LPS-like subject
-        % basis.  RS2D IMAGE_ORIENTATION_SUBJECT in these FCI datasets uses
-        % the same numerical basis.  Converting to RAH here would place the
-        % clinical and FCI geometry in different coordinate systems.
-        patientSubject = patientLPS;
-        cvi.contours(c).DicomFile = selected;
-        cvi.contours(c).PointsPatientMm = patientSubject.';
-        cvi.contours(c).FramePositionPatientMm = geometry.imagePositionPatient(:).';
-        cvi.contours(c).FrameNormalPatient = geometry.normalDirection(:).';
-        cvi.contours(c).SliceIndex = geometry.inStackPositionNumber;
-        cvi.contours(c).DicomPhaseIndex = geometry.phaseIndex;
+        decodedContours(c).DicomFile = selected;
+        decodedContours(c).PointsPatientMm = patientLPS.';
+        decodedContours(c).FramePositionPatientMm = geometry.imagePositionPatient(:).';
+        decodedContours(c).FrameNormalPatient = geometry.normalDirection(:).';
+        decodedContours(c).SliceIndex = geometry.inStackPositionNumber;
+        decodedContours(c).DicomPhaseIndex = geometry.phaseIndex;
+        directMatched(c) = true;
     end
 
-    cvi.unmatchedContourCount = nnz(unmatched);
-    cvi.contours = cvi.contours(~unmatched);
+    % cvi42 can create derived processing images (notably T1 maps) with its
+    % own 1.3.6.1.4.1.53684... UIDs, then copy the source contours onto
+    % those images. Scanner exports need not contain those derived images.
+    % Detect exact contour-set duplicates and treat them as aliases instead
+    % of reporting them as missing geometry or inserting duplicate surfaces.
+    [derivedDuplicate,duplicateGroups] = detectDerivedDuplicateContours(decodedContours,directMatched);
+    unresolved = ~directMatched & ~derivedDuplicate;
+    primaryMask = ismember({decodedContours.Type},{'LVEndo','LVEpi','RVEndo'}).';
+    cvi.decodedContourCount = numel(decodedContours);
+    cvi.directMatchedContourCount = nnz(directMatched);
+    cvi.derivedDuplicateContourCount = nnz(derivedDuplicate);
+    cvi.derivedDuplicateVentricularCount = nnz(derivedDuplicate & primaryMask);
+    cvi.unmatchedContourCount = nnz(unresolved);
+    cvi.unmatchedVentricularContourCount = nnz(unresolved & primaryMask);
+    cvi.derivedDuplicateGroups = duplicateGroups;
+    cvi.contours = decodedContours(directMatched);
     if isempty(cvi.contours)
         error('cvi_import_contours:NoGeometryMatches', ...
             ['Contours were decoded, but none could be matched to image DICOMs. ', ...
@@ -117,7 +122,9 @@ function cvi = cvi_import_contours(workspaceFile,dicomRoot)
         'PhaseIndices',[],'PhaseLabels',{{}},'PhaseItemsData',[], ...
         'SourceCenterPatientMm',[0 0 0],'Surfaces',[], ...
         'NumberOfFrames',1,'NumberOfPhases',1,'ContourCount',0, ...
-        'ClinicalStackNormalPatient',[NaN NaN NaN],'ClinicalSliceIndices',[]);
+        'ClinicalStackNormalPatient',[NaN NaN NaN],'ClinicalSliceIndices',[], ...
+        'PrimaryContourCount',0,'LGEEnhancementAvailable',false, ...
+        'LGEOverlayCount',0,'LGEOverlayDetails',struct());
     cvi.series = repmat(seriesTemplate,0,1);
 
     for s = 1:numel(sourceFiles)
@@ -155,19 +162,104 @@ function cvi = cvi_import_contours(workspaceFile,dicomRoot)
         series.NumberOfFrames = nFrames;
         series.NumberOfPhases = nPhases;
         series.ContourCount = numel(indices);
+        primary = ismember({cvi.contours(indices).Type},{'LVEndo','LVEpi','RVEndo'});
+        series.PrimaryContourCount = nnz(primary);
         series.SourceCenterPatientMm = sourceCentre(cvi.contours,indices);
         series.Surfaces = cvi_build_surfaces(cvi.contours(indices));
+
+        % The cvi42 LGE coloured enhancement overlay is not a normal contour
+        % object. It is stored as a sparse WorkImageOverlay mask. Reconstruct
+        % it and attach a patient-space mesh to the matching LGE series.
+        [lgeSurface,lgeDetails] = cvi_build_lge_enhancement_surface( ...
+            cvi.workImageOverlays,cvi.contours(indices),info);
+        series.LGEEnhancementAvailable = lgeDetails.available;
+        series.LGEOverlayCount = lgeDetails.matchedOverlayCount;
+        series.LGEOverlayDetails = lgeDetails;
+        if lgeDetails.available
+            series.Surfaces(end+1,1) = lgeSurface; %#ok<AGROW>
+        end
         [series.ClinicalStackNormalPatient,series.ClinicalSliceIndices] = ...
             clinicalStackMetadata(cvi.contours(indices));
         cvi.series(end+1,1) = series; %#ok<AGROW>
     end
 
-    cvi.coordinateConvention = 'DICOM/RS2D subject coordinates (LPS-like numerical basis)';
+    cvi.coordinateConvention = 'DICOM LPS (TEST25 shared patient geometry)';
 
-    % Prefer the image object containing the largest number of ventricular
-    % contours.  This automatically selects the 330-frame SAX cine in the
-    % supplied test study and ignores incidental contours on other series.
-    [~,cvi.defaultSeriesIndex] = max([cvi.series.ContourCount]);
+    % When a saved cvi42 LGE enhancement overlay is present, select that
+    % series by default because it is the most information-rich contour set.
+    % Otherwise preserve the original behaviour of choosing the series with
+    % the largest ventricular contour stack.
+    lge = find([cvi.series.LGEEnhancementAvailable]);
+    if ~isempty(lge)
+        [~,q] = max([cvi.series(lge).LGEOverlayCount]);
+        cvi.defaultSeriesIndex = lge(q);
+    else
+        [~,cvi.defaultSeriesIndex] = max([cvi.series.PrimaryContourCount]);
+    end
+end
+
+function [isDuplicate,groups] = detectDerivedDuplicateContours(contours,directMatched)
+%DETECTDERIVEDDUPLICATECONTOURS Identify cvi42-only derived image aliases.
+% Require an exact LV endocardial + epicardial pair match. If an ancillary
+% blood-pool contour is also present it must match as well. This is much
+% safer than aliasing a derived UID from a single circular ROI alone.
+
+    isDuplicate = false(numel(contours),1);
+    groups = struct('DerivedImageKey',{},'SourceImageKey',{},'ContourCount',{});
+    allKeys = {contours.ImageKey};
+    unmatchedKeys = unique(allKeys(~directMatched),'stable');
+    matchedKeys = unique(allKeys(directMatched),'stable');
+    for u = 1:numel(unmatchedKeys)
+        key = unmatchedKeys{u};
+        idx = find(strcmp(allKeys,key));
+        if isempty(idx), continue; end
+        typesHere = {contours(idx).Type};
+        if ~all(ismember({'LVEndo','LVEpi'},typesHere)), continue; end
+        candidates = {};
+        for m = 1:numel(matchedKeys)
+            sourceKey = matchedKeys{m};
+            src = find(strcmp(allKeys,sourceKey) & directMatched.');
+            sourceTypes = {contours(src).Type};
+            required = {'LVEndo','LVEpi'};
+            if any(strcmp(typesHere,'BloodPool')), required{end+1} = 'BloodPool'; end %#ok<AGROW>
+            ok = true;
+            for t = 1:numel(required)
+                a = idx(strcmp(typesHere,required{t}));
+                b = src(strcmp(sourceTypes,required{t}));
+                if numel(a) ~= 1 || numel(b) ~= 1 || ...
+                        ~samePoints(contours(a).PointsPixel,contours(b).PointsPixel)
+                    ok = false; break;
+                end
+            end
+            if ok, candidates{end+1} = sourceKey; end %#ok<AGROW>
+        end
+        if numel(candidates) ~= 1, continue; end
+        sourceKey = candidates{1};
+        src = find(strcmp(allKeys,sourceKey) & directMatched.');
+        sourceTypes = {contours(src).Type};
+        % Mark only contour types that have an exact counterpart on the
+        % source image. Unknown derived-only objects remain unresolved.
+        marked = false(size(idx));
+        for q = 1:numel(idx)
+            b = src(strcmp(sourceTypes,contours(idx(q)).Type));
+            if numel(b)==1 && samePoints(contours(idx(q)).PointsPixel,contours(b).PointsPixel)
+                isDuplicate(idx(q)) = true; marked(q) = true;
+            end
+        end
+        if any(marked)
+            g.DerivedImageKey = key;
+            g.SourceImageKey = sourceKey;
+            g.ContourCount = nnz(marked);
+            groups(end+1,1) = g; %#ok<AGROW>
+        end
+    end
+end
+
+function tf = samePoints(a,b)
+    tf = isequal(size(a),size(b));
+    if ~tf, return; end
+    if isempty(a), tf = true; return; end
+    tf = all(abs(double(a(:))-double(b(:))) < 1e-9);
 end
 
 function count = dicomFrameCount(info)

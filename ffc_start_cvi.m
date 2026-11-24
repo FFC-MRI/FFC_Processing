@@ -1,5 +1,5 @@
 function app = ffc_start_cvi()
-%FFC_START_CVI Launch the CVI-contour test build.
+%FFC_START_CVI Launch the Cleanup Fix TEST29 build.
 %
 % This build deliberately uses the uniquely named FFCProcessingCVI class.
 % It therefore remains safe even if an older FFCProcessing.mlapp is still
@@ -15,6 +15,11 @@ function app = ffc_start_cvi()
         clear FFCProcessingCVI
     catch
     end
+    % Reload class definitions when switching from an older test build.
+    try
+        clear ImageReconCore
+    catch
+    end
     rehash path
 
     resolved = which('FFCProcessingCVI');
@@ -26,7 +31,7 @@ function app = ffc_start_cvi()
             resolved,expected);
     end
 
-    fprintf('Launching CVI contour test build 9 from:\n  %s\n',resolved);
+    fprintf('Launching FFC Processing Cleanup Fix TEST29 from:\n  %s\n',resolved);
     app = FFCProcessingCVI();
     if nargout == 0
         clear app

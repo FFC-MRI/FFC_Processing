@@ -1,0 +1,13 @@
+{
+  "changed_matlab_files": [
+    "ffc_start_cvi.m",
+    "ffc_prepare_loaded_scan.m",
+    "FFCProcessingCVI.m",
+    "ffc_load_raw_pipeline.m",
+    "ffc_open_cameleon_scan.m",
+    "tests/test_network_pipeline.m",
+    "file_handling/open_mrifile.m"
+  ],
+  "runtime_tests": "not run",
+  "numerical_reconstruction_and_export": "unchanged from TEST26"
+}

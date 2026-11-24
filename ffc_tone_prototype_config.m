@@ -1,0 +1,26 @@
+function config = ffc_tone_prototype_config(scan)
+%FFC_TONE_PROTOTYPE_CONFIG Source-controlled switch, shared by pool workers.
+% Set enabled=true after validating your acquisition and quantitative workflow.
+config = struct('enabled',true,'version',1,'phaseOrder','auto');
+if ~config.enabled || nargin==0, return; end
+p = scan.param;
+if ~isscalar(scan.TwoDimensional) || scan.TwoDimensional~=0 || ...
+        (~isempty(scan.is_svs) && scan.is_svs) || ~isstruct(p)
+    config.enabled = false;
+    return
+end
+keys = {'SEQUENCE_NAME','TRANSFORM_PLUGIN', ...
+    'ACQUISITION_MATRIX_DIMENSION_1D','ACQUISITION_MATRIX_DIMENSION_2D', ...
+    'ACQUISITION_MATRIX_DIMENSION_3D'};
+if ~all(isfield(p,keys))
+    config.enabled = false;
+    return
+end
+k = scan.originalcomplexkspace;
+config.enabled = strcmpi(p.SEQUENCE_NAME,'FFC_GE') && ...
+    strcmpi(p.TRANSFORM_PLUGIN,'CentricZigZag2D') && ...
+    isequal(double(p.(keys{3})),size(k,1)) && ...
+    isequal(double(p.(keys{4})),size(k,2)) && ...
+    isequal(double(p.(keys{5})),size(k,3)) && ...
+    size(k,1)>=32 && size(k,2)>=48 && size(k,3)>=2;
+end

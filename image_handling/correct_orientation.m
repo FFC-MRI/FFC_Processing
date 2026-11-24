@@ -19,6 +19,25 @@ function obj = correct_orientation(obj)
     off2 = get_numeric_parameter(obj.param, 'OFF_CENTER_FIELD_OF_VIEW_2D', 0);
     off3 = get_numeric_parameter(obj.param, 'OFF_CENTER_FIELD_OF_VIEW_3D', 0);
 
+    % Cameleon reports offsets already handled by acquisition separately.
+    % Correct only the remaining displacement; otherwise the readout centre
+    % is shifted a second time. Missing EFF preserves legacy behaviour.
+    prescribedOffsets = [off1 off2 off3];
+    handledOffsets = zeros(1,3);
+    if isstruct(obj.param) && isfield(obj.param, 'OFF_CENTER_FIELD_OF_VIEW_EFF')
+        candidate = obj.param.OFF_CENTER_FIELD_OF_VIEW_EFF;
+        if ~isnumeric(candidate) || numel(candidate) ~= 3 || ...
+                any(~isfinite(double(candidate(:))))
+            error('correct_orientation:InvalidEffectiveOffsets', ...
+                'OFF_CENTER_FIELD_OF_VIEW_EFF must contain three finite numbers in metres.');
+        end
+        handledOffsets = double(candidate(:).');
+    end
+    remainingOffsets = prescribedOffsets - handledOffsets;
+    off1 = remainingOffsets(1);
+    off2 = remainingOffsets(2);
+    off3 = remainingOffsets(3);
+
     fov1 = get_numeric_parameter(obj.param, 'FIELD_OF_VIEW', NaN);
     fov2 = get_numeric_parameter(obj.param, 'FIELD_OF_VIEW_PHASE', fov1);
     fov3 = get_numeric_parameter(obj.param, 'FIELD_OF_VIEW_3D', NaN);
@@ -68,6 +87,9 @@ function obj = correct_orientation(obj)
     obj.fov_offsets_applied = true;
     obj.fov_offset_info = struct( ...
         'applied', true, ...
+        'convention_version', 25, ...
+        'prescribed_offsets_m', prescribedOffsets, ...
+        'acquisition_handled_offsets_m', handledOffsets, ...
         'offsets_m', [off1, off2, off3], ...
         'fov_m', [fov1, fov2, fov3], ...
         'is3D', is3D);
