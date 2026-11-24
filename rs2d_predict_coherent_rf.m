@@ -5,13 +5,13 @@ function [Kout, info] = rs2d_predict_coherent_rf(Kin, phaseOrder, is2D, model)
 % singleton z and false for multi-partition inputs (legacy 3-D behavior).
 % Supported orders include 'auto', 'centric-auto', 'centric-positive',
 % 'centric-negative', 'linear', and 'centric2d' (automatic order with a
-% 2-D spatial corroboration check for RS2D Centric2D).
+% 2-D spatial corroboration check for RS2D Centric2D), and 'central-band'.
 % All fits use stored phase-encode ranks. No ADC or frame clock is assumed.
 % Processing is deterministic and never modifies Kin. Pass the original data.
 % The optional model is a fitted result for this exact source and geometry.
 if nargin < 2, phaseOrder = 'auto'; end
 phaseOrder = validatestring(phaseOrder, ...
-    {'auto','centric-auto','centric-positive','centric-negative','linear','centric2d'});
+    {'auto','centric-auto','centric-positive','centric-negative','linear','centric2d','central-band','centric2d-zigzag'});
 validateattributes(Kin, {'single','double'}, {'nonempty','nonsparse'});
 if nargin<3, is2D = size(Kin,3)==1; end
 validateattributes(is2D,{'logical','numeric'},{'scalar','binary'});
@@ -21,7 +21,7 @@ shape(end+1:6) = 1;
 nx = shape(1); ny = shape(2); nz = shape(3);
 nf = shape(4)*shape(5); nc = shape(6);
 Kout = Kin;
-info = struct('version',3,'is2D',is2D,'status','no_correction','phaseOrder',phaseOrder, ...
+info = struct('version',5,'is2D',is2D,'status','no_correction','phaseOrder',phaseOrder, ...
     'shape',shape,'receivers',[]);
 if numel(shape)>6 || nx<32 || ny<48 || isreal(Kin)
     info.status = 'unsupported_input';
@@ -43,7 +43,8 @@ tune = distance >= floor(.27*ny) & ~train;
 audit = distance >= floor(.19*ny) & ~(train | tune);
 discoveryFrames = unique(round(linspace(1,nf,min(12,nf))));
 discoveryPartitions = unique(round(linspace(1,nz,min(4,nz))));
-useSpatialGuard = is2D && strcmp(phaseOrder,'centric2d');
+useSpatialGuard = is2D && any(strcmp(phaseOrder,{'centric2d','central-band','centric2d-zigzag'}));
+compareCentralBand = strcmp(phaseOrder,'centric2d');
 background = [];
 if useSpatialGuard
     middle = distance<=floor(.10*ny);
@@ -53,11 +54,31 @@ for channel = 1:nc
     raw = K(:,:,:,:,channel);
     eligible = all(isfinite(raw(:))) && ~isreal(raw);
     peaks = zeros(0,3); order = phaseOrder; orderScores = [];
+    trajectoryValidation = [];
     if eligible
         sample = raw(:,train,discoveryPartitions,discoveryFrames);
         [peaks, rank, order, orderScores] = discover(sample, ky, train, phaseOrder);
+        if compareCentralBand && ~isempty(peaks)
+            [bandPeaks, bandRank, bandOrder, bandScores] = ...
+                discover(sample,ky,train,'central-band');
+            if ~isempty(bandPeaks) && abs(peaks(1,1)-bandPeaks(1,1))<=.75
+                selected = raw(:,train | tune,discoveryPartitions,discoveryFrames);
+                pixel = peaks(1,1)+1;
+                legacyGain = validateOrder(selected,train,tune,rank,pixel,peaks(1,2));
+                bandGain = validateOrder(selected,train,tune,bandRank,pixel,bandPeaks(1,2));
+                trajectoryValidation = [legacyGain bandGain];
+                if bandGain>.35 && bandGain>legacyGain+.004 && ...
+                        1-bandGain<.75*(1-legacyGain)
+                    peaks = bandPeaks;
+                    rank = bandRank;
+                    order = bandOrder;
+                    orderScores = bandScores;
+                end
+            end
+        end
     end
     rec = struct('phaseOrder',order,'orderScores',orderScores, ...
+        'trajectoryValidation',trajectoryValidation, ...
         'discoveryFrames',discoveryFrames,'discoveryPartitions',discoveryPartitions, ...
         'trainKy',find(train).','tuneKy',find(tune).','auditKy',find(audit).', ...
         'readoutPixel',peaks(:,1)+1,'initialCyclesPerLine',peaks(:,2), ...
@@ -112,6 +133,8 @@ function [peaks, rank, chosen, scores] = discover(sample, ky, train, order)
 orders = {'centric-positive','centric-negative','linear'};
 if strcmp(order,'centric-auto')
     orders = orders(1:2);
+elseif strcmp(order,'centric2d-zigzag')
+    orders = orders(1);
 elseif ~any(strcmp(order,{'auto','centric2d'}))
     orders = {order};
 end
@@ -177,6 +200,14 @@ end
 
 function r = phaseRank(ky, order)
 switch order
+    case 'central-band'
+        % Matches the Java CentralBand2D forward map on the acquired grid.
+        ny = numel(ky);
+        first = floor(ny/2)-floor(ceil(ny/10)/2)+1;
+        acquisition = [first:ny first-1:-1:1];
+        r = zeros(size(ky));
+        r(acquisition) = 0:ny-1;
+        return
     case 'centric-positive'
         r = 2*abs(ky) - (ky>0);
     case 'centric-negative'
@@ -187,6 +218,19 @@ end
 % At even matrix sizes the outer negative Nyquist line can be unpaired.
 [~, index] = sort(r);
 r(index) = 0:numel(ky)-1;
+end
+
+function score = validateOrder(K,train,tune,rank,pixel,seed)
+% Compare the same readout carrier. Estimate phase and amplitude in the
+% outer training band and score it on a separate shoulder.
+nx = size(K,1);
+b = readoutBasis(nx,pixel);
+Y = reshape((b'/nx)*reshape(double(K),nx,[]),nnz(train | tune),[]);
+r = rank-mean(rank(train));
+outer = train(train | tune);
+[local,~,~] = localFit(Y(outer,:),r(train | tune),r(train),seed);
+fixed = exp(2i*pi*r(train | tune)*seed)*mean(exp(-2i*pi*r(train)*seed).*Y(outer,:),1);
+score = max(reduction(Y,local,~outer),reduction(Y,fixed,~outer));
 end
 
 function delta = peakOffset(logPower)

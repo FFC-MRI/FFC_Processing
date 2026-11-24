@@ -92,6 +92,7 @@ classdef ImageReconCore
         reconstruction_generation = uint64(0)
         magnitude_generation = uint64(0)
         reconstruction_key = []
+        rf_phase_order_override = 'auto' % RF fit only; never reorders image k-space
         rf_correction_info = [] % diagnostics and compact RF model for the acquired source
         sensitivity_cache = []
         sensitivity_cache_key = []

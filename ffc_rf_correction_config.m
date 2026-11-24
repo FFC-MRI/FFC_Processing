@@ -3,7 +3,7 @@ function config = ffc_rf_correction_config(scan)
 enabled = true;
 K = scan.originalcomplexkspace;
 ny = size(K,2);
-config = struct('version',3,'status','ready','phaseOrder','auto', ...
+config = struct('version',5,'status','ready','phaseOrder','auto', ...
                 'is2D',isequal(double(scan.TwoDimensional),1) || size(K,3)==1, ...
                 'phaseRange',[1 ny]);
 if ~enabled
@@ -32,8 +32,25 @@ if strncmpi(plugin,'Sequential',10) || strcmpi(plugin,'linear')
     config.phaseOrder = 'linear';
 elseif strcmpi(plugin,'CentricZigZag2D')
     config.phaseOrder = 'centric-auto';
+elseif strcmpi(plugin,'CentralBand2D')
+    config.phaseOrder = 'central-band';
 elseif strcmpi(plugin,'Centric2D')
     config.phaseOrder = 'centric2d';
+end
+
+override = 'auto';
+if (isstruct(scan) && isfield(scan,'rf_phase_order_override')) || ...
+        (~isstruct(scan) && isprop(scan,'rf_phase_order_override'))
+    override = validatestring(scan.rf_phase_order_override, ...
+        {'auto','zigzag','central-band'});
+end
+% The override changes the RF fit only for centric imaging acquisitions.
+if any(strcmp(config.phaseOrder,{'centric-auto','central-band','centric2d'}))
+    if strcmp(override,'zigzag')
+        config.phaseOrder = 'centric2d-zigzag';
+    elseif strcmp(override,'central-band')
+        config.phaseOrder = 'central-band';
+    end
 end
 
 % Preprocessing centre-pads acquired phase lines before reconstruction.

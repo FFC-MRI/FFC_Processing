@@ -113,6 +113,8 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
         cviDialogControls = struct()
         cviMenuHandles = struct()
         NoiseWhiteningCheckBoxHandle = []
+        RFTrajectoryMenuItems = []
+        RFTrajectoryMenu = []
         ViewOrientationDropDownHandle = []
         ViewOrientationLabelHandle = []
         T1FitDiagnosticFigure = []
@@ -128,6 +130,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             taskRunning = ~isempty(app.JobRunner) && app.JobRunner.isRunning();
             if taskRunning, setTaskBusy(app,false); end
             app.currentscan = app.ScanList.Value;
+            refreshRFTrajectoryMenu(app);
             % The viewer consumes combined images; the public core API can
             % still retain per-receiver RSSQ images for external analyses.
             app.scan_data{app.currentscan} = ffc_normalize_viewer_scan(app.scan_data{app.currentscan});
@@ -381,7 +384,7 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             if busy
                 controls = {app.FFTDropDown,app.FFTDropDown_3D,app.WindowDropDown, ...
                     app.WindowSizeEditField,app.MultichannelDropDown,app.CombinationDropDown, ...
-                    app.BiasFieldDropDown,getNoiseWhiteningCheckBox(app), ...
+                    app.BiasFieldDropDown,getNoiseWhiteningCheckBox(app),app.RFTrajectoryMenu, ...
                     app.FilterSettingsButton,app.RegisterImagesButton, ...
                     app.GenerateRelaxationMapsButton,app.GenerateROIDispersionCurveButton};
                 app.BusyControls = cell(numel(controls),2);
@@ -418,9 +421,11 @@ classdef FFCProcessingCVI < matlab.apps.AppBase
             scan = app.scan_data{app.CurrentTaskIndex};
             if isempty(scan.reconstruction_key), return; end
             names = {'fft_size','fft_size_3d','window_size','window_function', ...
-                'multichannel_recon','combination','biascorrect','noise_whitening'};
+                'multichannel_recon','combination','biascorrect','noise_whitening', ...
+                'rf_phase_order_override'};
             for i = 1:numel(names), scan.(names{i}) = scan.reconstruction_key.(names{i}); end
             app.scan_data{app.CurrentTaskIndex} = scan;
+            refreshRFTrajectoryMenu(app);
         end
 
         function closeFilterDialogs(app)
@@ -3333,6 +3338,16 @@ end
             app.JobRunner = FFCJobRunner();
             app.UIFigure.Name = 'FFC Processing - Performance Edition + Cleanup Fix TEST 29';
 
+            app.RFTrajectoryMenu = uimenu(app.UIFigure,'Text','RF trajectory','Enable','off');
+            modes = {'auto','zigzag','central-band'};
+            labels = {'Auto','Centric ZigZag','Central Band'};
+            app.RFTrajectoryMenuItems = gobjects(1,numel(modes));
+            for i = 1:numel(modes)
+                app.RFTrajectoryMenuItems(i) = uimenu(app.RFTrajectoryMenu, ...
+                    'Text',labels{i},'UserData',modes{i}, ...
+                    'MenuSelectedFcn',@(src,~) selectRFTrajectory(app,src.UserData));
+            end
+
             cviMenu = uimenu(app.UIFigure,'Text','CVI Contours');
             app.cviMenuHandles.import = uimenu(cviMenu,'Text','Import workspace...', ...
                 'MenuSelectedFcn',@(src,event) importCVIContours(app));
@@ -4256,6 +4271,37 @@ end
         % Value changed function: MultichannelDropDown
         function MultichannelDropDownValueChanged2(app, event)
           %updateimages(app)
+        end
+
+        function refreshRFTrajectoryMenu(app)
+            if isempty(app.RFTrajectoryMenu) || ~isgraphics(app.RFTrajectoryMenu) || isempty(app.currentscan) || ...
+                    app.currentscan>numel(app.scan_data), return; end
+            scan = app.scan_data{app.currentscan};
+            config = ffc_rf_correction_config(scan);
+            choices = {'centric2d','centric-auto','central-band','centric2d-zigzag'};
+            available = strcmp(config.status,'ready') && any(strcmp(config.phaseOrder,choices));
+            if available
+                app.RFTrajectoryMenu.Enable = 'on';
+            else
+                app.RFTrajectoryMenu.Enable = 'off';
+            end
+            for item = app.RFTrajectoryMenuItems
+                if strcmp(item.UserData,scan.rf_phase_order_override)
+                    item.Checked = 'on';
+                else
+                    item.Checked = 'off';
+                end
+            end
+        end
+
+        function selectRFTrajectory(app,mode)
+            if app.JobRunner.isRunning() || isempty(app.currentscan), return; end
+            scan = app.scan_data{app.currentscan};
+            if strcmp(mode,scan.rf_phase_order_override), return; end
+            scan.rf_phase_order_override = mode;
+            app.scan_data{app.currentscan} = scan;
+            refreshRFTrajectoryMenu(app);
+            updateimages(app);
         end
 
         function noiseWhiteningValueChanged(app, source)

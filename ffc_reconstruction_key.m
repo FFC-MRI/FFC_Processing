@@ -8,8 +8,9 @@ function key = ffc_reconstruction_key(scan)
         'biascorrect','noise_whitening','TwoDimensional','is_svs', ...
         'orientation','fov','fov_phase','fov_3d','thk','retain_coil_images','retain_phase_images'};
     key = struct();
-    key.algorithmVersion = 29;
+    key.algorithmVersion = 31;
     key.rfCorrection = ffc_rf_correction_config(scan);
+    key.rf_phase_order_override = scan.rf_phase_order_override;
     for i = 1:numel(names)
         key.(names{i}) = scan.(names{i});
     end
